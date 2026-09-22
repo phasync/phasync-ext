@@ -43,6 +43,16 @@ make test
 # load per-run in CLI:  php -d extension=modules/phasync.so your-app.php
 ```
 
+The committed `phasync_arginfo.h` targets the latest PHP. On **PHP 8.3** the
+`ZEND_RAW_FENTRY` macro has a different arity, so regenerate it first (needs no
+network beyond the one-time PHP-Parser fetch `gen_stub` does itself):
+
+```sh
+phpize
+php build/gen_stub.php phasync.stub.php   # regenerate arginfo for this PHP
+./configure --enable-phasync && make
+```
+
 ## API
 
 ```php
