@@ -38,6 +38,8 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
+#define PHP_PHASYNC_VERSION "0.3.0"
+
 typedef struct {
 	int  saved_flags;
 	bool flags_saved;
@@ -1447,7 +1449,7 @@ static PHP_MINFO_FUNCTION(phasync)
 {
 	php_info_print_table_start();
 	php_info_print_table_row(2, "phasync support", "enabled");
-	php_info_print_table_row(2, "version", "0.3.0-dev");
+	php_info_print_table_row(2, "version", PHP_PHASYNC_VERSION);
 	php_info_print_table_end();
 	DISPLAY_INI_ENTRIES();
 }
@@ -1507,7 +1509,7 @@ zend_module_entry phasync_module_entry = {
 	PHP_RINIT(phasync),
 	PHP_RSHUTDOWN(phasync),
 	PHP_MINFO(phasync),
-	"0.3.0-dev",
+	PHP_PHASYNC_VERSION,
 	PHP_MODULE_GLOBALS(phasync),
 	PHP_GINIT(phasync),
 	PHP_GSHUTDOWN(phasync),

@@ -1,5 +1,5 @@
-/* This is a generated file, edit phasync.stub.php instead.
- * Stub hash: 71ff48960614d0b9931c84a76d7bfbb0a07f16fe */
+/* This is a generated file, edit the .stub.php file instead.
+ * Stub hash: 7f09d88fbcb9f6bf2e4f2fec4977013df5cd2194 */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_phasync_stream_select, 0, 4, MAY_BE_LONG|MAY_BE_FALSE)
 	ZEND_ARG_TYPE_INFO(1, read, IS_ARRAY, 1)

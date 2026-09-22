@@ -1,5 +1,7 @@
 # phasync-ext
 
+[![CI](https://github.com/phasync/phasync-ext/actions/workflows/ci.yml/badge.svg)](https://github.com/phasync/phasync-ext/actions/workflows/ci.yml)
+
 A PHP extension that gives [phasync](https://github.com/phasync/phasync) — and any
 fiber-based async code — two things on **PHP 8.3+**, without patching PHP:
 
