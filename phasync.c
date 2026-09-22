@@ -28,6 +28,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 typedef struct {
 	int  saved_flags;
@@ -52,6 +53,8 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_proc_open)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_sleep)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_usleep)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_time_nanosleep)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_time_sleep_until)(INTERNAL_FUNCTION_PARAMETERS);
 	bool hooks_enabled;
 	HashTable hooked;             /* (uintptr_t)stream    -> phasync_hook_entry* */
 	HashTable wrapped_ops_cache;  /* (uintptr_t)orig_ops  -> php_stream_ops*     */
@@ -416,6 +419,52 @@ static ZEND_NAMED_FUNCTION(phasync_usleep_override)
 	phasync_call_wait(&PHASYNC_G(sleep_handler), usec);
 }
 
+static ZEND_NAMED_FUNCTION(phasync_time_nanosleep_override)
+{
+	zend_long sec, nsec;
+
+	if (Z_ISUNDEF(PHASYNC_G(sleep_handler))) {
+		PHASYNC_G(orig_time_nanosleep)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	ZEND_PARSE_PARAMETERS_START(2, 2)
+		Z_PARAM_LONG(sec)
+		Z_PARAM_LONG(nsec)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (sec < 0) {
+		zend_argument_value_error(1, "must be greater than or equal to 0");
+		RETURN_THROWS();
+	}
+	if (nsec < 0) {
+		zend_argument_value_error(2, "must be greater than or equal to 0");
+		RETURN_THROWS();
+	}
+	phasync_call_wait(&PHASYNC_G(sleep_handler), (zend_long) (sec * 1000000 + nsec / 1000));
+	RETURN_TRUE;
+}
+
+static ZEND_NAMED_FUNCTION(phasync_time_sleep_until_override)
+{
+	double ts, now;
+	struct timeval tv;
+	zend_long usec;
+
+	if (Z_ISUNDEF(PHASYNC_G(sleep_handler))) {
+		PHASYNC_G(orig_time_sleep_until)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_DOUBLE(ts)
+	ZEND_PARSE_PARAMETERS_END();
+
+	gettimeofday(&tv, NULL);
+	now = (double) tv.tv_sec + (double) tv.tv_usec / 1000000.0;
+	usec = (ts > now) ? (zend_long) ((ts - now) * 1000000.0) : 0;
+	phasync_call_wait(&PHASYNC_G(sleep_handler), usec);
+	RETURN_TRUE;
+}
+
 /* ---- enable_hooks / disable_hooks ---------------------------------------- */
 
 static zend_internal_function *phasync_find_ifunc(const char *name, size_t len)
@@ -465,6 +514,14 @@ ZEND_FUNCTION(phasync_enable_hooks)
 		PHASYNC_G(orig_usleep) = f->handler;
 		f->handler = phasync_usleep_override;
 	}
+	if ((f = phasync_find_ifunc("time_nanosleep", sizeof("time_nanosleep") - 1))) {
+		PHASYNC_G(orig_time_nanosleep) = f->handler;
+		f->handler = phasync_time_nanosleep_override;
+	}
+	if ((f = phasync_find_ifunc("time_sleep_until", sizeof("time_sleep_until") - 1))) {
+		PHASYNC_G(orig_time_sleep_until) = f->handler;
+		f->handler = phasync_time_sleep_until_override;
+	}
 	PHASYNC_G(hooks_enabled) = 1;
 }
 
@@ -495,6 +552,12 @@ static void phasync_restore_hooks(void)
 	}
 	if (PHASYNC_G(orig_usleep) && (f = phasync_find_ifunc("usleep", sizeof("usleep") - 1))) {
 		f->handler = PHASYNC_G(orig_usleep);
+	}
+	if (PHASYNC_G(orig_time_nanosleep) && (f = phasync_find_ifunc("time_nanosleep", sizeof("time_nanosleep") - 1))) {
+		f->handler = PHASYNC_G(orig_time_nanosleep);
+	}
+	if (PHASYNC_G(orig_time_sleep_until) && (f = phasync_find_ifunc("time_sleep_until", sizeof("time_sleep_until") - 1))) {
+		f->handler = PHASYNC_G(orig_time_sleep_until);
 	}
 	PHASYNC_G(hooks_enabled) = 0;
 }
