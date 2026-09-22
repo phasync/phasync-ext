@@ -30,9 +30,10 @@ jobs:
         run: |
           phpize
           ./configure --enable-phasync
-          # The committed arginfo targets the latest PHP; regenerate it for the
-          # PHP under test (the ZEND_RAW_FENTRY macro arity changed in 8.4).
-          php build/gen_stub.php phasync.stub.php
+          # The committed arginfo targets the latest PHP; force-regenerate it for
+          # the PHP under test (the ZEND_RAW_FENTRY macro arity changed in 8.4).
+          # -f is required: gen_stub skips when the stub hash is unchanged.
+          php build/gen_stub.php -f phasync.stub.php
           make -j"$(nproc)"
 
       - name: Test

@@ -49,7 +49,7 @@ network beyond the one-time PHP-Parser fetch `gen_stub` does itself):
 
 ```sh
 phpize
-php build/gen_stub.php phasync.stub.php   # regenerate arginfo for this PHP
+php build/gen_stub.php -f phasync.stub.php   # regenerate arginfo for this PHP
 ./configure --enable-phasync && make
 ```
 
