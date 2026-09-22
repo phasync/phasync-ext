@@ -48,6 +48,7 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	zval sleep_handler;
 	php_stream_transport_factory orig_tcp;
 	php_stream_transport_factory orig_unix;
+	php_stream_transport_factory orig_ssl;
 	void (*orig_proc_open)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_sleep)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_usleep)(INTERNAL_FUNCTION_PARAMETERS);
@@ -121,7 +122,12 @@ static void phasync_ensure_nonblocking(php_stream *stream, php_socket_t fd)
 	if (flags != -1) {
 		e->saved_flags = flags;
 		e->flags_saved = true;
-		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	}
+	/* Set the STREAM non-blocking (not just the fd): openssl and the socket op
+	 * consult the stream's blocking flag and would otherwise wait internally. */
+	php_stream_set_option(stream, PHP_STREAM_OPTION_BLOCKING, 0, NULL);
+	if (flags != -1) {
+		fcntl(fd, F_SETFL, flags | O_NONBLOCK);   /* ensure O_NONBLOCK regardless */
 	}
 }
 
@@ -184,6 +190,62 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 	}
 }
 
+/* Delegate-mode ops for streams whose bytes must go through the original op
+ * (e.g. TLS: SSL_read/SSL_write). We can't raw read/write the fd. We set the
+ * stream non-blocking so the original op returns 0-without-eof on would-block,
+ * then wait and retry. Read/write intent is approximated (a read waits for
+ * readability); TLS renegotiation wanting the opposite direction is a known
+ * v1 limitation. */
+static ssize_t phasync_wrapped_read_tls(php_stream *stream, char *buf, size_t count)
+{
+	const php_stream_ops *orig = PHASYNC_ORIG(stream);
+	zval *handler = &PHASYNC_G(read_handler);
+	php_socket_t fd;
+
+	if (Z_ISUNDEF_P(handler)) {
+		return orig->read(stream, buf, count);
+	}
+	phasync_ensure_nonblocking(stream, phasync_stream_fd(stream));
+	for (;;) {
+		ssize_t n = orig->read(stream, buf, count);
+		if (n > 0) {
+			return n;
+		}
+		if (n < 0 || stream->eof) {
+			return n;                    /* error or real EOF */
+		}
+		fd = phasync_stream_fd(stream);  /* n == 0, not eof -> would block */
+		if (fd == -1 || phasync_call_wait(handler, (zend_long) fd) != 0) {
+			return -1;
+		}
+	}
+}
+
+static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, size_t count)
+{
+	const php_stream_ops *orig = PHASYNC_ORIG(stream);
+	zval *handler = &PHASYNC_G(write_handler);
+	php_socket_t fd;
+
+	if (Z_ISUNDEF_P(handler)) {
+		return orig->write(stream, buf, count);
+	}
+	phasync_ensure_nonblocking(stream, phasync_stream_fd(stream));
+	for (;;) {
+		ssize_t n = orig->write(stream, buf, count);
+		if (n > 0) {
+			return n;
+		}
+		if (n < 0) {
+			return n;
+		}
+		fd = phasync_stream_fd(stream);  /* 0 -> would block */
+		if (fd == -1 || phasync_call_wait(handler, (zend_long) fd) != 0) {
+			return -1;
+		}
+	}
+}
+
 static int phasync_wrapped_close(php_stream *stream, int close_handle)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
@@ -203,7 +265,7 @@ static int phasync_wrapped_close(php_stream *stream, int close_handle)
 
 /* Build (or fetch cached) a wrapped ops for the given original ops: a copy with
  * read/write/close overridden and every other op left as the original's. */
-static php_stream_ops *phasync_wrapped_ops_for(const php_stream_ops *orig)
+static php_stream_ops *phasync_wrapped_ops_for(const php_stream_ops *orig, bool tls)
 {
 	phasync_wops *w = zend_hash_index_find_ptr(&PHASYNC_G(wrapped_ops_cache),
 		(zend_ulong) (uintptr_t) orig);
@@ -212,10 +274,10 @@ static php_stream_ops *phasync_wrapped_ops_for(const php_stream_ops *orig)
 	}
 	w = pemalloc(sizeof(*w), 1);
 	w->ops = *orig;
-	w->ops.read  = phasync_wrapped_read;
-	w->ops.write = phasync_wrapped_write;
+	w->ops.read  = tls ? phasync_wrapped_read_tls  : phasync_wrapped_read;
+	w->ops.write = tls ? phasync_wrapped_write_tls : phasync_wrapped_write;
 	w->ops.close = phasync_wrapped_close;
-	w->ops.label = "phasync-wrapped";
+	w->ops.label = tls ? "phasync-wrapped-tls" : "phasync-wrapped";
 	w->orig = orig;
 	zend_hash_index_add_ptr(&PHASYNC_G(wrapped_ops_cache), (zend_ulong) (uintptr_t) orig, w);
 	return &w->ops;
@@ -223,16 +285,17 @@ static php_stream_ops *phasync_wrapped_ops_for(const php_stream_ops *orig)
 
 /* Wrap any descriptor-backed stream (socket or pipe). Ops replacement only;
  * fd/non-blocking setup is deferred to first I/O. */
-static void phasync_wrap_stream(php_stream *stream)
+static void phasync_wrap_stream(php_stream *stream, bool tls)
 {
 	if (stream == NULL || stream->ops == NULL) {
 		return;
 	}
 	/* Already wrapped? (also covers accepted sockets that inherited wrapped ops) */
-	if (stream->ops->read == phasync_wrapped_read) {
+	if (stream->ops->read == phasync_wrapped_read
+	 || stream->ops->read == phasync_wrapped_read_tls) {
 		return;
 	}
-	stream->ops = phasync_wrapped_ops_for(stream->ops);
+	stream->ops = phasync_wrapped_ops_for(stream->ops, tls);
 }
 
 /* ---- transport factories ------------------------------------------------- */
@@ -244,7 +307,7 @@ static php_stream *phasync_tcp_factory(const char *proto, size_t protolen,
 {
 	php_stream *s = PHASYNC_G(orig_tcp)(proto, protolen, resourcename, resourcenamelen,
 		persistent_id, options, flags, timeout, context STREAMS_CC);
-	phasync_wrap_stream(s);
+	phasync_wrap_stream(s, false);
 	return s;
 }
 
@@ -255,9 +318,25 @@ static php_stream *phasync_unix_factory(const char *proto, size_t protolen,
 {
 	php_stream *s = PHASYNC_G(orig_unix)(proto, protolen, resourcename, resourcenamelen,
 		persistent_id, options, flags, timeout, context STREAMS_CC);
-	phasync_wrap_stream(s);
+	phasync_wrap_stream(s, false);
 	return s;
 }
+
+static php_stream *phasync_ssl_factory(const char *proto, size_t protolen,
+		const char *resourcename, size_t resourcenamelen, const char *persistent_id,
+		int options, int flags, struct timeval *timeout,
+		php_stream_context *context STREAMS_DC)
+{
+	php_stream *s = PHASYNC_G(orig_ssl)(proto, protolen, resourcename, resourcenamelen,
+		persistent_id, options, flags, timeout, context STREAMS_CC);
+	phasync_wrap_stream(s, true);   /* TLS: delegate to SSL_read/SSL_write */
+	return s;
+}
+
+/* The openssl extension registers one factory under several scheme names. */
+static const char *phasync_ssl_schemes[] = {
+	"ssl", "tls", "sslv3", "tlsv1.0", "tlsv1.1", "tlsv1.2", "tlsv1.3", NULL
+};
 
 /* ---- proc_open() override: wrap the pipe streams it produces -------------- */
 
@@ -278,7 +357,7 @@ static void phasync_wrap_pipes_array(zval *pipes)
 		stream = (php_stream *) zend_fetch_resource2_ex(elem, NULL,
 			php_file_le_stream(), php_file_le_pstream());
 		if (stream) {
-			phasync_wrap_stream(stream);
+			phasync_wrap_stream(stream, false);
 		}
 	} ZEND_HASH_FOREACH_END();
 }
@@ -364,6 +443,16 @@ ZEND_FUNCTION(phasync_enable_hooks)
 	if (PHASYNC_G(orig_tcp))  php_stream_xport_register("tcp", phasync_tcp_factory);
 	if (PHASYNC_G(orig_unix)) php_stream_xport_register("unix", phasync_unix_factory);
 
+	PHASYNC_G(orig_ssl) = zend_hash_str_find_ptr(xhash, "ssl", sizeof("ssl") - 1);
+	if (PHASYNC_G(orig_ssl)) {
+		const char **scheme;
+		for (scheme = phasync_ssl_schemes; *scheme; scheme++) {
+			if (zend_hash_str_exists(xhash, *scheme, strlen(*scheme))) {
+				php_stream_xport_register(*scheme, phasync_ssl_factory);
+			}
+		}
+	}
+
 	if ((f = phasync_find_ifunc("proc_open", sizeof("proc_open") - 1))) {
 		PHASYNC_G(orig_proc_open) = f->handler;
 		f->handler = phasync_proc_open_override;
@@ -388,6 +477,15 @@ static void phasync_restore_hooks(void)
 	}
 	if (PHASYNC_G(orig_tcp))  php_stream_xport_register("tcp", PHASYNC_G(orig_tcp));
 	if (PHASYNC_G(orig_unix)) php_stream_xport_register("unix", PHASYNC_G(orig_unix));
+	if (PHASYNC_G(orig_ssl)) {
+		HashTable *xh = php_stream_xport_get_hash();
+		const char **scheme;
+		for (scheme = phasync_ssl_schemes; *scheme; scheme++) {
+			if (zend_hash_str_exists(xh, *scheme, strlen(*scheme))) {
+				php_stream_xport_register(*scheme, PHASYNC_G(orig_ssl));
+			}
+		}
+	}
 
 	if (PHASYNC_G(orig_proc_open) && (f = phasync_find_ifunc("proc_open", sizeof("proc_open") - 1))) {
 		f->handler = PHASYNC_G(orig_proc_open);
