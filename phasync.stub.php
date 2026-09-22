@@ -35,9 +35,17 @@ function register_write_handler(?callable $handler): void {}
 function register_sleep_handler(?callable $handler): void {}
 
 /**
- * Install the hooks: re-register tcp:// and unix:// transports and override
- * proc_open(), sleep() and usleep(). Sockets and proc_open pipes created
- * afterwards route their would-block I/O through the registered handlers.
+ * Install the hooks. Afterwards, would-block I/O routes through the registered
+ * handlers so a fiber scheduler can drive it transparently:
+ *   - tcp://, unix:// and ssl://tls:// transports (sockets created afterwards);
+ *   - proc_open() pipes;
+ *   - sleep(), usleep(), time_nanosleep(), time_sleep_until();
+ *   - gethostbyname() (resolved on a worker thread, off the main thread);
+ *   - fopen(): regular files read/write on the worker thread pool (they are not
+ *     readiness-pollable); a named pipe (FIFO) has its blocking open() rendezvous
+ *     run on a dedicated thread, so a reader and a writer coroutine can open the
+ *     two ends concurrently instead of deadlocking.
+ * The worker pool size is set by the phasync.thread_pool_size INI (default 8).
  * Idempotent.
  */
 function enable_hooks(): void {}
