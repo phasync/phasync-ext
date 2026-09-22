@@ -15,27 +15,34 @@ namespace phasync;
 function stream_select(?array &$read, ?array &$write, ?array &$except, ?int $seconds, ?int $microseconds = null): int|false {}
 
 /**
- * Register (or clear, with null) the callback invoked when a hooked socket read
- * would block. It is called with the integer file descriptor and is responsible
- * for waiting until the fd is readable (typically Fiber::suspend into a scheduler).
+ * Register (or clear, with null) the callback invoked when a hooked stream read
+ * would block. It receives the integer file descriptor and is responsible for
+ * waiting until the fd is readable (typically Fiber::suspend into a scheduler).
  * The extension performs the actual read; the callback only waits.
  */
 function register_read_handler(?callable $handler): void {}
 
 /**
- * Register (or clear, with null) the callback invoked when a hooked socket write
- * would block. Called with the integer file descriptor; responsible for waiting
- * until the fd is writable.
+ * As register_read_handler(), but for writes that would block.
  */
 function register_write_handler(?callable $handler): void {}
 
 /**
- * Install the transport hooks (re-register tcp:// and unix:// so sockets created
- * afterwards route their reads/writes through the registered handlers). Idempotent.
+ * Register (or clear, with null) the callback invoked by the hooked sleep()/
+ * usleep(). It receives the duration in microseconds and is responsible for
+ * waiting that long (typically Fiber::suspend with a timer into a scheduler).
+ */
+function register_sleep_handler(?callable $handler): void {}
+
+/**
+ * Install the hooks: re-register tcp:// and unix:// transports and override
+ * proc_open(), sleep() and usleep(). Sockets and proc_open pipes created
+ * afterwards route their would-block I/O through the registered handlers.
+ * Idempotent.
  */
 function enable_hooks(): void {}
 
 /**
- * Remove the transport hooks, restoring the original tcp:// and unix:// factories.
+ * Remove all hooks, restoring the original transports and functions.
  */
 function disable_hooks(): void {}

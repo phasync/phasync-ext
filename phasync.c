@@ -3,14 +3,15 @@
  * Tier 1: phasync\stream_select() — growable, poll(2)-based, no FD_SETSIZE limit.
  *         Accepts stream resources and plain integer file descriptors.
  *
- * Tier 2: transparent async I/O for sockets. enable_hooks() re-registers the
- *         tcp:// and unix:// transports; sockets created afterwards get their
- *         reads/writes wrapped. On a would-block (EAGAIN) the wrapped op invokes
- *         the userland handler registered via register_read_handler()/
- *         register_write_handler() with the integer fd. The handler waits until
- *         the fd is ready (typically Fiber::suspend into a scheduler) and returns;
- *         the extension then performs the actual read/write. The C side never
- *         touches the fiber API — the userland callback owns all suspension.
+ * Tier 2: transparent async I/O. enable_hooks() re-registers the tcp:// and
+ *         unix:// transports AND overrides proc_open()/sleep()/usleep(). Sockets
+ *         and proc_open pipes created afterwards get their read/write ops wrapped;
+ *         on a would-block the wrapper invokes the userland handler with the
+ *         integer fd, which waits until ready (typically Fiber::suspend into a
+ *         scheduler) and returns, then the extension performs the real I/O.
+ *         sleep()/usleep() invoke a sleep handler with the duration in usec.
+ *         The C side never touches the fiber API — the userland callbacks own all
+ *         suspension; it works because PHP fibers are stackful.
  */
 #ifdef HAVE_CONFIG_H
 # include "config.h"
@@ -27,18 +28,32 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/socket.h>
+
+typedef struct {
+	int  saved_flags;
+	bool flags_saved;
+} phasync_hook_entry;
+
+/* Wrapped ops with the original embedded right after it, so the original is
+ * recoverable from any stream carrying these ops (including accepted sockets,
+ * which inherit the listener's ops pointer without going through our wrap path). */
+typedef struct {
+	php_stream_ops ops;             /* MUST be first member */
+	const php_stream_ops *orig;
+} phasync_wops;
 
 ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	zval read_handler;
 	zval write_handler;
+	zval sleep_handler;
 	php_stream_transport_factory orig_tcp;
 	php_stream_transport_factory orig_unix;
-	const php_stream_ops *orig_ops;   /* the socket ops we wrap (captured lazily) */
-	php_stream_ops wrapped_ops;       /* copy of orig_ops with read/write/close overridden */
-	bool wrapped_ready;
+	void (*orig_proc_open)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_sleep)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_usleep)(INTERNAL_FUNCTION_PARAMETERS);
 	bool hooks_enabled;
-	HashTable hooked;                 /* (uintptr_t)stream -> saved fd flags (as long) */
+	HashTable hooked;             /* (uintptr_t)stream    -> phasync_hook_entry* */
+	HashTable wrapped_ops_cache;  /* (uintptr_t)orig_ops  -> php_stream_ops*     */
 ZEND_END_MODULE_GLOBALS(phasync)
 
 ZEND_DECLARE_MODULE_GLOBALS(phasync)
@@ -49,7 +64,7 @@ ZEND_DECLARE_MODULE_GLOBALS(phasync)
 # define PHASYNC_G(v) (phasync_globals.v)
 #endif
 
-/* ---- fd helpers ---------------------------------------------------------- */
+/* ---- fd + wait helpers --------------------------------------------------- */
 
 static php_socket_t phasync_stream_fd(php_stream *stream)
 {
@@ -59,13 +74,13 @@ static php_socket_t phasync_stream_fd(php_stream *stream)
 	return fd;
 }
 
-/* Call the userland wait handler with the fd; returns -1 if it threw. */
-static int phasync_call_wait(zval *handler, php_socket_t fd)
+/* Call a userland wait handler with one long argument; -1 if it threw. */
+static int phasync_call_wait(zval *handler, zend_long arg)
 {
 	zval args[1], retval;
 	int rc = 0;
 
-	ZVAL_LONG(&args[0], (zend_long) fd);
+	ZVAL_LONG(&args[0], arg);
 	ZVAL_UNDEF(&retval);
 	if (call_user_function(NULL, NULL, handler, &retval, 1, args) == FAILURE || EG(exception)) {
 		rc = -1;
@@ -74,26 +89,59 @@ static int phasync_call_wait(zval *handler, php_socket_t fd)
 	return rc;
 }
 
-static void phasync_ensure_nonblocking(php_stream *stream, php_socket_t fd);
+/* ---- wrapped stream ops (shared across socket + pipe originals) ----------- */
 
-/* ---- wrapped socket ops -------------------------------------------------- */
+static phasync_hook_entry *phasync_entry(php_stream *stream)
+{
+	return zend_hash_index_find_ptr(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream);
+}
+
+/* stream->ops points at the .ops member (first) of a phasync_wops. */
+#define PHASYNC_ORIG(stream) (((phasync_wops *) (stream)->ops)->orig)
+
+static void phasync_ensure_nonblocking(php_stream *stream, php_socket_t fd)
+{
+	phasync_hook_entry *e;
+	int flags;
+
+	if (fd == -1) {
+		return;
+	}
+	e = phasync_entry(stream);
+	if (e == NULL) {
+		e = pemalloc(sizeof(*e), 1);
+		e->saved_flags = 0;
+		e->flags_saved = false;
+		zend_hash_index_add_ptr(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream, e);
+	}
+	if (e->flags_saved) {
+		return;
+	}
+	flags = fcntl(fd, F_GETFL, 0);
+	if (flags != -1) {
+		e->saved_flags = flags;
+		e->flags_saved = true;
+		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	}
+}
 
 static ssize_t phasync_wrapped_read(php_stream *stream, char *buf, size_t count)
 {
+	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
 	zval *handler = &PHASYNC_G(read_handler);
 
 	if (fd == -1 || Z_ISUNDEF_P(handler)) {
-		return PHASYNC_G(orig_ops)->read(stream, buf, count);
+		return orig->read(stream, buf, count);
 	}
 	phasync_ensure_nonblocking(stream, fd);
 	for (;;) {
-		ssize_t n = recv(fd, buf, count, 0);
+		ssize_t n = read(fd, buf, count);
 		if (n > 0) {
 			return n;
 		}
 		if (n == 0) {
-			stream->eof = 1;   /* orderly shutdown */
+			stream->eof = 1;
 			return 0;
 		}
 		if (errno == EINTR) {
@@ -103,8 +151,7 @@ static ssize_t phasync_wrapped_read(php_stream *stream, char *buf, size_t count)
 			stream->eof = 1;
 			return -1;
 		}
-		/* would block: let userland wait (may suspend the fiber), then retry */
-		if (phasync_call_wait(handler, fd) != 0) {
+		if (phasync_call_wait(handler, (zend_long) fd) != 0) {
 			return -1;
 		}
 	}
@@ -112,15 +159,16 @@ static ssize_t phasync_wrapped_read(php_stream *stream, char *buf, size_t count)
 
 static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t count)
 {
+	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
 	zval *handler = &PHASYNC_G(write_handler);
 
 	if (fd == -1 || Z_ISUNDEF_P(handler)) {
-		return PHASYNC_G(orig_ops)->write(stream, buf, count);
+		return orig->write(stream, buf, count);
 	}
 	phasync_ensure_nonblocking(stream, fd);
 	for (;;) {
-		ssize_t n = send(fd, buf, count, 0);
+		ssize_t n = write(fd, buf, count);
 		if (n >= 0) {
 			return n;
 		}
@@ -130,7 +178,7 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 		if (errno != EAGAIN && errno != EWOULDBLOCK) {
 			return -1;
 		}
-		if (phasync_call_wait(&PHASYNC_G(write_handler), fd) != 0) {
+		if (phasync_call_wait(handler, (zend_long) fd) != 0) {
 			return -1;
 		}
 	}
@@ -138,57 +186,53 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 
 static int phasync_wrapped_close(php_stream *stream, int close_handle)
 {
-	zval *saved = zend_hash_index_find(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream);
-	if (saved) {
-		php_socket_t fd = phasync_stream_fd(stream);
-		if (fd != -1) {
-			fcntl(fd, F_SETFL, (int) Z_LVAL_P(saved));  /* restore original flags */
+	const php_stream_ops *orig = PHASYNC_ORIG(stream);
+	phasync_hook_entry *e = phasync_entry(stream);
+
+	if (e) {
+		if (e->flags_saved) {
+			php_socket_t fd = phasync_stream_fd(stream);
+			if (fd != -1) {
+				fcntl(fd, F_SETFL, e->saved_flags);
+			}
 		}
 		zend_hash_index_del(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream);
 	}
-	return PHASYNC_G(orig_ops)->close(stream, close_handle);
+	return orig->close(stream, close_handle);
 }
 
+/* Build (or fetch cached) a wrapped ops for the given original ops: a copy with
+ * read/write/close overridden and every other op left as the original's. */
+static php_stream_ops *phasync_wrapped_ops_for(const php_stream_ops *orig)
+{
+	phasync_wops *w = zend_hash_index_find_ptr(&PHASYNC_G(wrapped_ops_cache),
+		(zend_ulong) (uintptr_t) orig);
+	if (w) {
+		return &w->ops;
+	}
+	w = pemalloc(sizeof(*w), 1);
+	w->ops = *orig;
+	w->ops.read  = phasync_wrapped_read;
+	w->ops.write = phasync_wrapped_write;
+	w->ops.close = phasync_wrapped_close;
+	w->ops.label = "phasync-wrapped";
+	w->orig = orig;
+	zend_hash_index_add_ptr(&PHASYNC_G(wrapped_ops_cache), (zend_ulong) (uintptr_t) orig, w);
+	return &w->ops;
+}
+
+/* Wrap any descriptor-backed stream (socket or pipe). Ops replacement only;
+ * fd/non-blocking setup is deferred to first I/O. */
 static void phasync_wrap_stream(php_stream *stream)
 {
-	if (stream == NULL) {
+	if (stream == NULL || stream->ops == NULL) {
 		return;
 	}
-	/* Capture the socket ops once and build the wrapped copy. */
-	if (!PHASYNC_G(wrapped_ready)) {
-		PHASYNC_G(orig_ops) = stream->ops;
-		PHASYNC_G(wrapped_ops) = *stream->ops;
-		PHASYNC_G(wrapped_ops).read = phasync_wrapped_read;
-		PHASYNC_G(wrapped_ops).write = phasync_wrapped_write;
-		PHASYNC_G(wrapped_ops).close = phasync_wrapped_close;
-		PHASYNC_G(wrapped_ops).label = "phasync-wrapped-socket";
-		PHASYNC_G(wrapped_ready) = 1;
-	}
-	/* Only wrap streams using the exact ops we captured (plain tcp/unix sockets). */
-	if (stream->ops != PHASYNC_G(orig_ops)) {
+	/* Already wrapped? (also covers accepted sockets that inherited wrapped ops) */
+	if (stream->ops->read == phasync_wrapped_read) {
 		return;
 	}
-	/* Replace the ops now; defer fd acquisition + non-blocking setup to the first
-	 * I/O, since the stream is not reliably castable to an fd at factory time. */
-	stream->ops = &PHASYNC_G(wrapped_ops);
-}
-
-/* Lazily make the underlying fd non-blocking on first I/O, saving prior flags. */
-static void phasync_ensure_nonblocking(php_stream *stream, php_socket_t fd)
-{
-	int flags;
-
-	if (fd == -1
-	 || zend_hash_index_exists(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream)) {
-		return;
-	}
-	flags = fcntl(fd, F_GETFL, 0);
-	if (flags != -1) {
-		zval z;
-		ZVAL_LONG(&z, flags);
-		zend_hash_index_update(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream, &z);
-		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-	}
+	stream->ops = phasync_wrapped_ops_for(stream->ops);
 }
 
 /* ---- transport factories ------------------------------------------------- */
@@ -215,47 +259,155 @@ static php_stream *phasync_unix_factory(const char *proto, size_t protolen,
 	return s;
 }
 
-/* ---- phasync\enable_hooks / disable_hooks -------------------------------- */
+/* ---- proc_open() override: wrap the pipe streams it produces -------------- */
+
+static void phasync_wrap_pipes_array(zval *pipes)
+{
+	zval *elem;
+	php_stream *stream;
+
+	ZVAL_DEREF(pipes);
+	if (Z_TYPE_P(pipes) != IS_ARRAY) {
+		return;
+	}
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(pipes), elem) {
+		ZVAL_DEREF(elem);
+		if (Z_TYPE_P(elem) != IS_RESOURCE) {
+			continue;
+		}
+		stream = (php_stream *) zend_fetch_resource2_ex(elem, NULL,
+			php_file_le_stream(), php_file_le_pstream());
+		if (stream) {
+			phasync_wrap_stream(stream);
+		}
+	} ZEND_HASH_FOREACH_END();
+}
+
+static ZEND_NAMED_FUNCTION(phasync_proc_open_override)
+{
+	PHASYNC_G(orig_proc_open)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+
+	if (!EG(exception) && ZEND_NUM_ARGS() >= 3) {
+		/* arg #3 ($pipes) is by-ref and now holds the pipe stream resources */
+		zval *pipes = ZEND_CALL_ARG(execute_data, 3);
+		if (pipes) {
+			phasync_wrap_pipes_array(pipes);
+		}
+	}
+}
+
+/* ---- sleep()/usleep() override ------------------------------------------- */
+
+static ZEND_NAMED_FUNCTION(phasync_sleep_override)
+{
+	zend_long seconds;
+
+	if (Z_ISUNDEF(PHASYNC_G(sleep_handler))) {
+		PHASYNC_G(orig_sleep)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_LONG(seconds)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (seconds < 0) {
+		zend_argument_value_error(1, "must be greater than or equal to 0");
+		RETURN_THROWS();
+	}
+	phasync_call_wait(&PHASYNC_G(sleep_handler), (zend_long) (seconds * 1000000));
+	RETURN_LONG(0);
+}
+
+static ZEND_NAMED_FUNCTION(phasync_usleep_override)
+{
+	zend_long usec;
+
+	if (Z_ISUNDEF(PHASYNC_G(sleep_handler))) {
+		PHASYNC_G(orig_usleep)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_LONG(usec)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (usec < 0) {
+		zend_argument_value_error(1, "must be greater than or equal to 0");
+		RETURN_THROWS();
+	}
+	phasync_call_wait(&PHASYNC_G(sleep_handler), usec);
+}
+
+/* ---- enable_hooks / disable_hooks ---------------------------------------- */
+
+static zend_internal_function *phasync_find_ifunc(const char *name, size_t len)
+{
+	zend_function *f = zend_hash_str_find_ptr(CG(function_table), name, len);
+	if (f && f->type == ZEND_INTERNAL_FUNCTION) {
+		return &f->internal_function;
+	}
+	return NULL;
+}
 
 ZEND_FUNCTION(phasync_enable_hooks)
 {
 	HashTable *xhash;
+	zend_internal_function *f;
 
 	ZEND_PARSE_PARAMETERS_NONE();
-
 	if (PHASYNC_G(hooks_enabled)) {
 		return;
 	}
+
 	xhash = php_stream_xport_get_hash();
 	PHASYNC_G(orig_tcp)  = zend_hash_str_find_ptr(xhash, "tcp", sizeof("tcp") - 1);
 	PHASYNC_G(orig_unix) = zend_hash_str_find_ptr(xhash, "unix", sizeof("unix") - 1);
+	if (PHASYNC_G(orig_tcp))  php_stream_xport_register("tcp", phasync_tcp_factory);
+	if (PHASYNC_G(orig_unix)) php_stream_xport_register("unix", phasync_unix_factory);
 
-	if (PHASYNC_G(orig_tcp)) {
-		php_stream_xport_register("tcp", phasync_tcp_factory);
+	if ((f = phasync_find_ifunc("proc_open", sizeof("proc_open") - 1))) {
+		PHASYNC_G(orig_proc_open) = f->handler;
+		f->handler = phasync_proc_open_override;
 	}
-	if (PHASYNC_G(orig_unix)) {
-		php_stream_xport_register("unix", phasync_unix_factory);
+	if ((f = phasync_find_ifunc("sleep", sizeof("sleep") - 1))) {
+		PHASYNC_G(orig_sleep) = f->handler;
+		f->handler = phasync_sleep_override;
+	}
+	if ((f = phasync_find_ifunc("usleep", sizeof("usleep") - 1))) {
+		PHASYNC_G(orig_usleep) = f->handler;
+		f->handler = phasync_usleep_override;
 	}
 	PHASYNC_G(hooks_enabled) = 1;
+}
+
+static void phasync_restore_hooks(void)
+{
+	zend_internal_function *f;
+
+	if (!PHASYNC_G(hooks_enabled)) {
+		return;
+	}
+	if (PHASYNC_G(orig_tcp))  php_stream_xport_register("tcp", PHASYNC_G(orig_tcp));
+	if (PHASYNC_G(orig_unix)) php_stream_xport_register("unix", PHASYNC_G(orig_unix));
+
+	if (PHASYNC_G(orig_proc_open) && (f = phasync_find_ifunc("proc_open", sizeof("proc_open") - 1))) {
+		f->handler = PHASYNC_G(orig_proc_open);
+	}
+	if (PHASYNC_G(orig_sleep) && (f = phasync_find_ifunc("sleep", sizeof("sleep") - 1))) {
+		f->handler = PHASYNC_G(orig_sleep);
+	}
+	if (PHASYNC_G(orig_usleep) && (f = phasync_find_ifunc("usleep", sizeof("usleep") - 1))) {
+		f->handler = PHASYNC_G(orig_usleep);
+	}
+	PHASYNC_G(hooks_enabled) = 0;
 }
 
 ZEND_FUNCTION(phasync_disable_hooks)
 {
 	ZEND_PARSE_PARAMETERS_NONE();
-
-	if (!PHASYNC_G(hooks_enabled)) {
-		return;
-	}
-	if (PHASYNC_G(orig_tcp)) {
-		php_stream_xport_register("tcp", PHASYNC_G(orig_tcp));
-	}
-	if (PHASYNC_G(orig_unix)) {
-		php_stream_xport_register("unix", PHASYNC_G(orig_unix));
-	}
-	PHASYNC_G(hooks_enabled) = 0;
+	phasync_restore_hooks();
 }
 
-/* ---- phasync\register_read_handler / register_write_handler --------------- */
+/* ---- handler registration ------------------------------------------------ */
 
 static void phasync_set_handler(zval *slot, INTERNAL_FUNCTION_PARAMETERS)
 {
@@ -266,11 +418,12 @@ static void phasync_set_handler(zval *slot, INTERNAL_FUNCTION_PARAMETERS)
 		Z_PARAM_FUNC_OR_NULL(fci, fcc)
 	ZEND_PARSE_PARAMETERS_END();
 
-	zval_ptr_dtor(slot);
+	if (!Z_ISUNDEF_P(slot)) {
+		zval_ptr_dtor(slot);
+		ZVAL_UNDEF(slot);
+	}
 	if (ZEND_FCI_INITIALIZED(fci)) {
 		ZVAL_COPY(slot, &fci.function_name);
-	} else {
-		ZVAL_UNDEF(slot);
 	}
 }
 
@@ -278,15 +431,17 @@ ZEND_FUNCTION(phasync_register_read_handler)
 {
 	phasync_set_handler(&PHASYNC_G(read_handler), INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
-
 ZEND_FUNCTION(phasync_register_write_handler)
 {
 	phasync_set_handler(&PHASYNC_G(write_handler), INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
+ZEND_FUNCTION(phasync_register_sleep_handler)
+{
+	phasync_set_handler(&PHASYNC_G(sleep_handler), INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
 
 /* ---- phasync\stream_select (Tier 1) -------------------------------------- */
 
-/* Extract an fd from an array element: a stream resource or a plain integer. */
 static php_socket_t phasync_elem_fd(zval *elem)
 {
 	php_stream *stream;
@@ -339,7 +494,6 @@ static int phasync_filter(zval *array, HashTable *revents_by_fd, short mask)
 		return 0;
 	}
 	ht = zend_new_array(zend_hash_num_elements(Z_ARRVAL_P(array)));
-
 	ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(array), num_ind, key, elem) {
 		php_socket_t fd = phasync_elem_fd(elem);
 		if (fd != -1) {
@@ -355,7 +509,6 @@ static int phasync_filter(zval *array, HashTable *revents_by_fd, short mask)
 			}
 		}
 	} ZEND_HASH_FOREACH_END();
-
 	zval_ptr_dtor(array);
 	ZVAL_ARR(array, ht);
 	return ret;
@@ -374,11 +527,10 @@ static int phasync_emulate_read(zval *array)
 		return 0;
 	}
 	ht = zend_new_array(zend_hash_num_elements(Z_ARRVAL_P(array)));
-
 	ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(array), num_ind, key, elem) {
 		ZVAL_DEREF(elem);
 		if (Z_TYPE_P(elem) == IS_LONG) {
-			continue;   /* raw fds have no PHP-side buffer */
+			continue;
 		}
 		php_stream_from_zval_no_verify(stream, elem);
 		if (stream == NULL) {
@@ -394,7 +546,6 @@ static int phasync_emulate_read(zval *array)
 			ret++;
 		}
 	} ZEND_HASH_FOREACH_END();
-
 	if (ret > 0) {
 		zval_ptr_dtor(array);
 		ZVAL_ARR(array, ht);
@@ -513,6 +664,15 @@ ZEND_FUNCTION(phasync_stream_select)
 
 /* ---- module lifecycle ---------------------------------------------------- */
 
+static void phasync_hook_entry_dtor(zval *zv)
+{
+	pefree(Z_PTR_P(zv), 1);
+}
+static void phasync_ops_dtor(zval *zv)
+{
+	pefree(Z_PTR_P(zv), 1);
+}
+
 static PHP_GINIT_FUNCTION(phasync)
 {
 #if defined(COMPILE_DL_PHASYNC) && defined(ZTS)
@@ -521,46 +681,34 @@ static PHP_GINIT_FUNCTION(phasync)
 	memset(phasync_globals, 0, sizeof(*phasync_globals));
 	ZVAL_UNDEF(&phasync_globals->read_handler);
 	ZVAL_UNDEF(&phasync_globals->write_handler);
-	/* Persistent + globals-lifetime: wrapped streams may be freed during request
-	 * shutdown, after RSHUTDOWN, and their close op consults this table. */
-	zend_hash_init(&phasync_globals->hooked, 8, NULL, NULL, 1);
+	ZVAL_UNDEF(&phasync_globals->sleep_handler);
+	zend_hash_init(&phasync_globals->hooked, 8, NULL, phasync_hook_entry_dtor, 1);
+	zend_hash_init(&phasync_globals->wrapped_ops_cache, 8, NULL, phasync_ops_dtor, 1);
 }
 
 static PHP_GSHUTDOWN_FUNCTION(phasync)
 {
 	zend_hash_destroy(&phasync_globals->hooked);
+	zend_hash_destroy(&phasync_globals->wrapped_ops_cache);
 }
 
 static PHP_RINIT_FUNCTION(phasync)
 {
 	ZVAL_UNDEF(&PHASYNC_G(read_handler));
 	ZVAL_UNDEF(&PHASYNC_G(write_handler));
+	ZVAL_UNDEF(&PHASYNC_G(sleep_handler));
 	PHASYNC_G(hooks_enabled) = 0;
-	PHASYNC_G(wrapped_ready) = 0;
 	zend_hash_clean(&PHASYNC_G(hooked));
 	return SUCCESS;
 }
 
 static PHP_RSHUTDOWN_FUNCTION(phasync)
 {
-	if (PHASYNC_G(hooks_enabled)) {
-		if (PHASYNC_G(orig_tcp)) {
-			php_stream_xport_register("tcp", PHASYNC_G(orig_tcp));
-		}
-		if (PHASYNC_G(orig_unix)) {
-			php_stream_xport_register("unix", PHASYNC_G(orig_unix));
-		}
-		PHASYNC_G(hooks_enabled) = 0;
-	}
-	if (!Z_ISUNDEF(PHASYNC_G(read_handler)))  {
-		zval_ptr_dtor(&PHASYNC_G(read_handler));
-		ZVAL_UNDEF(&PHASYNC_G(read_handler));
-	}
-	if (!Z_ISUNDEF(PHASYNC_G(write_handler))) {
-		zval_ptr_dtor(&PHASYNC_G(write_handler));
-		ZVAL_UNDEF(&PHASYNC_G(write_handler));
-	}
-	/* Do NOT destroy PHASYNC_G(hooked) here — streams close later in shutdown. */
+	phasync_restore_hooks();
+	if (!Z_ISUNDEF(PHASYNC_G(read_handler)))  { zval_ptr_dtor(&PHASYNC_G(read_handler));  ZVAL_UNDEF(&PHASYNC_G(read_handler)); }
+	if (!Z_ISUNDEF(PHASYNC_G(write_handler))) { zval_ptr_dtor(&PHASYNC_G(write_handler)); ZVAL_UNDEF(&PHASYNC_G(write_handler)); }
+	if (!Z_ISUNDEF(PHASYNC_G(sleep_handler))) { zval_ptr_dtor(&PHASYNC_G(sleep_handler)); ZVAL_UNDEF(&PHASYNC_G(sleep_handler)); }
+	/* leave hooked table intact: streams may close later in shutdown */
 	return SUCCESS;
 }
 
@@ -568,12 +716,11 @@ zend_module_entry phasync_module_entry = {
 	STANDARD_MODULE_HEADER,
 	"phasync",
 	ext_functions,
-	NULL,              /* MINIT */
-	NULL,              /* MSHUTDOWN */
+	NULL, NULL,
 	PHP_RINIT(phasync),
 	PHP_RSHUTDOWN(phasync),
-	NULL,              /* MINFO */
-	"0.2.0-dev",
+	NULL,
+	"0.3.0-dev",
 	PHP_MODULE_GLOBALS(phasync),
 	PHP_GINIT(phasync),
 	PHP_GSHUTDOWN(phasync),
