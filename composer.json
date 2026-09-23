@@ -1,0 +1,26 @@
+{
+    "name": "phasync/phasync-ext",
+    "description": "Growable stream_select() (no FD_SETSIZE limit) and transparent fiber-async I/O hooks for PHP 8.3+, without a core patch.",
+    "type": "php-ext",
+    "license": "MIT",
+    "keywords": ["phasync", "fiber", "async", "coroutine", "stream_select", "extension", "pie"],
+    "authors": [
+        {
+            "name": "Frode Børli",
+            "email": "frode@ennerd.com"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/phasync/phasync-ext/issues",
+        "source": "https://github.com/phasync/phasync-ext"
+    },
+    "require": {
+        "php": ">=8.3"
+    },
+    "php-ext": {
+        "extension-name": "phasync",
+        "support-nts": true,
+        "support-zts": false,
+        "os-families-exclude": ["windows"]
+    }
+}
