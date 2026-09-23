@@ -54,6 +54,39 @@ php build/gen_stub.php -f phasync.stub.php   # regenerate arginfo for this PHP
 ./configure --enable-phasync && make
 ```
 
+## Install
+
+**PIE** (the PECL successor) builds it from source against your PHP:
+
+```sh
+pie install phasync/phasync-ext
+```
+
+**Composer** — the package is `type: php-ext`, and it also ships a
+files-autoloaded bootstrap so a plain `composer require` can activate it on the
+CLI with no `php.ini` edit and no root:
+
+```php
+require 'vendor/autoload.php';
+phasync\ext\ensure_loaded();   // call once, first thing
+```
+
+A C extension can't load itself from its own not-yet-loaded code, so
+`ensure_loaded()` (plain PHP) checks whether the extension is present and, if not,
+**re-execs the current CLI process** with `-d extension=<matching .so>` — i.e. it
+lands on the normal, ABI-safe MINIT load. It preserves the original command line
+(via `/proc/self/cmdline`, so your own `-d` flags survive), guards against a
+re-exec loop, and is a no-op when the extension is already loaded (PIE,
+`extension=`, or a prior re-exec). Uses `pcntl_exec()`, falling back to FFI
+`execv()`. CLI only; on other SAPIs add `extension=phasync` to `php.ini`.
+
+Or the plain manual load, from anywhere on disk (absolute path — no
+`extension_dir` needed for `extension=`):
+
+```sh
+php -d extension=/path/to/phasync.so your-app.php
+```
+
 ## API
 
 ```php

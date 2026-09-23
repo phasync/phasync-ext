@@ -44,7 +44,6 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <limits.h>
-#include <dlfcn.h>
 
 #define PHP_PHASYNC_VERSION "0.3.0"
 
@@ -1569,57 +1568,3 @@ ZEND_TSRMLS_CACHE_DEFINE()
 # endif
 ZEND_GET_MODULE(phasync)
 #endif
-
-/* ---- FFI bootstrap ------------------------------------------------------- *
- *
- * A plain C-ABI entry point so the extension can be activated straight from
- * userland with:
- *
- *     FFI::cdef("int phasync_ffi_enable();", "phasync.so")->phasync_ffi_enable();
- *
- * The trick: the version-specific engine ABI (zend_register_module_ex(),
- * which even changed arity across releases, module startup, module_registry)
- * is called from HERE — code compiled against the matching PHP headers — so it
- * is correct by construction. The FFI boundary the caller depends on is just
- * "int phasync_ffi_enable()", which is trivial and stable across PHP versions.
- *
- * It registers as MODULE_PERSISTENT (the process-lifetime path, matching a
- * normal `extension=` load) and pins its own mapping with RTLD_NODELETE, so
- * neither FFI dropping its handle nor a temporary-module unload can pull the
- * code out from under the still-registered module. Idempotent: a no-op if the
- * extension is already loaded (e.g. via extension= or a previous call). */
-ZEND_DLEXPORT int phasync_ffi_enable(void)
-{
-	Dl_info info;
-
-	if (zend_hash_str_exists(&module_registry, "phasync", sizeof("phasync") - 1)) {
-		return 1;   /* already loaded */
-	}
-
-	/* Pin our code for the process lifetime. FFI::cdef()'s handle is often a
-	 * throwaway, so FFI dlclose()s this .so as soon as the caller's expression
-	 * ends — which would unmap the code out from under the still-registered
-	 * module (any later phasync\* call would jump into freed memory). A real
-	 * dlopen() here bumps the refcount (we deliberately never close it) and
-	 * RTLD_NODELETE keeps the mapping even if all refs are later dropped. Note:
-	 * dlopen on an already-loaded library does NOT re-run its constructors. */
-	if (dladdr((void *) phasync_ffi_enable, &info) && info.dli_fname) {
-		dlopen(info.dli_fname, RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
-	}
-
-	/* zend_register_module_ex() gained a module_type parameter in PHP 8.4. */
-#if PHP_VERSION_ID >= 80400
-	if (zend_register_module_ex(&phasync_module_entry, MODULE_PERSISTENT) == NULL) {
-		return 0;
-	}
-#else
-	phasync_module_entry.type = MODULE_PERSISTENT;
-	if (zend_register_module_ex(&phasync_module_entry) == NULL) {
-		return 0;
-	}
-#endif
-	if (zend_startup_module_ex(&phasync_module_entry) == FAILURE) {
-		return 0;
-	}
-	return 1;
-}
