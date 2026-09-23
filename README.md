@@ -5,23 +5,24 @@
 A PHP extension that gives [phasync](https://github.com/phasync/phasync) — and any
 fiber-based async code — two things on **PHP 8.3+**, without patching PHP:
 
-1. **`phasync\stream_select()`** — a drop-in `stream_select()` that uses `poll(2)`
-   internally, so it is **not bounded by `FD_SETSIZE`** (the ~1024 descriptor
-   ceiling). Accepts stream resources *and* plain integer file descriptors.
+1. **`phasync\ext\stream_select()`** — a drop-in `stream_select()` that uses
+   `poll(2)` internally, so it is **not bounded by `FD_SETSIZE`** (the ~1024
+   descriptor ceiling). Accepts stream resources *and* plain integer fds.
 
-2. **Transparent async I/O hooks** — `phasync\enable_hooks()` makes ordinary
-   blocking calls cooperatively yield the current fiber instead of blocking the
-   process. It covers:
+2. **Transparent async I/O via `phasync\ext\manage()`** — run a closure with
+   blocking I/O cooperatively yielding the current fiber instead of blocking the
+   process, for the dynamic extent of that closure. It covers:
    - `tcp://` / `unix://` sockets (incl. `fsockopen`, `stream_socket_client/server`)
    - `ssl://` / `tls://` sockets
    - `proc_open()` pipes
    - `sleep()`, `usleep()`, `time_nanosleep()`, `time_sleep_until()`
+   - `gethostbyname()` and `fopen()` (regular files + FIFO open, via a thread pool)
 
-   The extension performs the real I/O; on a would-block it invokes a userland
-   callback that decides how to wait (typically `Fiber::suspend()` into a
-   scheduler). The C side never touches the Fiber API — your callback owns all
-   suspension. This works because PHP fibers are stackful, so a suspend from
-   inside `fread()`/`SSL_read()` unwinds and resumes correctly.
+   The extension performs the real I/O; on a would-block it invokes one of the
+   handlers you pass to `manage()`, which decides how to wait (typically
+   `Fiber::suspend()` into a scheduler). The C side never touches the Fiber API —
+   your callback owns all suspension. This works because PHP fibers are stackful,
+   so a suspend from inside `fread()`/`SSL_read()` unwinds and resumes correctly.
 
 ## Why
 
@@ -56,26 +57,44 @@ php build/gen_stub.php -f phasync.stub.php   # regenerate arginfo for this PHP
 ## API
 
 ```php
-namespace phasync;
+namespace phasync\ext;
 
 function stream_select(?array &$read, ?array &$write, ?array &$except,
                        ?int $seconds, ?int $microseconds = null): int|false;
 
-function register_read_handler(?callable $handler): void;   // ($fd) — wait until readable
-function register_write_handler(?callable $handler): void;  // ($fd) — wait until writable
-function register_sleep_handler(?callable $handler): void;  // ($microseconds) — wait that long
-
-function enable_hooks(): void;    // install transport + function hooks
-function disable_hooks(): void;   // restore originals
+function manage(
+    \Closure $code,          // run with async I/O active; its return value is returned
+    \Closure $readHandler,   // ($fd) — wait until readable
+    \Closure $writeHandler,  // ($fd) — wait until writable
+    \Closure $sleepHandler,  // ($microseconds) — wait that long (a scheduler timer)
+): mixed;
 ```
 
 The handlers receive an integer fd (or a µs duration for sleep) and are
 responsible only for *waiting* — the extension does the actual I/O afterwards. A
-handler that is called outside an event loop can just do a small blocking
-`phasync\stream_select()` to satisfy the contract.
+read/write handler called outside an event loop can just do a small blocking
+`phasync\ext\stream_select()` to satisfy the contract.
 
-`enable_hooks()` covers, in addition to sockets/TLS/pipes/sleep: `gethostbyname()`
-and `fopen()`.
+`manage()` scopes are **automatic and stacking**: the handlers apply only while
+`$code` runs and are removed when it returns or throws (no separate enable/disable
+step), and a nested `manage()` shadows the outer handlers (LIFO), restoring them
+on return. The hooks are installed once and are inert whenever no scope is active,
+so unhooked code behaves normally. Sleep and the thread-pool ops only take effect
+inside a fiber; outside one they run as the ordinary blocking call.
+
+```php
+use function phasync\ext\manage;
+
+manage(
+    function () {
+        // start fibers, drive them with phasync\ext\stream_select(); blocking
+        // fread()/fwrite()/gethostbyname()/sleep() inside a fiber yield here.
+    },
+    fn(int $fd) => \Fiber::suspend($fd),      // readable
+    fn(int $fd) => \Fiber::suspend($fd),      // writable
+    fn(int $us) => \Fiber::suspend($us),      // timer
+);
+```
 
 ### Filesystem and DNS (thread pool)
 
@@ -83,7 +102,7 @@ Regular files and DNS lookups cannot be made non-blocking with readiness polling
 (a disk fd is always "ready"; `getaddrinfo()` blocks). Like libuv/Node, these are
 offloaded to a small worker thread pool: the worker runs only the raw syscall
 (never the Zend engine, so it is safe in a non-ZTS build) and wakes the parked
-fiber through a self-pipe that reuses `register_read_handler`. Workers are pooled;
+fiber through a self-pipe that reuses the scope's read handler. Workers are pooled;
 the pool size is the `phasync.thread_pool_size` INI (default 8; idle workers cost
 only a lazily-paged stack, so a larger pool is cheap).
 

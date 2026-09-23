@@ -19,7 +19,7 @@ if (count($pairs) < 1100) die("skip could not open enough pairs");
 $last = $pairs[count($pairs) - 1];
 fwrite($last[0], "x");
 $r = array_map(fn($p) => $p[1], $pairs); $w = $e = null;
-var_dump(\phasync\stream_select($r, $w, $e, 2));
+var_dump(\phasync\ext\stream_select($r, $w, $e, 2));
 var_dump(count($r));
 ?>
 --EXPECT--

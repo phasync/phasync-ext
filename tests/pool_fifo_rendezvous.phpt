@@ -21,9 +21,6 @@ if (!function_exists('posix_mkfifo')) {
  * while the single main thread keeps driving the event loop. The test therefore
  * doubles as a concurrency proof: it can only pass if both opens run at once.
  */
-\phasync\enable_hooks();
-\phasync\register_read_handler(fn($fd) => Fiber::suspend($fd));
-
 $fifo = sys_get_temp_dir() . '/phasync_fifo_' . getmypid();
 @unlink($fifo);
 if (function_exists('posix_mkfifo')) {
@@ -35,39 +32,44 @@ if (function_exists('posix_mkfifo')) {
 $result = new stdClass();
 $result->data = null;
 
-$reader = new Fiber(function () use ($fifo, $result) {
-    $fh = fopen($fifo, 'r');           // blocks until a writer opens -> own thread
-    $result->data = fread($fh, 100);   // after open, FIFO honors EAGAIN (RAW path)
-    fclose($fh);
-});
-$writer = new Fiber(function () use ($fifo) {
-    $fh = fopen($fifo, 'w');           // blocks until a reader opens -> own thread
-    fwrite($fh, "ping");
-    fclose($fh);
-});
+\phasync\ext\manage(function () use ($fifo, $result) {
+    $reader = new Fiber(function () use ($fifo, $result) {
+        $fh = fopen($fifo, 'r');           // blocks until a writer opens -> own thread
+        $result->data = fread($fh, 100);   // after open, FIFO honors EAGAIN (RAW path)
+        fclose($fh);
+    });
+    $writer = new Fiber(function () use ($fifo) {
+        $fh = fopen($fifo, 'w');           // blocks until a reader opens -> own thread
+        fwrite($fh, "ping");
+        fclose($fh);
+    });
 
-/* Multi-fiber driver: each fiber parks on a fd; wait for any to be ready, resume
- * it, and let it park again on its next fd, until both have finished. */
-$pending = [];                          // fd => Fiber
-foreach ([$reader, $writer] as $f) {
-    $fd = $f->start();
-    if (!$f->isTerminated()) {
-        $pending[$fd] = $f;
-    }
-}
-while ($pending) {
-    $r = array_keys($pending); $w = $e = null;
-    \phasync\stream_select($r, $w, $e, 5);
-    if (!$r) { echo "timeout\n"; break; }
-    foreach ($r as $fd) {
-        $f = $pending[$fd];
-        unset($pending[$fd]);
-        $nfd = $f->resume();
+    // Multi-fiber driver: each fiber parks on a fd; wait for any to be ready,
+    // resume it, let it park again, until both finish.
+    $pending = [];                          // fd => Fiber
+    foreach ([$reader, $writer] as $f) {
+        $fd = $f->start();
         if (!$f->isTerminated()) {
-            $pending[$nfd] = $f;
+            $pending[$fd] = $f;
         }
     }
-}
+    while ($pending) {
+        $r = array_keys($pending); $w = $e = null;
+        \phasync\ext\stream_select($r, $w, $e, 5);
+        if (!$r) { echo "timeout\n"; break; }
+        foreach ($r as $fd) {
+            $f = $pending[$fd];
+            unset($pending[$fd]);
+            $nfd = $f->resume();
+            if (!$f->isTerminated()) {
+                $pending[$nfd] = $f;
+            }
+        }
+    }
+},
+fn($fd) => Fiber::suspend($fd),
+fn($fd) => Fiber::suspend($fd),
+fn($us) => Fiber::suspend($us));
 
 @unlink($fifo);
 echo "got: {$result->data}\n";

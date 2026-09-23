@@ -33,24 +33,28 @@ while (($line = fgets($pipes[1])) !== false) {
     if (preg_match('/PORT:(\d+)/', $line, $m)) { $port = $m[1]; break; }
 }
 
-\phasync\enable_hooks();
-\phasync\register_read_handler(fn($fd)=>Fiber::suspend(['read',$fd]));
-\phasync\register_write_handler(fn($fd)=>Fiber::suspend(['write',$fd]));
 $ctx = stream_context_create(['ssl'=>['verify_peer'=>false,'verify_peer_name'=>false]]);
 
-$fiber = new Fiber(function() use ($port,$ctx){
-    $c = @stream_socket_client("tls://127.0.0.1:$port",$e,$es,5,STREAM_CLIENT_CONNECT,$ctx);
-    echo "tls fiber read: " . fread($c, 100) . "\n";
-});
-$sig = $fiber->start();
-$suspended = ($sig !== null);
-while (!$fiber->isTerminated()) {
-    [$type,$fd] = $sig;
-    $r=$w=$ex=null;
-    if ($type==='read') $r=[$fd]; else $w=[$fd];
-    \phasync\stream_select($r,$w,$ex,5);
-    $sig = $fiber->resume();
-}
+$suspended = \phasync\ext\manage(function () use ($port, $ctx) {
+    $fiber = new Fiber(function() use ($port,$ctx){
+        $c = @stream_socket_client("tls://127.0.0.1:$port",$e,$es,5,STREAM_CLIENT_CONNECT,$ctx);
+        echo "tls fiber read: " . fread($c, 100) . "\n";
+    });
+    $sig = $fiber->start();
+    $suspended = ($sig !== null);
+    while (!$fiber->isTerminated()) {
+        [$type,$fd] = $sig;
+        $r=$w=$ex=null;
+        if ($type==='read') $r=[$fd]; else $w=[$fd];
+        \phasync\ext\stream_select($r,$w,$ex,5);
+        $sig = $fiber->resume();
+    }
+    return $suspended;
+},
+fn($fd)=>Fiber::suspend(['read',$fd]),
+fn($fd)=>Fiber::suspend(['write',$fd]),
+fn($us)=>Fiber::suspend(['sleep',$us]));
+
 var_dump($suspended);   // proves it went async, not blocking
 foreach ($pipes as $pp) @fclose($pp);
 proc_close($p);

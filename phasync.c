@@ -1,17 +1,24 @@
 /* phasync extension
  *
- * Tier 1: phasync\stream_select() — growable, poll(2)-based, no FD_SETSIZE limit.
+ * phasync\ext\stream_select() — growable, poll(2)-based, no FD_SETSIZE limit.
  *         Accepts stream resources and plain integer file descriptors.
  *
- * Tier 2: transparent async I/O. enable_hooks() re-registers the tcp:// and
- *         unix:// transports AND overrides proc_open()/sleep()/usleep(). Sockets
- *         and proc_open pipes created afterwards get their read/write ops wrapped;
- *         on a would-block the wrapper invokes the userland handler with the
- *         integer fd, which waits until ready (typically Fiber::suspend into a
- *         scheduler) and returns, then the extension performs the real I/O.
- *         sleep()/usleep() invoke a sleep handler with the duration in usec.
- *         The C side never touches the fiber API — the userland callbacks own all
- *         suspension; it works because PHP fibers are stackful.
+ * phasync\ext\manage($code, $read, $write, $sleep) — run $code with transparent
+ *         async I/O active for its dynamic extent. While a manage() scope is
+ *         active the tcp/unix/ssl transports are re-registered and proc_open()/
+ *         sleep()/usleep()/time_nanosleep()/time_sleep_until()/gethostbyname()/
+ *         fopen() are overridden; sockets and pipes created meanwhile get their
+ *         read/write ops wrapped. On a would-block the wrapper invokes the
+ *         scope's handler with the integer fd (or the sleep handler with usec),
+ *         which waits until ready (typically Fiber::suspend into a scheduler);
+ *         the extension then performs the real I/O. Scopes stack (LIFO) and the
+ *         handlers are removed automatically when $code returns or throws — the
+ *         hooks are installed once and are inert whenever no scope is active, so
+ *         there is nothing to toggle off. The C side never touches the fiber API
+ *         — the userland callbacks own all suspension; it works because PHP
+ *         fibers are stackful. Regular-file and DNS blocking and the FIFO open()
+ *         rendezvous run on a worker thread pool (they are not readiness-pollable
+ *         / are unsolvable single-threaded), waking the fiber via a self-pipe.
  */
 #ifdef HAVE_CONFIG_H
 # include "config.h"
@@ -37,6 +44,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <limits.h>
+#include <dlfcn.h>
 
 #define PHP_PHASYNC_VERSION "0.3.0"
 
@@ -62,10 +70,18 @@ typedef enum {
 	PHASYNC_MODE_POOL = 2    /* offload to the thread pool (regular files)    */
 } phasync_mode;
 
+/* One active phasync\manage() scope. Frames live on the C stack of the manage()
+ * call and link to the enclosing scope, so nesting is plain LIFO and unwinds
+ * automatically. The three handlers are owned copies of the closures. */
+typedef struct phasync_scope {
+	zval read;
+	zval write;
+	zval sleep;
+	struct phasync_scope *prev;
+} phasync_scope;
+
 ZEND_BEGIN_MODULE_GLOBALS(phasync)
-	zval read_handler;
-	zval write_handler;
-	zval sleep_handler;
+	phasync_scope *scope_top;     /* innermost active manage() scope, or NULL */
 	php_stream_transport_factory orig_tcp;
 	php_stream_transport_factory orig_unix;
 	php_stream_transport_factory orig_ssl;
@@ -77,7 +93,7 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_gethostbyname)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_fopen)(INTERNAL_FUNCTION_PARAMETERS);
 	zend_long thread_pool_size;   /* INI: phasync.thread_pool_size */
-	bool hooks_enabled;
+	bool hooks_installed;         /* transports + fn overrides physically in place */
 	HashTable hooked;             /* (uintptr_t)stream    -> phasync_hook_entry* */
 	HashTable wrapped_ops_cache;  /* (uintptr_t)orig_ops  -> php_stream_ops*     */
 ZEND_END_MODULE_GLOBALS(phasync)
@@ -89,6 +105,21 @@ ZEND_DECLARE_MODULE_GLOBALS(phasync)
 #else
 # define PHASYNC_G(v) (phasync_globals.v)
 #endif
+
+/* Active handlers = those of the innermost manage() scope, or NULL when no
+ * scope is active (then hooked I/O falls through to the original behaviour). */
+static zend_always_inline zval *phasync_read_handler(void)
+{
+	return PHASYNC_G(scope_top) ? &PHASYNC_G(scope_top)->read : NULL;
+}
+static zend_always_inline zval *phasync_write_handler(void)
+{
+	return PHASYNC_G(scope_top) ? &PHASYNC_G(scope_top)->write : NULL;
+}
+static zend_always_inline zval *phasync_sleep_handler(void)
+{
+	return PHASYNC_G(scope_top) ? &PHASYNC_G(scope_top)->sleep : NULL;
+}
 
 /* ---- fd + wait helpers --------------------------------------------------- */
 
@@ -418,7 +449,7 @@ static void phasync_pool_run(phasync_task *t)
 	char c;
 	ssize_t r;
 
-	if (Z_ISUNDEF(PHASYNC_G(read_handler)) || EG(active_fiber) == NULL
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL
 	 || (p = phasync_pipe_get()) == NULL) {
 		/* No fiber to yield from (or no scheduler / pipe failed): run inline. */
 		phasync_task_exec(t);
@@ -430,7 +461,7 @@ static void phasync_pool_run(phasync_task *t)
 	phasync_pool_submit(t);
 
 	/* park until the worker makes the read end readable */
-	phasync_call_wait(&PHASYNC_G(read_handler), (zend_long) p->rfd);
+	phasync_call_wait(phasync_read_handler(), (zend_long) p->rfd);
 
 	/* The worker will finish this bounded op shortly and write its byte even if
 	 * the fiber was resumed early by an exception, so draining here is safe and
@@ -449,7 +480,7 @@ static void phasync_pool_run_dedicated(phasync_task *t)
 	pthread_attr_t attr;
 	int rc;
 
-	if (Z_ISUNDEF(PHASYNC_G(read_handler)) || EG(active_fiber) == NULL
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL
 	 || pipe(pipefd) != 0) {
 		phasync_task_exec(t);   /* no fiber/scheduler: block inline, as fopen() would */
 		return;
@@ -469,7 +500,7 @@ static void phasync_pool_run_dedicated(phasync_task *t)
 	}
 	pthread_attr_destroy(&attr);
 
-	rc = phasync_call_wait(&PHASYNC_G(read_handler), (zend_long) pipefd[0]);
+	rc = phasync_call_wait(phasync_read_handler(), (zend_long) pipefd[0]);
 
 	/* Always reap the thread, however the fiber came back. If the worker already
 	 * finished, it is past its (only) open() cancellation point with cancellation
@@ -579,9 +610,9 @@ static ssize_t phasync_wrapped_read(php_stream *stream, char *buf, size_t count)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
-	zval *handler = &PHASYNC_G(read_handler);
+	zval *handler = phasync_read_handler();
 
-	if (fd == -1 || Z_ISUNDEF_P(handler)) {
+	if (fd == -1 || handler == NULL) {
 		return orig->read(stream, buf, count);
 	}
 	phasync_ensure_nonblocking(stream, fd);
@@ -611,9 +642,9 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
-	zval *handler = &PHASYNC_G(write_handler);
+	zval *handler = phasync_write_handler();
 
-	if (fd == -1 || Z_ISUNDEF_P(handler)) {
+	if (fd == -1 || handler == NULL) {
 		return orig->write(stream, buf, count);
 	}
 	phasync_ensure_nonblocking(stream, fd);
@@ -643,10 +674,10 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 static ssize_t phasync_wrapped_read_tls(php_stream *stream, char *buf, size_t count)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
-	zval *handler = &PHASYNC_G(read_handler);
+	zval *handler = phasync_read_handler();
 	php_socket_t fd;
 
-	if (Z_ISUNDEF_P(handler)) {
+	if (handler == NULL) {
 		return orig->read(stream, buf, count);
 	}
 	phasync_ensure_nonblocking(stream, phasync_stream_fd(stream));
@@ -668,10 +699,10 @@ static ssize_t phasync_wrapped_read_tls(php_stream *stream, char *buf, size_t co
 static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, size_t count)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
-	zval *handler = &PHASYNC_G(write_handler);
+	zval *handler = phasync_write_handler();
 	php_socket_t fd;
 
-	if (Z_ISUNDEF_P(handler)) {
+	if (handler == NULL) {
 		return orig->write(stream, buf, count);
 	}
 	phasync_ensure_nonblocking(stream, phasync_stream_fd(stream));
@@ -847,7 +878,7 @@ static ZEND_NAMED_FUNCTION(phasync_sleep_override)
 	 * idle-waits by calling these same sleep functions from the main (non-fiber)
 	 * context; delegating those to the handler (which can only Fiber::suspend
 	 * inside a fiber) would collapse the wait to a no-op and spin the loop. */
-	if (Z_ISUNDEF(PHASYNC_G(sleep_handler)) || EG(active_fiber) == NULL) {
+	if (phasync_sleep_handler() == NULL || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_sleep)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -859,7 +890,7 @@ static ZEND_NAMED_FUNCTION(phasync_sleep_override)
 		zend_argument_value_error(1, "must be greater than or equal to 0");
 		RETURN_THROWS();
 	}
-	phasync_call_wait(&PHASYNC_G(sleep_handler), (zend_long) (seconds * 1000000));
+	phasync_call_wait(phasync_sleep_handler(), (zend_long) (seconds * 1000000));
 	RETURN_LONG(0);
 }
 
@@ -867,7 +898,7 @@ static ZEND_NAMED_FUNCTION(phasync_usleep_override)
 {
 	zend_long usec;
 
-	if (Z_ISUNDEF(PHASYNC_G(sleep_handler)) || EG(active_fiber) == NULL) {
+	if (phasync_sleep_handler() == NULL || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_usleep)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -879,14 +910,14 @@ static ZEND_NAMED_FUNCTION(phasync_usleep_override)
 		zend_argument_value_error(1, "must be greater than or equal to 0");
 		RETURN_THROWS();
 	}
-	phasync_call_wait(&PHASYNC_G(sleep_handler), usec);
+	phasync_call_wait(phasync_sleep_handler(), usec);
 }
 
 static ZEND_NAMED_FUNCTION(phasync_time_nanosleep_override)
 {
 	zend_long sec, nsec;
 
-	if (Z_ISUNDEF(PHASYNC_G(sleep_handler)) || EG(active_fiber) == NULL) {
+	if (phasync_sleep_handler() == NULL || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_time_nanosleep)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -903,7 +934,7 @@ static ZEND_NAMED_FUNCTION(phasync_time_nanosleep_override)
 		zend_argument_value_error(2, "must be greater than or equal to 0");
 		RETURN_THROWS();
 	}
-	phasync_call_wait(&PHASYNC_G(sleep_handler), (zend_long) (sec * 1000000 + nsec / 1000));
+	phasync_call_wait(phasync_sleep_handler(), (zend_long) (sec * 1000000 + nsec / 1000));
 	RETURN_TRUE;
 }
 
@@ -913,7 +944,7 @@ static ZEND_NAMED_FUNCTION(phasync_time_sleep_until_override)
 	struct timeval tv;
 	zend_long usec;
 
-	if (Z_ISUNDEF(PHASYNC_G(sleep_handler)) || EG(active_fiber) == NULL) {
+	if (phasync_sleep_handler() == NULL || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_time_sleep_until)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -924,7 +955,7 @@ static ZEND_NAMED_FUNCTION(phasync_time_sleep_until_override)
 	gettimeofday(&tv, NULL);
 	now = (double) tv.tv_sec + (double) tv.tv_usec / 1000000.0;
 	usec = (ts > now) ? (zend_long) ((ts - now) * 1000000.0) : 0;
-	phasync_call_wait(&PHASYNC_G(sleep_handler), usec);
+	phasync_call_wait(phasync_sleep_handler(), usec);
 	RETURN_TRUE;
 }
 
@@ -934,7 +965,7 @@ static ZEND_NAMED_FUNCTION(phasync_gethostbyname_override)
 	phasync_task t;
 	char hostbuf[256];
 
-	if (Z_ISUNDEF(PHASYNC_G(read_handler))) {
+	if (phasync_read_handler() == NULL) {
 		PHASYNC_G(orig_gethostbyname)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -994,7 +1025,7 @@ static ZEND_NAMED_FUNCTION(phasync_fopen_override)
 	php_stream *stream;
 	struct stat st;
 
-	if (Z_ISUNDEF(PHASYNC_G(read_handler))) {
+	if (phasync_read_handler() == NULL) {
 		PHASYNC_G(orig_fopen)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -1068,13 +1099,17 @@ static zend_internal_function *phasync_find_ifunc(const char *name, size_t len)
 	return NULL;
 }
 
-ZEND_FUNCTION(phasync_enable_hooks)
+/* Install the transport re-registration + internal-function overrides. Called
+ * lazily on the first manage() of a request and left in place: the hooks are
+ * inert while no scope is active (the wrapped ops and sleep/pool overrides fall
+ * through to the original when scope_top is NULL), so there is nothing to toggle
+ * off. Idempotent. */
+static void phasync_install_hooks(void)
 {
 	HashTable *xhash;
 	zend_internal_function *f;
 
-	ZEND_PARSE_PARAMETERS_NONE();
-	if (PHASYNC_G(hooks_enabled)) {
+	if (PHASYNC_G(hooks_installed)) {
 		return;
 	}
 
@@ -1122,14 +1157,14 @@ ZEND_FUNCTION(phasync_enable_hooks)
 		PHASYNC_G(orig_fopen) = f->handler;
 		f->handler = phasync_fopen_override;
 	}
-	PHASYNC_G(hooks_enabled) = 1;
+	PHASYNC_G(hooks_installed) = 1;
 }
 
 static void phasync_restore_hooks(void)
 {
 	zend_internal_function *f;
 
-	if (!PHASYNC_G(hooks_enabled)) {
+	if (!PHASYNC_G(hooks_installed)) {
 		return;
 	}
 	if (PHASYNC_G(orig_tcp))  php_stream_xport_register("tcp", PHASYNC_G(orig_tcp));
@@ -1165,46 +1200,56 @@ static void phasync_restore_hooks(void)
 	if (PHASYNC_G(orig_fopen) && (f = phasync_find_ifunc("fopen", sizeof("fopen") - 1))) {
 		f->handler = PHASYNC_G(orig_fopen);
 	}
-	PHASYNC_G(hooks_enabled) = 0;
+	PHASYNC_G(hooks_installed) = 0;
 }
 
-ZEND_FUNCTION(phasync_disable_hooks)
+/* ---- manage(): scoped handler activation --------------------------------- */
+
+ZEND_FUNCTION(phasync_ext_manage)
 {
-	ZEND_PARSE_PARAMETERS_NONE();
-	phasync_restore_hooks();
-}
+	zval *code, *rh, *wh, *sh;
+	phasync_scope frame;
+	zval retval;
 
-/* ---- handler registration ------------------------------------------------ */
-
-static void phasync_set_handler(zval *slot, INTERNAL_FUNCTION_PARAMETERS)
-{
-	zend_fcall_info fci;
-	zend_fcall_info_cache fcc;
-
-	ZEND_PARSE_PARAMETERS_START(1, 1)
-		Z_PARAM_FUNC_OR_NULL(fci, fcc)
+	ZEND_PARSE_PARAMETERS_START(4, 4)
+		Z_PARAM_ZVAL(code)
+		Z_PARAM_ZVAL(rh)
+		Z_PARAM_ZVAL(wh)
+		Z_PARAM_ZVAL(sh)
 	ZEND_PARSE_PARAMETERS_END();
 
-	if (!Z_ISUNDEF_P(slot)) {
-		zval_ptr_dtor(slot);
-		ZVAL_UNDEF(slot);
-	}
-	if (ZEND_FCI_INITIALIZED(fci)) {
-		ZVAL_COPY(slot, &fci.function_name);
-	}
-}
+	/* Push this scope's handlers (owned copies) and link to the enclosing one. */
+	ZVAL_COPY(&frame.read,  rh);
+	ZVAL_COPY(&frame.write, wh);
+	ZVAL_COPY(&frame.sleep, sh);
+	frame.prev = PHASYNC_G(scope_top);
+	PHASYNC_G(scope_top) = &frame;
 
-ZEND_FUNCTION(phasync_register_read_handler)
-{
-	phasync_set_handler(&PHASYNC_G(read_handler), INTERNAL_FUNCTION_PARAM_PASSTHRU);
-}
-ZEND_FUNCTION(phasync_register_write_handler)
-{
-	phasync_set_handler(&PHASYNC_G(write_handler), INTERNAL_FUNCTION_PARAM_PASSTHRU);
-}
-ZEND_FUNCTION(phasync_register_sleep_handler)
-{
-	phasync_set_handler(&PHASYNC_G(sleep_handler), INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	phasync_install_hooks();   /* idempotent; first manage() of the request installs */
+
+	ZVAL_UNDEF(&retval);
+	/* zend_try/zend_catch guarantees the pop even on a fatal bailout (which
+	 * longjmps past normal C control flow); a thrown PHP exception is the
+	 * ordinary path — call_user_function returns and EG(exception) is set. */
+	zend_try {
+		call_user_function(NULL, NULL, code, &retval, 0, NULL);
+	} zend_catch {
+		PHASYNC_G(scope_top) = frame.prev;
+		zval_ptr_dtor(&frame.read);
+		zval_ptr_dtor(&frame.write);
+		zval_ptr_dtor(&frame.sleep);
+		zend_bailout();
+	} zend_end_try();
+
+	PHASYNC_G(scope_top) = frame.prev;
+	zval_ptr_dtor(&frame.read);
+	zval_ptr_dtor(&frame.write);
+	zval_ptr_dtor(&frame.sleep);
+
+	if (Z_ISUNDEF(retval)) {
+		RETURN_NULL();   /* $code threw (exception pending) or returned nothing */
+	}
+	RETURN_COPY_VALUE(&retval);
 }
 
 /* ---- phasync\stream_select (Tier 1) -------------------------------------- */
@@ -1322,7 +1367,7 @@ static int phasync_emulate_read(zval *array)
 	return ret;
 }
 
-ZEND_FUNCTION(phasync_stream_select)
+ZEND_FUNCTION(phasync_ext_stream_select)
 {
 	zval *r_array, *w_array, *e_array;
 	zend_long sec, usec = 0;
@@ -1466,9 +1511,6 @@ static PHP_GINIT_FUNCTION(phasync)
 	ZEND_TSRMLS_CACHE_UPDATE();
 #endif
 	memset(phasync_globals, 0, sizeof(*phasync_globals));
-	ZVAL_UNDEF(&phasync_globals->read_handler);
-	ZVAL_UNDEF(&phasync_globals->write_handler);
-	ZVAL_UNDEF(&phasync_globals->sleep_handler);
 	zend_hash_init(&phasync_globals->hooked, 8, NULL, phasync_hook_entry_dtor, 1);
 	zend_hash_init(&phasync_globals->wrapped_ops_cache, 8, NULL, phasync_ops_dtor, 1);
 }
@@ -1488,10 +1530,8 @@ static PHP_MSHUTDOWN_FUNCTION(phasync)
 
 static PHP_RINIT_FUNCTION(phasync)
 {
-	ZVAL_UNDEF(&PHASYNC_G(read_handler));
-	ZVAL_UNDEF(&PHASYNC_G(write_handler));
-	ZVAL_UNDEF(&PHASYNC_G(sleep_handler));
-	PHASYNC_G(hooks_enabled) = 0;
+	PHASYNC_G(scope_top) = NULL;
+	PHASYNC_G(hooks_installed) = 0;
 	zend_hash_clean(&PHASYNC_G(hooked));
 	return SUCCESS;
 }
@@ -1499,10 +1539,10 @@ static PHP_RINIT_FUNCTION(phasync)
 static PHP_RSHUTDOWN_FUNCTION(phasync)
 {
 	phasync_restore_hooks();
-	if (!Z_ISUNDEF(PHASYNC_G(read_handler)))  { zval_ptr_dtor(&PHASYNC_G(read_handler));  ZVAL_UNDEF(&PHASYNC_G(read_handler)); }
-	if (!Z_ISUNDEF(PHASYNC_G(write_handler))) { zval_ptr_dtor(&PHASYNC_G(write_handler)); ZVAL_UNDEF(&PHASYNC_G(write_handler)); }
-	if (!Z_ISUNDEF(PHASYNC_G(sleep_handler))) { zval_ptr_dtor(&PHASYNC_G(sleep_handler)); ZVAL_UNDEF(&PHASYNC_G(sleep_handler)); }
-	/* leave hooked table intact: streams may close later in shutdown */
+	/* Any manage() scopes have unwound already (their frames live on the C
+	 * stack); nothing to free here. Leave the hooked table intact: streams may
+	 * close later in shutdown. */
+	PHASYNC_G(scope_top) = NULL;
 	return SUCCESS;
 }
 
@@ -1529,3 +1569,49 @@ ZEND_TSRMLS_CACHE_DEFINE()
 # endif
 ZEND_GET_MODULE(phasync)
 #endif
+
+/* ---- FFI bootstrap ------------------------------------------------------- *
+ *
+ * A plain C-ABI entry point so the extension can be activated straight from
+ * userland with:
+ *
+ *     FFI::cdef("int phasync_ffi_enable();", "phasync.so")->phasync_ffi_enable();
+ *
+ * The trick: the version-specific engine ABI (zend_register_module_ex(),
+ * which even changed arity across releases, module startup, module_registry)
+ * is called from HERE — code compiled against the matching PHP headers — so it
+ * is correct by construction. The FFI boundary the caller depends on is just
+ * "int phasync_ffi_enable()", which is trivial and stable across PHP versions.
+ *
+ * It registers as MODULE_PERSISTENT (the process-lifetime path, matching a
+ * normal `extension=` load) and pins its own mapping with RTLD_NODELETE, so
+ * neither FFI dropping its handle nor a temporary-module unload can pull the
+ * code out from under the still-registered module. Idempotent: a no-op if the
+ * extension is already loaded (e.g. via extension= or a previous call). */
+ZEND_DLEXPORT int phasync_ffi_enable(void)
+{
+	Dl_info info;
+
+	if (zend_hash_str_exists(&module_registry, "phasync", sizeof("phasync") - 1)) {
+		return 1;   /* already loaded */
+	}
+
+	/* Pin our code for the process lifetime. FFI::cdef()'s handle is often a
+	 * throwaway, so FFI dlclose()s this .so as soon as the caller's expression
+	 * ends — which would unmap the code out from under the still-registered
+	 * module (any later phasync\* call would jump into freed memory). A real
+	 * dlopen() here bumps the refcount (we deliberately never close it) and
+	 * RTLD_NODELETE keeps the mapping even if all refs are later dropped. Note:
+	 * dlopen on an already-loaded library does NOT re-run its constructors. */
+	if (dladdr((void *) phasync_ffi_enable, &info) && info.dli_fname) {
+		dlopen(info.dli_fname, RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
+	}
+
+	if (zend_register_module_ex(&phasync_module_entry, MODULE_PERSISTENT) == NULL) {
+		return 0;
+	}
+	if (zend_startup_module_ex(&phasync_module_entry) == FAILURE) {
+		return 0;
+	}
+	return 1;
+}
