@@ -38,3 +38,33 @@ function stream_select(?array &$read, ?array &$write, ?array &$except, ?int $sec
  * Returns whatever $code returns.
  */
 function manage(\Closure $code, \Closure $readHandler, \Closure $writeHandler, \Closure $sleepHandler): mixed {}
+
+/**
+ * EXPERIMENTAL. Swap the global symbol table (the $GLOBALS / `global` table,
+ * EG(symbol_table)) — a step toward per-coroutine global isolation.
+ *
+ * Installs the given context as the active global scope and returns an opaque
+ * handle to the previously-installed one. Pass 0 to install a fresh empty scope.
+ * Pass a handle returned earlier to restore that scope. The handle you get back
+ * is "consumed" once you pass it in again; free unused handles with
+ * free_symbols().
+ *
+ *   $saved = swap_symbols(0);   // isolate: fresh empty globals, keep the old
+ *   // ... code here sees its own $GLOBALS ...
+ *   $mine  = swap_symbols($saved);  // restore the caller's globals
+ *   free_symbols($mine);            // discard the isolated scope
+ *
+ * Caveats (why this is experimental): it swaps ONLY globals, not function/class
+ * statics; superglobals ($_SERVER, $_GET, …) are entries in the table, so a
+ * fresh scope does not have them; and it must not run while a `global` binding
+ * (an IS_INDIRECT into the outgoing table) is live — swap at coroutine
+ * boundaries, and restore before the request ends.
+ */
+function swap_symbols(int $context = 0): int {}
+
+/**
+ * EXPERIMENTAL. Destroy a symbol-table context handle returned by
+ * swap_symbols() that you no longer need. Never pass the currently-installed
+ * scope's handle.
+ */
+function free_symbols(int $context): void {}

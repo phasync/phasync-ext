@@ -95,6 +95,8 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	bool hooks_installed;         /* transports + fn overrides physically in place */
 	HashTable hooked;             /* (uintptr_t)stream    -> phasync_hook_entry* */
 	HashTable wrapped_ops_cache;  /* (uintptr_t)orig_ops  -> php_stream_ops*     */
+	HashTable symtab_registry;    /* handle -> detached zend_array* (swap_symbols) */
+	zend_long symtab_next;        /* monotonic handle counter                     */
 ZEND_END_MODULE_GLOBALS(phasync)
 
 ZEND_DECLARE_MODULE_GLOBALS(phasync)
@@ -1251,6 +1253,74 @@ ZEND_FUNCTION(phasync_ext_manage)
 	RETURN_COPY_VALUE(&retval);
 }
 
+/* ---- EXPERIMENTAL: swap the global symbol table -------------------------- *
+ *
+ * EG(symbol_table) is the $GLOBALS / `global` table, an embedded zend_array.
+ * We "swap" by moving the struct: the outgoing table's buckets are transferred
+ * into a heap container we own (handed back as a handle), and the incoming
+ * table's struct is moved into EG(symbol_table). This is the globals-only piece
+ * of per-coroutine virtualization — it does NOT touch function/class statics
+ * (those live behind CG(map_ptr_base)). See swap_symbols() docs for caveats. */
+
+static void phasync_symtab_free(zend_array *a);   /* defined near the dtors below */
+
+static zend_long phasync_symtab_store(zend_array *a)
+{
+	zend_long h = ++PHASYNC_G(symtab_next);
+	zend_hash_index_add_ptr(&PHASYNC_G(symtab_registry), (zend_ulong) h, a);
+	return h;
+}
+
+ZEND_FUNCTION(phasync_ext_swap_symbols)
+{
+	zend_long ctx = 0;
+	zend_array *incoming, *old;
+
+	ZEND_PARSE_PARAMETERS_START(0, 1)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_LONG(ctx)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (ctx == 0) {
+		incoming = zend_new_array(8);   /* a fresh, empty global scope */
+	} else {
+		incoming = zend_hash_index_find_ptr(&PHASYNC_G(symtab_registry), (zend_ulong) ctx);
+		if (incoming == NULL) {
+			zend_argument_value_error(1, "is not a valid symbol-table context handle");
+			RETURN_THROWS();
+		}
+		zend_hash_index_del(&PHASYNC_G(symtab_registry), (zend_ulong) ctx);  /* consumed */
+	}
+
+	/* Move the currently-installed table out into a heap container we own. */
+	old = emalloc(sizeof(zend_array));
+	memcpy(old, &EG(symbol_table), sizeof(zend_array));
+
+	/* Move the incoming table in; free only the now-empty container. */
+	memcpy(&EG(symbol_table), incoming, sizeof(zend_array));
+	efree(incoming);
+
+	RETURN_LONG(phasync_symtab_store(old));
+}
+
+ZEND_FUNCTION(phasync_ext_free_symbols)
+{
+	zend_long ctx;
+	zend_array *a;
+
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_LONG(ctx)
+	ZEND_PARSE_PARAMETERS_END();
+
+	a = zend_hash_index_find_ptr(&PHASYNC_G(symtab_registry), (zend_ulong) ctx);
+	if (a == NULL) {
+		zend_argument_value_error(1, "is not a valid symbol-table context handle");
+		RETURN_THROWS();
+	}
+	zend_hash_index_del(&PHASYNC_G(symtab_registry), (zend_ulong) ctx);
+	phasync_symtab_free(a);
+}
+
 /* ---- phasync\stream_select (Tier 1) -------------------------------------- */
 
 static php_socket_t phasync_elem_fd(zval *elem)
@@ -1484,6 +1554,13 @@ static void phasync_ops_dtor(zval *zv)
 	pefree(Z_PTR_P(zv), 1);
 }
 
+/* Destroy a detached global symbol table (buckets + our container). */
+static void phasync_symtab_free(zend_array *a)
+{
+	zend_hash_destroy(a);
+	efree(a);
+}
+
 PHP_INI_BEGIN()
 	STD_PHP_INI_ENTRY("phasync.thread_pool_size", "8", PHP_INI_SYSTEM, OnUpdateLong,
 		thread_pool_size, zend_phasync_globals, phasync_globals)
@@ -1532,6 +1609,11 @@ static PHP_RINIT_FUNCTION(phasync)
 	PHASYNC_G(scope_top) = NULL;
 	PHASYNC_G(hooks_installed) = 0;
 	zend_hash_clean(&PHASYNC_G(hooked));
+	/* Per-request registry of detached global symbol tables (swap_symbols).
+	 * No value dtor: consuming a handle via zend_hash_index_del must NOT destroy
+	 * the table (it is about to be installed/returned); we free tables manually. */
+	zend_hash_init(&PHASYNC_G(symtab_registry), 8, NULL, NULL, 0);
+	PHASYNC_G(symtab_next) = 0;
 	return SUCCESS;
 }
 
@@ -1542,6 +1624,14 @@ static PHP_RSHUTDOWN_FUNCTION(phasync)
 	 * stack); nothing to free here. Leave the hooked table intact: streams may
 	 * close later in shutdown. */
 	PHASYNC_G(scope_top) = NULL;
+	/* Free any symbol-table contexts the caller never restored/freed. */
+	{
+		zend_array *a;
+		ZEND_HASH_FOREACH_PTR(&PHASYNC_G(symtab_registry), a) {
+			phasync_symtab_free(a);
+		} ZEND_HASH_FOREACH_END();
+	}
+	zend_hash_destroy(&PHASYNC_G(symtab_registry));
 	return SUCCESS;
 }
 

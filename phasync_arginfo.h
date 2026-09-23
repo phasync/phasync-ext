@@ -1,5 +1,5 @@
 /* This is a generated file, edit the .stub.php file instead.
- * Stub hash: 2e71780406d9a18d22f7777dba5ded3b47c7ae56 */
+ * Stub hash: 659f0f4d41c50d30b09d9a570f3b15e412df5aca */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_phasync_ext_stream_select, 0, 4, MAY_BE_LONG|MAY_BE_FALSE)
 	ZEND_ARG_TYPE_INFO(1, read, IS_ARRAY, 1)
@@ -16,11 +16,23 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_phasync_ext_manage, 0, 4, IS_MIX
 	ZEND_ARG_OBJ_INFO(0, sleepHandler, Closure, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_phasync_ext_swap_symbols, 0, 0, IS_LONG, 0)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, context, IS_LONG, 0, "0")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_phasync_ext_free_symbols, 0, 1, IS_VOID, 0)
+	ZEND_ARG_TYPE_INFO(0, context, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_FUNCTION(phasync_ext_stream_select);
 ZEND_FUNCTION(phasync_ext_manage);
+ZEND_FUNCTION(phasync_ext_swap_symbols);
+ZEND_FUNCTION(phasync_ext_free_symbols);
 
 static const zend_function_entry ext_functions[] = {
 	ZEND_RAW_FENTRY(ZEND_NS_NAME("phasync\\ext", "stream_select"), zif_phasync_ext_stream_select, arginfo_phasync_ext_stream_select, 0, NULL, NULL)
 	ZEND_RAW_FENTRY(ZEND_NS_NAME("phasync\\ext", "manage"), zif_phasync_ext_manage, arginfo_phasync_ext_manage, 0, NULL, NULL)
+	ZEND_RAW_FENTRY(ZEND_NS_NAME("phasync\\ext", "swap_symbols"), zif_phasync_ext_swap_symbols, arginfo_phasync_ext_swap_symbols, 0, NULL, NULL)
+	ZEND_RAW_FENTRY(ZEND_NS_NAME("phasync\\ext", "free_symbols"), zif_phasync_ext_free_symbols, arginfo_phasync_ext_free_symbols, 0, NULL, NULL)
 	ZEND_FE_END
 };
