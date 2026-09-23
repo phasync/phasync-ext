@@ -418,8 +418,9 @@ static void phasync_pool_run(phasync_task *t)
 	char c;
 	ssize_t r;
 
-	if (Z_ISUNDEF(PHASYNC_G(read_handler)) || (p = phasync_pipe_get()) == NULL) {
-		/* No scheduler to yield to (or pipe failed): run inline on this thread. */
+	if (Z_ISUNDEF(PHASYNC_G(read_handler)) || EG(active_fiber) == NULL
+	 || (p = phasync_pipe_get()) == NULL) {
+		/* No fiber to yield from (or no scheduler / pipe failed): run inline. */
 		phasync_task_exec(t);
 		return;
 	}
@@ -448,8 +449,9 @@ static void phasync_pool_run_dedicated(phasync_task *t)
 	pthread_attr_t attr;
 	int rc;
 
-	if (Z_ISUNDEF(PHASYNC_G(read_handler)) || pipe(pipefd) != 0) {
-		phasync_task_exec(t);   /* no scheduler: block inline, as fopen() would */
+	if (Z_ISUNDEF(PHASYNC_G(read_handler)) || EG(active_fiber) == NULL
+	 || pipe(pipefd) != 0) {
+		phasync_task_exec(t);   /* no fiber/scheduler: block inline, as fopen() would */
 		return;
 	}
 	fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
@@ -841,7 +843,11 @@ static ZEND_NAMED_FUNCTION(phasync_sleep_override)
 {
 	zend_long seconds;
 
-	if (Z_ISUNDEF(PHASYNC_G(sleep_handler))) {
+	/* Only intercept when a fiber is actually running. The scheduler itself
+	 * idle-waits by calling these same sleep functions from the main (non-fiber)
+	 * context; delegating those to the handler (which can only Fiber::suspend
+	 * inside a fiber) would collapse the wait to a no-op and spin the loop. */
+	if (Z_ISUNDEF(PHASYNC_G(sleep_handler)) || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_sleep)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -861,7 +867,7 @@ static ZEND_NAMED_FUNCTION(phasync_usleep_override)
 {
 	zend_long usec;
 
-	if (Z_ISUNDEF(PHASYNC_G(sleep_handler))) {
+	if (Z_ISUNDEF(PHASYNC_G(sleep_handler)) || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_usleep)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -880,7 +886,7 @@ static ZEND_NAMED_FUNCTION(phasync_time_nanosleep_override)
 {
 	zend_long sec, nsec;
 
-	if (Z_ISUNDEF(PHASYNC_G(sleep_handler))) {
+	if (Z_ISUNDEF(PHASYNC_G(sleep_handler)) || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_time_nanosleep)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -907,7 +913,7 @@ static ZEND_NAMED_FUNCTION(phasync_time_sleep_until_override)
 	struct timeval tv;
 	zend_long usec;
 
-	if (Z_ISUNDEF(PHASYNC_G(sleep_handler))) {
+	if (Z_ISUNDEF(PHASYNC_G(sleep_handler)) || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_time_sleep_until)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
