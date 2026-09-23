@@ -1607,9 +1607,17 @@ ZEND_DLEXPORT int phasync_ffi_enable(void)
 		dlopen(info.dli_fname, RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
 	}
 
+	/* zend_register_module_ex() gained a module_type parameter in PHP 8.4. */
+#if PHP_VERSION_ID >= 80400
 	if (zend_register_module_ex(&phasync_module_entry, MODULE_PERSISTENT) == NULL) {
 		return 0;
 	}
+#else
+	phasync_module_entry.type = MODULE_PERSISTENT;
+	if (zend_register_module_ex(&phasync_module_entry) == NULL) {
+		return 0;
+	}
+#endif
 	if (zend_startup_module_ex(&phasync_module_entry) == FAILURE) {
 		return 0;
 	}
