@@ -59,9 +59,15 @@ if (!\function_exists('phasync\\ext\\ensure_loaded')) {
         $so = $soPath ?? _resolve_so();
         if ($so === null || !\is_file($so)) {
             throw new \RuntimeException(
-                'phasync\\ext\\ensure_loaded(): no phasync extension binary found for '
-                . 'this PHP build (' . _abi_key() . '). Set PHASYNC_EXT_SO to a .so '
-                . 'path, install via PIE, or add "extension=phasync" to php.ini.'
+                "phasync\\ext\\ensure_loaded(): no prebuilt phasync binary is bundled "
+                . "for this platform (" . _abi_key() . ").\n"
+                . "Bundled platforms: PHP 8.3/8.4/8.5, x86_64/aarch64, glibc/musl.\n"
+                . "Build it yourself and point PHASYNC_EXT_SO at the result:\n"
+                . "    git clone https://github.com/phasync/phasync-ext\n"
+                . "    cd phasync-ext && phpize && ./configure --enable-phasync && make\n"
+                . "    PHASYNC_EXT_SO=\"\$PWD/modules/phasync.so\" php your-app.php\n"
+                . "(or drop it in " . __DIR__ . "/bin/phasync-" . _abi_key() . ".so, "
+                . "or add 'extension=<path>' to php.ini)."
             );
         }
 
