@@ -1,25 +1,30 @@
-name: Release binaries
+name: Release
 
-# Builds the per-ABI prebuilt extension binaries that phasync\ext\ensure_loaded()
-# selects from (bin/phasync-<ver>-<ts>-<arch>-<libc>.so) and attaches them to the
-# GitHub release on a v* tag. Run manually (workflow_dispatch) to smoke-test.
-#
-# glibc builds run inside the official php:X-cli image. musl builds do NOT use a
-# `container:` — GitHub cannot run JavaScript actions (checkout, upload-artifact)
-# inside an Alpine container on an arm64 runner — so those run on the glibc host
-# and do the actual build inside `docker run … php:X-cli-alpine`.
+# One-click release: builds the 12 per-ABI binaries, bundles them into a
+# tag-only commit (so Packagist's tag tarball carries bin/ while main stays
+# binary-free), pushes the tag, and publishes a GitHub release with the .so as
+# assets. Run from the Actions tab with the version to cut.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 0.4.0-alpha1'
+        required: true
+      prerelease:
+        description: 'Mark as a pre-release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
 
 jobs:
   build-glibc:
-    name: PHP ${{ matrix.php }} ${{ matrix.arch }}-glibc
+    name: build ${{ matrix.php }} ${{ matrix.arch }}-glibc
     runs-on: ${{ matrix.runner }}
     container: php:${{ matrix.php }}-cli
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - { php: '8.3', runner: ubuntu-24.04,     arch: x86_64 }
@@ -44,16 +49,13 @@ jobs:
           php -d extension="$PWD/$ART" -r 'exit(extension_loaded("phasync") ? 0 : 1);'
           echo "ART=$ART" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ART }}
-          path: ${{ env.ART }}
-          if-no-files-found: error
+        with: { name: "${{ env.ART }}", path: "${{ env.ART }}", if-no-files-found: error }
 
   build-musl:
-    name: PHP ${{ matrix.php }} ${{ matrix.arch }}-musl
+    name: build ${{ matrix.php }} ${{ matrix.arch }}-musl
     runs-on: ${{ matrix.runner }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - { php: '8.3', runner: ubuntu-24.04,     arch: x86_64 }
@@ -79,30 +81,54 @@ jobs:
           cp modules/phasync.so "$ART"
           echo "ART=$ART" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ART }}
-          path: ${{ env.ART }}
-          if-no-files-found: error
+        with: { name: "${{ env.ART }}", path: "${{ env.ART }}", if-no-files-found: error }
 
-  release:
-    name: Attach binaries to release
+  publish:
+    name: Bundle, tag & release
     needs: [build-glibc, build-musl]
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Upload to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - uses: actions/checkout@v4
+        with: { ref: main }
+
+      - name: Refuse to overwrite an existing tag
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ inputs.version }}" | grep -q .; then
+            echo "::error::Tag ${{ inputs.version }} already exists"; exit 1
+          fi
+
+      - name: Collect binaries into bin/
+        uses: actions/download-artifact@v4
+        with: { path: bin, merge-multiple: true }
+
+      - name: Verify all 12 ABIs are present
         run: |
           set -eux
-          ls -l dist
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" dist/*.so --clobber
+          n=$(ls bin/*.so | wc -l)
+          test "$n" -eq 12 || { echo "::error::expected 12 binaries, got $n"; exit 1; }
+
+      - name: Create tag-only release commit and tag
+        run: |
+          set -eux
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "__release-${{ inputs.version }}"
+          git add -f bin/*.so
+          git commit -m "Release ${{ inputs.version }}: bundle prebuilt binaries (12 ABIs)
+
+          bin/ carries phasync-<ver>-nts-<arch>-<libc>.so for PHP 8.3/8.4/8.5 x
+          {x86_64,aarch64} x {glibc,musl}. This commit lives only on the tag;
+          main stays binary-free."
+          git tag -a "${{ inputs.version }}" -m "phasync-ext ${{ inputs.version }}"
+          git push origin "refs/tags/${{ inputs.version }}"
+
+      - name: Publish GitHub release with binary assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          PRE=""
+          [ "${{ inputs.prerelease }}" = "true" ] && PRE="--prerelease"
+          gh release create "${{ inputs.version }}" $PRE \
+            --title "${{ inputs.version }}" --generate-notes \
+            bin/*.so
