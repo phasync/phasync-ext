@@ -15,7 +15,8 @@
         "source": "https://github.com/phasync/phasync-ext"
     },
     "require": {
-        "php": ">=8.3"
+        "php": ">=8.3",
+        "phasync/phasync": "^1.1@RC"
     },
     "autoload": {
         "files": ["phasync-ext.php"]

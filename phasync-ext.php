@@ -48,11 +48,16 @@ if (!\function_exists('phasync\\ext\\ensure_loaded')) {
             );
         }
 
-        if (\PHP_SAPI !== 'cli') {
+        // Non-CLI SAPIs (php-fpm, apache2handler/mod_php, cgi, …) cannot be
+        // re-executed to load an extension mid-request. There the extension must
+        // be loaded the normal way, so require it in php.ini and fail loudly.
+        if (\PHP_SAPI !== 'cli' && \PHP_SAPI !== 'phpdbg') {
             throw new \RuntimeException(
-                'phasync\\ext\\ensure_loaded(): the extension is not loaded and can '
-                . 'only be auto-loaded on the CLI SAPI. Add "extension=phasync" to '
-                . 'php.ini for this SAPI (' . \PHP_SAPI . ').'
+                'phasync\\ext\\ensure_loaded(): the phasync extension is not loaded '
+                . 'and cannot be auto-loaded on the "' . \PHP_SAPI . '" SAPI. Load it '
+                . 'via php.ini for this SAPI, e.g. add "extension=phasync" (point '
+                . 'extension_dir at, or give an absolute path to, the matching '
+                . 'binary for ' . _abi_key() . ').'
             );
         }
 
