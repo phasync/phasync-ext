@@ -16,7 +16,7 @@
     },
     "require": {
         "php": ">=8.3",
-        "phasync/phasync": "^2.0.0"
+        "phasync/phasync": ">=2.0.0@dev"
     },
     "autoload": {
         "files": ["phasync-ext.php"]
