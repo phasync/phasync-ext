@@ -49,7 +49,7 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha8"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha9"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -325,9 +325,11 @@ static int phasync_cooperate(zval *handler, php_stream *stream, php_socket_t fd,
 		double now = phasync_now();
 		if (*deadline < 0) {
 			*deadline = now + timeout;
+			wait = timeout;                /* first wait of this fill: the exact native timeout */
+		} else {
+			wait = *deadline - now;        /* a retry: only the remaining time */
 		}
-		wait = *deadline - now;
-		if (wait <= 0) {                   /* time used up */
+		if (wait <= 0) {                   /* time used up (or a zero timeout) */
 			phasync_mark_timed_out(stream);
 			return PHASYNC_COOP_TIMEOUT;
 		}

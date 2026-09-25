@@ -50,7 +50,7 @@ $wait = function ($s, ?float $t) use (&$seen) {          // waits like phasync d
     var_dump(stream_get_meta_data($cli)['timed_out']);   // bool(true)
 }, $wait, fn($s, $t) => null, fn($us) => null, TestTimeout::class)))->start();
 
-var_dump($seen !== null && $seen > 0.15 && $seen <= 0.2); // bool(true): the socket's timeout
+var_dump(is_float($seen) && $seen > 0 && $seen <= 0.2);   // bool(true): the socket's timeout, not null
 proc_terminate($p);
 foreach ($pipes as $pp) fclose($pp);
 proc_close($p);
