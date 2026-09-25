@@ -53,7 +53,7 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha4"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha5"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -100,6 +100,7 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_time_sleep_until)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_gethostbyname)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_fopen)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_stream_socket_pair)(INTERNAL_FUNCTION_PARAMETERS);
 	zend_long thread_pool_size;   /* INI: phasync.thread_pool_size */
 	bool hooks_installed;         /* transports + fn overrides physically in place */
 	HashTable hooked;             /* (uintptr_t)stream    -> phasync_hook_entry* */
@@ -1170,6 +1171,24 @@ static ZEND_NAMED_FUNCTION(phasync_fopen_override)
 		Z_PARAM_RESOURCE_OR_NULL(zcontext)
 	ZEND_PARSE_PARAMETERS_END();
 
+	/* php://stdin|stdout|stderr and php://fd/N are backed by real OS descriptors,
+	 * so wrap them RAW to make them cooperative too. Other php:// streams
+	 * (memory/temp/input/output) and every other wrapper are not fd-backed and
+	 * fall through untouched below. */
+	if (zcontext == NULL && !use_include_path
+	 && (strncasecmp(ZSTR_VAL(filename), "php://std", sizeof("php://std") - 1) == 0
+	  || strncasecmp(ZSTR_VAL(filename), "php://fd/", sizeof("php://fd/") - 1) == 0)) {
+		PHASYNC_G(orig_fopen)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		if (Z_TYPE_P(return_value) == IS_RESOURCE) {
+			php_stream *s = NULL;
+			php_stream_from_zval_no_verify(s, return_value);
+			if (s && phasync_stream_fd(s) != -1) {
+				phasync_wrap_stream(s, PHASYNC_MODE_RAW);
+			}
+		}
+		return;
+	}
+
 	/* Only plain local paths get special handling; wrappers (http://, php://,
 	 * data:// …) and include-path/context lookups fall straight through. */
 	if (zcontext != NULL || use_include_path
@@ -1220,6 +1239,27 @@ static ZEND_NAMED_FUNCTION(phasync_fopen_override)
 	}
 }
 
+/* stream_socket_pair() builds its sockets with socketpair(2) via
+ * php_stream_sock_open_from_socket(), bypassing the transport factory — so wrap
+ * both returned streams here (RAW; they are ordinary sockets). Wrapped
+ * unconditionally, like the factory path: the wrapper is inert outside a scope. */
+static ZEND_NAMED_FUNCTION(phasync_stream_socket_pair_override)
+{
+	PHASYNC_G(orig_stream_socket_pair)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	if (Z_TYPE_P(return_value) == IS_ARRAY) {
+		zval *el;
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(return_value), el) {
+			if (Z_TYPE_P(el) == IS_RESOURCE) {
+				php_stream *s = NULL;
+				php_stream_from_zval_no_verify(s, el);
+				if (s) {
+					phasync_wrap_stream(s, PHASYNC_MODE_RAW);
+				}
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+}
+
 /* ---- enable_hooks / disable_hooks ---------------------------------------- */
 
 static zend_internal_function *phasync_find_ifunc(const char *name, size_t len)
@@ -1264,6 +1304,10 @@ static void phasync_install_hooks(void)
 	if ((f = phasync_find_ifunc("proc_open", sizeof("proc_open") - 1))) {
 		PHASYNC_G(orig_proc_open) = f->handler;
 		f->handler = phasync_proc_open_override;
+	}
+	if ((f = phasync_find_ifunc("stream_socket_pair", sizeof("stream_socket_pair") - 1))) {
+		PHASYNC_G(orig_stream_socket_pair) = f->handler;
+		f->handler = phasync_stream_socket_pair_override;
 	}
 	if ((f = phasync_find_ifunc("sleep", sizeof("sleep") - 1))) {
 		PHASYNC_G(orig_sleep) = f->handler;
@@ -1314,6 +1358,9 @@ static void phasync_restore_hooks(void)
 	if (PHASYNC_G(orig_proc_open) && (f = phasync_find_ifunc("proc_open", sizeof("proc_open") - 1))) {
 		f->handler = PHASYNC_G(orig_proc_open);
 	}
+	if (PHASYNC_G(orig_stream_socket_pair) && (f = phasync_find_ifunc("stream_socket_pair", sizeof("stream_socket_pair") - 1))) {
+		f->handler = PHASYNC_G(orig_stream_socket_pair);
+	}
 	if (PHASYNC_G(orig_sleep) && (f = phasync_find_ifunc("sleep", sizeof("sleep") - 1))) {
 		f->handler = PHASYNC_G(orig_sleep);
 	}
@@ -1337,6 +1384,8 @@ static void phasync_restore_hooks(void)
 
 /* ---- manage(): scoped handler activation --------------------------------- */
 
+static void phasync_wrap_existing_streams(void);
+
 ZEND_FUNCTION(phasync_ext_manage)
 {
 	zval *code, *rh, *wh, *sh;
@@ -1358,6 +1407,12 @@ ZEND_FUNCTION(phasync_ext_manage)
 	PHASYNC_G(scope_top) = &frame;
 
 	phasync_install_hooks();   /* idempotent; first manage() of the request installs */
+	if (frame.prev == NULL) {
+		/* Entering the outermost scope: wrap fd-backed streams that appeared after
+		 * RINIT's walk — notably the STDIN/STDOUT/STDERR constants, which the CLI
+		 * SAPI materialises only once execution starts. Idempotent and cheap. */
+		phasync_wrap_existing_streams();
+	}
 
 	ZVAL_UNDEF(&retval);
 	/* zend_try/zend_catch guarantees the pop even on a fatal bailout (which

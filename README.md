@@ -120,9 +120,14 @@ step), and a nested `manage()` shadows the outer handlers (LIFO), restoring them
 on return. Sleep and the thread-pool ops only take effect inside a fiber; outside
 one they run as the ordinary blocking call.
 
-Descriptor-backed streams are **wrapped as soon as they are created** (and any
-that predate the extension — `STDIN`/`STDOUT`/`STDERR` and fds inherited across
-`ensure_loaded()`'s re-exec — are wrapped at request start). A wrapped stream is
+Descriptor-backed streams are **wrapped as soon as they are created**: sockets
+from the tcp/unix/ssl transports (`stream_socket_client/server`, `fsockopen`),
+`stream_socket_pair()`, `proc_open()` pipes, `fopen()` of regular files/FIFOs, and
+the fd-backed `php://` streams (`php://stdin|stdout|stderr`, `php://fd/N`). Streams
+that predate the hooks are swept up too — fds inherited across `ensure_loaded()`'s
+re-exec are wrapped at request start, and the `STDIN`/`STDOUT`/`STDERR` constants
+(which the CLI materialises lazily) are wrapped when the first `manage()` scope is
+entered. A wrapped stream is
 **indistinguishable from a raw one outside a `manage()` scope**: it blocks,
 returns `EAGAIN`, and honours `stream_set_blocking()` exactly as an unwrapped
 stream would. Only inside a scope, and only for a stream left in blocking mode,
