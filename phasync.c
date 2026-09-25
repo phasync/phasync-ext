@@ -49,7 +49,7 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha7"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha8"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -192,13 +192,18 @@ static int phasync_call_wait(zval *handler, zval *arg, double timeout)
 	return rc;
 }
 
-/* If the stream is a socket (tcp/udp/unix/udg all share php_sockop_read as their
- * read op) return its netstream data — which holds the timeout and the timed-out
- * flag — otherwise NULL. */
+/* If the stream is a socket, return its netstream data — which holds the timeout
+ * and the timed-out flag — otherwise NULL. xp_socket's udp/unix/udg streams share
+ * php_sockop_read as their read op. But ext/openssl registers itself for tcp://
+ * too (so crypto can be enabled on a plain TCP stream later), so TCP and ssl/tls
+ * streams use openssl's static ops, recognisable only by their label; its stream
+ * data starts with a php_netstream_data_t (xp_ssl.c), so the cast holds. */
 static php_netstream_data_t *phasync_sock_data(php_stream *stream)
 {
 	const php_stream_ops *orig = stream ? PHASYNC_ORIG(stream) : NULL;
-	if (orig && orig->read == php_stream_socket_ops.read && stream->abstract) {
+	if (orig && stream->abstract
+	 && (orig->read == php_stream_socket_ops.read
+	  || (orig->label && strcmp(orig->label, "tcp_socket/ssl") == 0))) {
 		return (php_netstream_data_t *) stream->abstract;
 	}
 	return NULL;
