@@ -97,23 +97,43 @@ function stream_select(?array &$read, ?array &$write, ?array &$except,
 
 function manage(
     \Closure $code,          // run with async I/O active; its return value is returned
-    \Closure $readHandler,   // ($fd) — wait until readable
-    \Closure $writeHandler,  // ($fd) — wait until writable
-    \Closure $sleepHandler,  // ($microseconds) — wait that long (a scheduler timer)
+    \Closure $readHandler,   // (resource $stream) — wait until readable
+    \Closure $writeHandler,  // (resource $stream) — wait until writable
+    \Closure $sleepHandler,  // (int $microseconds) — wait that long (a scheduler timer)
 ): mixed;
+
+function is_managed(mixed $stream): bool;
 ```
 
-The handlers receive an integer fd (or a µs duration for sleep) and are
-responsible only for *waiting* — the extension does the actual I/O afterwards. A
-read/write handler called outside an event loop can just do a small blocking
-`phasync\ext\stream_select()` to satisfy the contract.
+The read/write handlers receive a real **PHP stream resource** — the socket/pipe
+being read, or, for thread-pool ops (`gethostbyname()`/file/FIFO), a wrapper
+around the worker's completion pipe — so they can be handed straight to
+`phasync::readable()`/`writable()` (or a native `stream_select()`) and ride the
+event loop's single select. The handlers are responsible only for *waiting*; the
+extension performs the actual I/O afterwards. A handler called outside an event
+loop can just do a small blocking `phasync\ext\stream_select()` to satisfy the
+contract. The sleep handler receives a µs duration.
 
 `manage()` scopes are **automatic and stacking**: the handlers apply only while
 `$code` runs and are removed when it returns or throws (no separate enable/disable
 step), and a nested `manage()` shadows the outer handlers (LIFO), restoring them
-on return. The hooks are installed once and are inert whenever no scope is active,
-so unhooked code behaves normally. Sleep and the thread-pool ops only take effect
-inside a fiber; outside one they run as the ordinary blocking call.
+on return. Sleep and the thread-pool ops only take effect inside a fiber; outside
+one they run as the ordinary blocking call.
+
+Descriptor-backed streams are **wrapped as soon as they are created** (and any
+that predate the extension — `STDIN`/`STDOUT`/`STDERR` and fds inherited across
+`ensure_loaded()`'s re-exec — are wrapped at request start). A wrapped stream is
+**indistinguishable from a raw one outside a `manage()` scope**: it blocks,
+returns `EAGAIN`, and honours `stream_set_blocking()` exactly as an unwrapped
+stream would. Only inside a scope, and only for a stream left in blocking mode,
+does a would-block suspend the fiber instead of blocking the process.
+
+`is_managed($stream)` reports whether reads/writes on `$stream` are intercepted
+inside a scope (i.e. would suspend rather than block). It is a **pure ops-pointer
+check — no syscall** — so a scheduler can cheaply skip an explicit readiness wait
+and let the read suspend on its own. It returns `false` for non-descriptor
+streams (`php://memory`, userspace wrappers, …) and for **listening server
+sockets**, whose `accept()` is not intercepted.
 
 ```php
 use function phasync\ext\manage;
@@ -123,8 +143,8 @@ manage(
         // start fibers, drive them with phasync\ext\stream_select(); blocking
         // fread()/fwrite()/gethostbyname()/sleep() inside a fiber yield here.
     },
-    fn(int $fd) => \Fiber::suspend($fd),      // readable
-    fn(int $fd) => \Fiber::suspend($fd),      // writable
+    fn($stream) => \Fiber::suspend($stream),  // readable
+    fn($stream) => \Fiber::suspend($stream),  // writable
     fn(int $us) => \Fiber::suspend($us),      // timer
 );
 ```

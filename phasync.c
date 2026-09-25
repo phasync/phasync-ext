@@ -4,21 +4,27 @@
  *         Accepts stream resources and plain integer file descriptors.
  *
  * phasync\ext\manage($code, $read, $write, $sleep) — run $code with transparent
- *         async I/O active for its dynamic extent. While a manage() scope is
- *         active the tcp/unix/ssl transports are re-registered and proc_open()/
- *         sleep()/usleep()/time_nanosleep()/time_sleep_until()/gethostbyname()/
- *         fopen() are overridden; sockets and pipes created meanwhile get their
- *         read/write ops wrapped. On a would-block the wrapper invokes the
- *         scope's handler with the integer fd (or the sleep handler with usec),
- *         which waits until ready (typically Fiber::suspend into a scheduler);
- *         the extension then performs the real I/O. Scopes stack (LIFO) and the
- *         handlers are removed automatically when $code returns or throws — the
- *         hooks are installed once and are inert whenever no scope is active, so
- *         there is nothing to toggle off. The C side never touches the fiber API
- *         — the userland callbacks own all suspension; it works because PHP
- *         fibers are stackful. Regular-file and DNS blocking and the FIFO open()
- *         rendezvous run on a worker thread pool (they are not readiness-pollable
- *         / are unsolvable single-threaded), waking the fiber via a self-pipe.
+ *         async I/O active for its dynamic extent. The tcp/unix/ssl transports
+ *         are re-registered and proc_open()/sleep()/usleep()/time_nanosleep()/
+ *         time_sleep_until()/gethostbyname()/fopen() overridden at request start,
+ *         and every descriptor-backed stream is wrapped as it is created (plus
+ *         STDIN/STDOUT/STDERR and any fds inherited before load). The wrappers
+ *         are inert outside a scope: a wrapped stream then blocks, returns EAGAIN
+ *         and honours stream_set_blocking() exactly like an unwrapped one. Only
+ *         inside a scope, and only for a stream left in blocking mode, does a
+ *         would-block invoke the scope's handler with the stream RESOURCE (or the
+ *         sleep handler with usec), which waits until ready (typically
+ *         Fiber::suspend into a scheduler); the extension then performs the real
+ *         I/O. Scopes stack (LIFO) and the handlers are removed automatically when
+ *         $code returns or throws. The C side never touches the fiber API — the
+ *         userland callbacks own all suspension; it works because PHP fibers are
+ *         stackful. Regular-file and DNS blocking and the FIFO open() rendezvous
+ *         run on a worker thread pool (they are not readiness-pollable / are
+ *         unsolvable single-threaded), waking the fiber via a self-pipe.
+ *
+ * phasync\ext\is_managed($stream) — pure ops-pointer check (no syscall): whether
+ *         reads/writes on $stream suspend inside a scope. False for non-fd streams
+ *         and for listening sockets (accept() is not intercepted).
  */
 #ifdef HAVE_CONFIG_H
 # include "config.h"
@@ -45,11 +51,12 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#define PHP_PHASYNC_VERSION "0.3.0"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha3"
 
 typedef struct {
-	int  saved_flags;
-	bool flags_saved;
+	bool want_block;    /* caller's intended blocking mode (default: blocking) */
+	signed char applied; /* fd mode we last forced: -1 unknown, 0 blocking, 1 non-blocking */
+	bool is_listener;   /* server socket: accept() is not hooked, so not "managed" */
 } phasync_hook_entry;
 
 /* Wrapped ops with the original embedded right after it, so the original is
@@ -626,47 +633,73 @@ static phasync_hook_entry *phasync_entry(php_stream *stream)
 	return zend_hash_index_find_ptr(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream);
 }
 
-static void phasync_ensure_nonblocking(php_stream *stream, php_socket_t fd)
+static phasync_hook_entry *phasync_entry_ensure(php_stream *stream)
 {
-	phasync_hook_entry *e;
-	int flags;
-
-	if (fd == -1) {
-		return;
-	}
-	e = phasync_entry(stream);
+	phasync_hook_entry *e = phasync_entry(stream);
 	if (e == NULL) {
 		e = pemalloc(sizeof(*e), 1);
-		e->saved_flags = 0;
-		e->flags_saved = false;
+		e->want_block  = true;    /* streams are blocking until told otherwise */
+		e->applied     = -1;      /* fd mode not forced yet */
+		e->is_listener = false;
 		zend_hash_index_add_ptr(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream, e);
 	}
-	if (e->flags_saved) {
+	return e;
+}
+
+/* Force the fd (and, for a delegate/TLS stream, the stream layer) into the given
+ * blocking mode, but only when it differs from what we last applied — so the hot
+ * path (repeated cooperative reads on an already-non-blocking fd) does no syscall.
+ * We go through the ORIGINAL set_option, never php_stream_set_option, to avoid
+ * re-entering our own BLOCKING interception. */
+static void phasync_apply_mode(php_stream *stream, php_socket_t fd,
+                               phasync_hook_entry *e, bool nonblock, bool tls)
+{
+	int flags;
+
+	if (fd == -1 || e->applied == (signed char) (nonblock ? 1 : 0)) {
 		return;
+	}
+	if (tls) {
+		const php_stream_ops *orig = PHASYNC_ORIG(stream);
+		if (orig->set_option) {
+			orig->set_option(stream, PHP_STREAM_OPTION_BLOCKING, nonblock ? 0 : 1, NULL);
+		}
 	}
 	flags = fcntl(fd, F_GETFL, 0);
 	if (flags != -1) {
-		e->saved_flags = flags;
-		e->flags_saved = true;
+		if (nonblock) {
+			flags |= O_NONBLOCK;
+		} else {
+			flags &= ~O_NONBLOCK;
+		}
+		fcntl(fd, F_SETFL, flags);
 	}
-	/* Set the STREAM non-blocking (not just the fd): openssl and the socket op
-	 * consult the stream's blocking flag and would otherwise wait internally. */
-	php_stream_set_option(stream, PHP_STREAM_OPTION_BLOCKING, 0, NULL);
-	if (flags != -1) {
-		fcntl(fd, F_SETFL, flags | O_NONBLOCK);   /* ensure O_NONBLOCK regardless */
-	}
+	e->applied = nonblock ? 1 : 0;
 }
 
+/* The wrapped read/write ops emulate the caller's intended semantics:
+ *   - outside a manage() scope (handler == NULL) -> exactly the native op;
+ *   - an explicitly non-blocking stream          -> exactly the native op;
+ *   - a blocking stream inside a scope           -> cooperate: drive the fd
+ *     non-blocking and suspend the fiber on would-block instead of blocking.
+ * So a wrapped stream is indistinguishable from an unwrapped one whenever no
+ * scope is driving it. */
 static ssize_t phasync_wrapped_read(php_stream *stream, char *buf, size_t count)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
 	zval *handler = phasync_read_handler();
+	phasync_hook_entry *e;
 
-	if (fd == -1 || handler == NULL) {
+	if (fd == -1) {
 		return orig->read(stream, buf, count);
 	}
-	phasync_ensure_nonblocking(stream, fd);
+	e = phasync_entry_ensure(stream);
+	if (!e->want_block || handler == NULL) {
+		phasync_apply_mode(stream, fd, e, !e->want_block, false);
+		return orig->read(stream, buf, count);
+	}
+	phasync_apply_mode(stream, fd, e, true, false);
 	for (;;) {
 		ssize_t n = read(fd, buf, count);
 		if (n > 0) {
@@ -694,11 +727,17 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
 	zval *handler = phasync_write_handler();
+	phasync_hook_entry *e;
 
-	if (fd == -1 || handler == NULL) {
+	if (fd == -1) {
 		return orig->write(stream, buf, count);
 	}
-	phasync_ensure_nonblocking(stream, fd);
+	e = phasync_entry_ensure(stream);
+	if (!e->want_block || handler == NULL) {
+		phasync_apply_mode(stream, fd, e, !e->want_block, false);
+		return orig->write(stream, buf, count);
+	}
+	phasync_apply_mode(stream, fd, e, true, false);
 	for (;;) {
 		ssize_t n = write(fd, buf, count);
 		if (n >= 0) {
@@ -717,21 +756,23 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 }
 
 /* Delegate-mode ops for streams whose bytes must go through the original op
- * (e.g. TLS: SSL_read/SSL_write). We can't raw read/write the fd. We set the
- * stream non-blocking so the original op returns 0-without-eof on would-block,
- * then wait and retry. Read/write intent is approximated (a read waits for
- * readability); TLS renegotiation wanting the opposite direction is a known
- * v1 limitation. */
+ * (e.g. TLS: SSL_read/SSL_write). We can't raw read/write the fd, so inside a
+ * scope we drive the stream non-blocking and let the original op report
+ * would-block (0 without eof), then wait and retry. Read/write intent is
+ * approximated (a read waits for readability); TLS renegotiation wanting the
+ * opposite direction is a known limitation. */
 static ssize_t phasync_wrapped_read_tls(php_stream *stream, char *buf, size_t count)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
+	php_socket_t fd = phasync_stream_fd(stream);
 	zval *handler = phasync_read_handler();
-	php_socket_t fd;
+	phasync_hook_entry *e = phasync_entry_ensure(stream);
 
-	if (handler == NULL) {
+	if (!e->want_block || handler == NULL) {
+		phasync_apply_mode(stream, fd, e, !e->want_block, true);
 		return orig->read(stream, buf, count);
 	}
-	phasync_ensure_nonblocking(stream, phasync_stream_fd(stream));
+	phasync_apply_mode(stream, fd, e, true, true);
 	for (;;) {
 		ssize_t n = orig->read(stream, buf, count);
 		if (n > 0) {
@@ -750,13 +791,15 @@ static ssize_t phasync_wrapped_read_tls(php_stream *stream, char *buf, size_t co
 static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, size_t count)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
+	php_socket_t fd = phasync_stream_fd(stream);
 	zval *handler = phasync_write_handler();
-	php_socket_t fd;
+	phasync_hook_entry *e = phasync_entry_ensure(stream);
 
-	if (handler == NULL) {
+	if (!e->want_block || handler == NULL) {
+		phasync_apply_mode(stream, fd, e, !e->want_block, true);
 		return orig->write(stream, buf, count);
 	}
-	phasync_ensure_nonblocking(stream, phasync_stream_fd(stream));
+	phasync_apply_mode(stream, fd, e, true, true);
 	for (;;) {
 		ssize_t n = orig->write(stream, buf, count);
 		if (n > 0) {
@@ -772,16 +815,46 @@ static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, si
 	}
 }
 
+/* Record the caller's intended blocking mode and pass it through, so the native
+ * op (used outside a scope) sees the real intent while we still know it. */
+static int phasync_wrapped_set_option(php_stream *stream, int option, int value, void *ptrparam)
+{
+	const php_stream_ops *orig = PHASYNC_ORIG(stream);
+
+	if (option == PHP_STREAM_OPTION_BLOCKING) {
+		phasync_hook_entry *e = phasync_entry_ensure(stream);
+		e->want_block = (value != 0);
+		e->applied    = -1;   /* orig is about to change the fd; re-apply on next I/O */
+	} else if (option == PHP_STREAM_OPTION_XPORT_API && ptrparam) {
+		/* Mark server sockets when they enter listen state, cheaply and once, so
+		 * is_managed() can report false for them without any per-call syscall
+		 * (accept() is not intercepted). */
+		php_stream_xport_param *xp = (php_stream_xport_param *) ptrparam;
+		if (xp->op == STREAM_XPORT_OP_LISTEN) {
+			phasync_entry_ensure(stream)->is_listener = true;
+		}
+	}
+	if (orig->set_option) {
+		return orig->set_option(stream, option, value, ptrparam);
+	}
+	return PHP_STREAM_OPTION_RETURN_NOTIMPL;
+}
+
 static int phasync_wrapped_close(php_stream *stream, int close_handle)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	phasync_hook_entry *e = phasync_entry(stream);
 
 	if (e) {
-		if (e->flags_saved) {
+		/* If we forced a detached fd non-blocking but the caller wanted blocking,
+		 * hand it back the way they left it. */
+		if (!close_handle && e->applied == 1 && e->want_block) {
 			php_socket_t fd = phasync_stream_fd(stream);
 			if (fd != -1) {
-				fcntl(fd, F_SETFL, e->saved_flags);
+				int flags = fcntl(fd, F_GETFL, 0);
+				if (flags != -1) {
+					fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+				}
 			}
 		}
 		zend_hash_index_del(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream);
@@ -821,6 +894,7 @@ static php_stream_ops *phasync_wrapped_ops_for(const php_stream_ops *orig, phasy
 			break;
 	}
 	w->ops.close = phasync_wrapped_close;
+	w->ops.set_option = phasync_wrapped_set_option;
 	w->orig = orig;
 	zend_hash_index_add_ptr(&PHASYNC_G(wrapped_ops_cache), key, w);
 	return &w->ops;
@@ -1418,6 +1492,36 @@ static int phasync_emulate_read(zval *array)
 	return ret;
 }
 
+ZEND_FUNCTION(phasync_ext_is_managed)
+{
+	zval *zstream;
+	php_stream *stream;
+	phasync_hook_entry *e;
+
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_ZVAL(zstream)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (Z_TYPE_P(zstream) != IS_RESOURCE) {
+		RETURN_FALSE;
+	}
+	php_stream_from_zval_no_verify(stream, zstream);
+	if (stream == NULL || stream->ops == NULL) {
+		RETURN_FALSE;
+	}
+	/* Pure pointer check: is this one of our wrapped read ops? (no syscall) */
+	if (stream->ops->read != phasync_wrapped_read
+	 && stream->ops->read != phasync_wrapped_read_tls
+	 && stream->ops->read != phasync_wrapped_read_pool) {
+		RETURN_FALSE;
+	}
+	e = phasync_entry(stream);
+	if (e && e->is_listener) {
+		RETURN_FALSE;   /* accept() is not hooked */
+	}
+	RETURN_TRUE;
+}
+
 ZEND_FUNCTION(phasync_ext_stream_select)
 {
 	zval *r_array, *w_array, *e_array;
@@ -1580,11 +1684,52 @@ static PHP_MSHUTDOWN_FUNCTION(phasync)
 	return SUCCESS;
 }
 
+/* Wrap descriptor-backed streams that already exist when the hooks go in:
+ * STDIN/STDOUT/STDERR, and anything opened before the extension loaded (e.g. via
+ * ensure_loaded()'s re-exec). Only sockets, FIFOs and char devices are wrapped —
+ * they can be raw-read; regular files keep their native (FILE*-buffered) ops and
+ * are handled by the fopen() override, and streams with no OS fd (php://memory/
+ * temp, data://, userspace wrappers) or with filters are left alone. */
+static void phasync_wrap_existing_streams(void)
+{
+	zend_resource *res;
+	int fd_type = php_file_le_stream();
+
+	ZEND_HASH_FOREACH_PTR(&EG(regular_list), res) {
+		php_stream *stream;
+		php_socket_t fd;
+		struct stat st;
+
+		if (res == NULL || res->type != fd_type) {
+			continue;
+		}
+		stream = (php_stream *) res->ptr;
+		if (stream == NULL || stream->ops == NULL) {
+			continue;
+		}
+		if (stream->readfilters.head || stream->writefilters.head) {
+			continue;   /* filters rewrite the bytes; can't raw-read the fd */
+		}
+		fd = phasync_stream_fd(stream);
+		if (fd == -1 || fstat(fd, &st) != 0) {
+			continue;
+		}
+		if (S_ISSOCK(st.st_mode) || S_ISFIFO(st.st_mode) || S_ISCHR(st.st_mode)) {
+			phasync_wrap_stream(stream, PHASYNC_MODE_RAW);   /* idempotent */
+		}
+	} ZEND_HASH_FOREACH_END();
+}
+
 static PHP_RINIT_FUNCTION(phasync)
 {
 	PHASYNC_G(scope_top) = NULL;
 	PHASYNC_G(hooks_installed) = 0;
 	zend_hash_clean(&PHASYNC_G(hooked));
+	/* Always-on: the transport factories and function overrides go in at the
+	 * start of every request (they are inert while no manage() scope is active),
+	 * and streams that predate them get wrapped now. */
+	phasync_install_hooks();
+	phasync_wrap_existing_streams();
 	return SUCCESS;
 }
 
