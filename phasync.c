@@ -53,7 +53,7 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha5"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha6"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -843,7 +843,18 @@ static int phasync_wrapped_set_option(php_stream *stream, int option, int value,
 		}
 	}
 	if (orig->set_option) {
-		return orig->set_option(stream, option, value, ptrparam);
+		/* xport ops (bind/connect/listen/getname/…) all arrive through set_option,
+		 * and the socket layer decides unix-vs-inet by *pointer identity*
+		 * (php_stream_is(stream, &php_stream_unix_socket_ops), xp_socket.c). Our
+		 * wrapped ops is a copy with a different address, which would make a unix
+		 * socket look like inet ("Failed to parse address"). Restore the real ops
+		 * pointer for the duration of the (synchronous) delegated call. */
+		const php_stream_ops *saved = stream->ops;
+		int r;
+		stream->ops = (php_stream_ops *) orig;
+		r = orig->set_option(stream, option, value, ptrparam);
+		stream->ops = saved;
+		return r;
 	}
 	return PHP_STREAM_OPTION_RETURN_NOTIMPL;
 }
