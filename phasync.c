@@ -49,7 +49,7 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha10"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha11"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -579,12 +579,16 @@ static void phasync_pool_child_atfork(void)
 	phasync_pipe_free = NULL;
 }
 
-static void phasync_pool_ensure(void)
+/* Start the worker pool once. Returns non-zero if at least one worker exists. If
+ * none could be created (thread/pid limits), the pool is left unstarted so a later
+ * call retries, and the caller runs the task inline instead of queueing it where
+ * nothing would ever pick it up. */
+static int phasync_pool_ensure(void)
 {
 	int i, n;
 	pthread_attr_t attr;
 	if (phasync_pool_started) {
-		return;
+		return 1;
 	}
 	n = (int) PHASYNC_G(thread_pool_size);
 	if (n < 1) n = 1;
@@ -602,8 +606,12 @@ static void phasync_pool_ensure(void)
 		phasync_pool_n++;
 	}
 	pthread_attr_destroy(&attr);
+	if (phasync_pool_n == 0) {
+		return 0;
+	}
 	phasync_pool_started = 1;
 	pthread_atfork(NULL, NULL, phasync_pool_child_atfork);
+	return 1;
 }
 
 static void phasync_pool_shutdown(void)
@@ -649,11 +657,29 @@ static void phasync_pool_submit(phasync_task *t)
 /* Submit a task, park the fiber on the self-pipe until the worker completes.
  * The task lives on the caller's (fiber) stack, which is preserved across the
  * suspend, so no heap allocation is needed for it. */
+/* Block until the worker's completion byte arrives and consume it. Polls on
+ * EAGAIN so it holds even if the read end was made non-blocking (it shares its
+ * open file description with the dup() handed to the wait handler). */
+static void phasync_pipe_drain(int rfd)
+{
+	char c;
+	for (;;) {
+		ssize_t r = read(rfd, &c, 1);
+		if (r == 1 || r == 0) {
+			return;
+		}
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			struct pollfd pfd = { .fd = rfd, .events = POLLIN };
+			poll(&pfd, 1, -1);
+		} else if (errno != EINTR) {
+			return;
+		}
+	}
+}
+
 static void phasync_pool_run(phasync_task *t)
 {
 	phasync_pipe *p;
-	char c;
-	ssize_t r;
 
 	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL
 	 || (p = phasync_pipe_get()) == NULL) {
@@ -662,17 +688,30 @@ static void phasync_pool_run(phasync_task *t)
 		return;
 	}
 
+	if (!phasync_pool_ensure()) {
+		phasync_pipe_put(p);
+		phasync_task_exec(t);            /* no worker could be started: run inline */
+		return;
+	}
 	t->write_fd = p->wfd;
-	phasync_pool_ensure();
 	phasync_pool_submit(t);
 
-	/* park until the worker makes the read end readable */
-	phasync_wait_fd(phasync_read_handler(), NULL, p->rfd, INFINITY);
+	/* Park until the worker makes the read end readable. The task (and a read's
+	 * buffer) live in the caller's C frame and the worker now holds pointers into
+	 * them, so a fatal error (bailout) raised inside the handler must not unwind
+	 * past this frame before the worker is done: wait for its byte, then re-raise. */
+	zend_try {
+		phasync_wait_fd(phasync_read_handler(), NULL, p->rfd, INFINITY);
+	} zend_catch {
+		phasync_pipe_drain(p->rfd);
+		phasync_pipe_put(p);
+		zend_bailout();
+	} zend_end_try();
 
-	/* The worker will finish this bounded op shortly and write its byte even if
-	 * the fiber was resumed early by an exception, so draining here is safe and
-	 * leaves the pipe empty for reuse. */
-	do { r = read(p->rfd, &c, 1); } while (r < 0 && errno == EINTR);
+	/* The worker finishes this bounded op shortly and writes its byte even if the
+	 * fiber was resumed early by an exception, so draining here is safe and leaves
+	 * the pipe empty for reuse. */
+	phasync_pipe_drain(p->rfd);
 	phasync_pipe_put(p);
 }
 
@@ -706,7 +745,22 @@ static void phasync_pool_run_dedicated(phasync_task *t)
 	}
 	pthread_attr_destroy(&attr);
 
-	rc = phasync_wait_fd(phasync_read_handler(), NULL, pipefd[0], INFINITY);
+	/* A fatal error (bailout) raised inside the handler must not unwind past this
+	 * frame while the thread still holds a pointer to the stack-resident task:
+	 * cancel and reap it first, drop any fd it opened, then re-raise. */
+	zend_try {
+		rc = phasync_wait_fd(phasync_read_handler(), NULL, pipefd[0], INFINITY);
+	} zend_catch {
+		pthread_cancel(th);
+		pthread_join(th, NULL);
+		close(pipefd[0]);
+		close(pipefd[1]);
+		if (t->fd >= 0) {
+			close(t->fd);
+		}
+		t->fd = -1;
+		zend_bailout();
+	} zend_end_try();
 
 	/* Always reap the thread, however the fiber came back. If the worker already
 	 * finished, it is past its (only) open() cancellation point with cancellation
@@ -742,7 +796,9 @@ static ssize_t phasync_wrapped_read_pool(php_stream *stream, char *buf, size_t c
 	php_socket_t fd = phasync_stream_fd(stream);
 	phasync_task t;
 
-	if (fd == -1) {
+	/* Outside a scope (or not in a fiber) there is nothing to yield to: be the
+	 * native op exactly. */
+	if (fd == -1 || phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
 		return orig->read(stream, buf, count);
 	}
 	memset(&t, 0, sizeof(t));
@@ -766,7 +822,7 @@ static ssize_t phasync_wrapped_write_pool(php_stream *stream, const char *buf, s
 	php_socket_t fd = phasync_stream_fd(stream);
 	phasync_task t;
 
-	if (fd == -1) {
+	if (fd == -1 || phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
 		return orig->write(stream, buf, count);
 	}
 	memset(&t, 0, sizeof(t));
@@ -1164,6 +1220,14 @@ static ZEND_NAMED_FUNCTION(phasync_proc_open_override)
 
 /* ---- sleep()/usleep() override ------------------------------------------- */
 
+/* Seconds -> microseconds for the sleep handler, clamped: native PHP accepts
+ * absurdly long sleeps, and the conversion must not overflow zend_long. */
+static zend_long phasync_sec_to_usec(double sec)
+{
+	double us = sec * 1000000.0;
+	return us >= (double) ZEND_LONG_MAX ? ZEND_LONG_MAX : (zend_long) us;
+}
+
 static ZEND_NAMED_FUNCTION(phasync_sleep_override)
 {
 	zend_long seconds;
@@ -1184,7 +1248,7 @@ static ZEND_NAMED_FUNCTION(phasync_sleep_override)
 		zend_argument_value_error(1, "must be greater than or equal to 0");
 		RETURN_THROWS();
 	}
-	phasync_call_sleep(phasync_sleep_handler(), (zend_long) (seconds * 1000000));
+	phasync_call_sleep(phasync_sleep_handler(), phasync_sec_to_usec((double) seconds));
 	RETURN_LONG(0);
 }
 
@@ -1228,7 +1292,12 @@ static ZEND_NAMED_FUNCTION(phasync_time_nanosleep_override)
 		zend_argument_value_error(2, "must be greater than or equal to 0");
 		RETURN_THROWS();
 	}
-	phasync_call_sleep(phasync_sleep_handler(), (zend_long) (sec * 1000000 + nsec / 1000));
+	if (nsec > 999999999) {             /* native nanosleep() fails with EINVAL */
+		zend_value_error("Nanoseconds was not in the range 0 to 999 999 999 or seconds was negative");
+		RETURN_THROWS();
+	}
+	phasync_call_sleep(phasync_sleep_handler(),
+		phasync_sec_to_usec((double) sec + (double) nsec / 1000000000.0));
 	RETURN_TRUE;
 }
 
@@ -1248,7 +1317,7 @@ static ZEND_NAMED_FUNCTION(phasync_time_sleep_until_override)
 
 	gettimeofday(&tv, NULL);
 	now = (double) tv.tv_sec + (double) tv.tv_usec / 1000000.0;
-	usec = (ts > now) ? (zend_long) ((ts - now) * 1000000.0) : 0;
+	usec = (ts > now) ? phasync_sec_to_usec(ts - now) : 0;
 	phasync_call_sleep(phasync_sleep_handler(), usec);
 	RETURN_TRUE;
 }
@@ -1545,7 +1614,7 @@ static void phasync_restore_hooks(void)
 
 /* ---- manage(): scoped handler activation --------------------------------- */
 
-static void phasync_wrap_existing_streams(void);
+static void phasync_wrap_existing_streams(bool include_files);
 
 ZEND_FUNCTION(phasync_ext_manage)
 {
@@ -1585,8 +1654,9 @@ ZEND_FUNCTION(phasync_ext_manage)
 	if (frame.prev == NULL) {
 		/* Entering the outermost scope: wrap fd-backed streams that appeared after
 		 * RINIT's walk — notably the STDIN/STDOUT/STDERR constants, which the CLI
-		 * SAPI materialises only once execution starts. Idempotent and cheap. */
-		phasync_wrap_existing_streams();
+		 * SAPI materialises only once execution starts, and files opened before this
+		 * scope. Idempotent and cheap. */
+		phasync_wrap_existing_streams(true);
 	}
 
 	ZVAL_UNDEF(&retval);
@@ -1736,7 +1806,8 @@ ZEND_FUNCTION(phasync_ext_stream_select)
 	bool secnull, usecnull = 1;
 	HashTable events_by_fd, revents_by_fd;
 	struct pollfd *fds = NULL;
-	int nfds, i, retval, sets = 0, timeout_ms;
+	struct timespec ts, *tsp = NULL;
+	int nfds, i, retval, sets = 0, max_fd = -1, err;
 
 	ZEND_PARSE_PARAMETERS_START(4, 5)
 		Z_PARAM_ARRAY_EX2(r_array, 1, 1, 0)
@@ -1778,9 +1849,12 @@ ZEND_FUNCTION(phasync_ext_stream_select)
 			zend_argument_value_error(5, "must be greater than or equal to 0");
 			RETURN_THROWS();
 		}
-		timeout_ms = (int) (sec * 1000 + (usec / 1000));
-	} else {
-		timeout_ms = -1;
+		/* Microsecond precision like select()'s timeval (a 500 µs timeout must not
+		 * become a zero-time poll), normalised like native, clamped not overflowed. */
+		ts.tv_sec  = (sec > ZEND_LONG_MAX - usec / 1000000)
+			? (time_t) ZEND_LONG_MAX : (time_t) (sec + usec / 1000000);
+		ts.tv_nsec = (long) (usec % 1000000) * 1000;
+		tsp = &ts;
 	}
 
 	if (r_array) {
@@ -1802,16 +1876,31 @@ ZEND_FUNCTION(phasync_ext_stream_select)
 		ZEND_HASH_FOREACH_NUM_KEY_VAL(&events_by_fd, fd, ev) {
 			fds[i].fd = (int) fd;
 			fds[i].events = (short) Z_LVAL_P(ev);
+			if ((int) fd > max_fd) {
+				max_fd = (int) fd;
+			}
 			i++;
 		} ZEND_HASH_FOREACH_END();
 	}
 
-	do {
-		retval = poll(fds, nfds, timeout_ms);
-	} while (retval == -1 && errno == EINTR);
-
+	/* Like native stream_select(), a signal is an error (false + warning), not a
+	 * silent retry that would also restart the whole timeout. */
+	retval = ppoll(fds, nfds, tsp, NULL);
+	err = errno;
+	if (retval > 0) {
+		/* select() fails with EBADF on an invalid descriptor; poll() instead flags
+		 * it POLLNVAL and reports it as an event. Report it the native way. */
+		for (i = 0; i < nfds; i++) {
+			if (fds[i].revents & POLLNVAL) {
+				retval = -1;
+				err = EBADF;
+				break;
+			}
+		}
+	}
 	if (retval == -1) {
-		php_error_docref(NULL, E_WARNING, "Unable to select [%d]: %s", errno, strerror(errno));
+		php_error_docref(NULL, E_WARNING, "Unable to select [%d]: %s (max_fd=%d)",
+			err, strerror(err), max_fd);
 		efree(fds);
 		zend_hash_destroy(&events_by_fd);
 		RETURN_FALSE;
@@ -1826,9 +1915,12 @@ ZEND_FUNCTION(phasync_ext_stream_select)
 		}
 	}
 
-	if (r_array) phasync_filter(r_array, &revents_by_fd, POLLIN | POLLHUP | POLLERR);
-	if (w_array) phasync_filter(w_array, &revents_by_fd, POLLOUT | POLLERR);
-	if (e_array) phasync_filter(e_array, &revents_by_fd, POLLPRI);
+	/* select() returns the number of bits set across all three sets, so a stream
+	 * that is both readable and writable counts twice; poll() counts it once. */
+	retval = 0;
+	if (r_array) retval += phasync_filter(r_array, &revents_by_fd, POLLIN | POLLHUP | POLLERR);
+	if (w_array) retval += phasync_filter(w_array, &revents_by_fd, POLLOUT | POLLERR);
+	if (e_array) retval += phasync_filter(e_array, &revents_by_fd, POLLPRI);
 
 	efree(fds);
 	zend_hash_destroy(&revents_by_fd);
@@ -1891,13 +1983,17 @@ static PHP_MSHUTDOWN_FUNCTION(phasync)
 	return SUCCESS;
 }
 
-/* Wrap descriptor-backed streams that already exist when the hooks go in:
- * STDIN/STDOUT/STDERR, and anything opened before the extension loaded (e.g. via
- * ensure_loaded()'s re-exec). Only sockets, FIFOs and char devices are wrapped —
- * they can be raw-read; regular files keep their native (FILE*-buffered) ops and
- * are handled by the fopen() override, and streams with no OS fd (php://memory/
- * temp, data://, userspace wrappers) or with filters are left alone. */
-static void phasync_wrap_existing_streams(void)
+/* Wrap descriptor-backed streams that already exist: STDIN/STDOUT/STDERR, and
+ * anything opened before the extension loaded (e.g. via ensure_loaded()'s re-exec)
+ * or before the first manage() scope. Sockets, FIFOs and char devices are wrapped
+ * RAW. With include_files (on entering a scope, not at RINIT), plain regular files
+ * are wrapped POOL too, so a file opened before manage() is async inside it — the
+ * same wrapping fopen() applies inside a scope, and the POOL ops stay native
+ * outside one. This only happens for code that uses manage(): wrapping changes the
+ * stream's ops identity, which php_stream_cast(AS_STDIO) checks. Streams with no OS
+ * fd (php://memory/temp, data://, userspace wrappers) or with filters are left
+ * alone. */
+static void phasync_wrap_existing_streams(bool include_files)
 {
 	zend_resource *res;
 	int fd_type = php_file_le_stream();
@@ -1923,6 +2019,8 @@ static void phasync_wrap_existing_streams(void)
 		}
 		if (S_ISSOCK(st.st_mode) || S_ISFIFO(st.st_mode) || S_ISCHR(st.st_mode)) {
 			phasync_wrap_stream(stream, PHASYNC_MODE_RAW);   /* idempotent */
+		} else if (include_files && S_ISREG(st.st_mode) && stream->ops == &php_stream_stdio_ops) {
+			phasync_wrap_stream(stream, PHASYNC_MODE_POOL);
 		}
 	} ZEND_HASH_FOREACH_END();
 }
@@ -1936,7 +2034,7 @@ static PHP_RINIT_FUNCTION(phasync)
 	 * start of every request (they are inert while no manage() scope is active),
 	 * and streams that predate them get wrapped now. */
 	phasync_install_hooks();
-	phasync_wrap_existing_streams();
+	phasync_wrap_existing_streams(false);
 	return SUCCESS;
 }
 

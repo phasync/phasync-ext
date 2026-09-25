@@ -56,15 +56,10 @@ php build/gen_stub.php -f phasync.stub.php   # regenerate arginfo for this PHP
 
 ## Install
 
-**PIE** (the PECL successor) builds it from source against your PHP:
-
-```sh
-pie install phasync/phasync-ext
-```
-
-**Composer** — the package is `type: php-ext`, and it also ships a
-files-autoloaded bootstrap so a plain `composer require` can activate it on the
-CLI with no `php.ini` edit and no root:
+**Composer** — the package is a plain Composer library that bundles prebuilt
+binaries (PHP 8.2–8.5 × x86_64/aarch64 × glibc/musl, carried on each release tag),
+so `composer require phasync/phasync-ext` needs no compiler. A files-autoloaded
+bootstrap can then activate it on the CLI with no `php.ini` edit and no root:
 
 ```php
 require 'vendor/autoload.php';
@@ -79,6 +74,10 @@ lands on the normal, ABI-safe MINIT load. It preserves the original command line
 re-exec loop, and is a no-op when the extension is already loaded (PIE,
 `extension=`, or a prior re-exec). Uses `pcntl_exec()`, falling back to FFI
 `execv()`. CLI only; on other SAPIs add `extension=phasync` to `php.ini`.
+
+**PIE** isn't supported yet: PIE only installs packages of `type: php-ext`, and
+this package is a library so that plain `composer require` works without a
+compiler. Build from source (see Build) if you need a `php.ini`-managed install.
 
 Or the plain manual load, from anywhere on disk (absolute path — no
 `extension_dir` needed for `extension=`):
