@@ -1,5 +1,5 @@
 --TEST--
-Transparent async: fread on a hooked socket suspends a fiber and resumes with data
+Transparent async: fread on a hooked socket suspends a fiber with its stream resource
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -12,27 +12,25 @@ phasync
 
     $fiber = new Fiber(function() use ($addr) {
         $conn = stream_socket_client("tcp://$addr", $e, $es, 1);
-        $data = fread($conn, 100);      // no data yet -> suspends transparently
-        echo "fiber read: $data\n";
+        echo "fiber read: " . fread($conn, 100) . "\n";   // no data yet -> suspends
     });
 
-    $sig = $fiber->start();             // runs until fread would block
-    echo "suspended on: {$sig[0]}\n";
+    $res = $fiber->start();                 // handler was handed the client resource
+    var_dump(is_resource($res));            // suspended on a real stream resource
 
     $sconn = stream_socket_accept($server, 1);
     fwrite($sconn, "hello");
 
-    [$type, $fd] = $sig;
-    $r = [$fd]; $w = $e = null;
+    $r = [$res]; $w = $e = null;
     \phasync\ext\stream_select($r, $w, $e, 2);
     $fiber->resume();
     echo "done\n";
 },
-fn($fd) => Fiber::suspend(['read', $fd]),
-fn($fd) => Fiber::suspend(['write', $fd]),
-fn($us) => Fiber::suspend(['sleep', $us]));
+fn($res) => Fiber::suspend($res),
+fn($res) => Fiber::suspend($res),
+fn($us) => Fiber::suspend($us));
 ?>
 --EXPECT--
-suspended on: read
+bool(true)
 fiber read: hello
 done

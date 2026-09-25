@@ -130,19 +130,71 @@ static php_socket_t phasync_stream_fd(php_stream *stream)
 	return fd;
 }
 
-/* Call a userland wait handler with one long argument; -1 if it threw. */
-static int phasync_call_wait(zval *handler, zend_long arg)
+/* Call a userland wait handler with one already-built argument zval; -1 if it
+ * threw. The argument is copied for the call and released afterwards, so the
+ * caller keeps ownership of whatever it passed. */
+static int phasync_call_wait_zval(zval *handler, zval *arg)
 {
-	zval args[1], retval;
+	zval call_args[1], retval;
 	int rc = 0;
 
-	ZVAL_LONG(&args[0], arg);
+	ZVAL_COPY(&call_args[0], arg);   /* +1 ref for the duration of the call */
 	ZVAL_UNDEF(&retval);
-	if (call_user_function(NULL, NULL, handler, &retval, 1, args) == FAILURE || EG(exception)) {
+	if (call_user_function(NULL, NULL, handler, &retval, 1, call_args) == FAILURE || EG(exception)) {
 		rc = -1;
 	}
+	zval_ptr_dtor(&call_args[0]);
 	zval_ptr_dtor(&retval);
 	return rc;
+}
+
+/* Call the sleep handler with a microsecond count. */
+static int phasync_call_wait_long(zval *handler, zend_long arg)
+{
+	zval z;
+	ZVAL_LONG(&z, arg);
+	return phasync_call_wait_zval(handler, &z);
+}
+
+/* Call a read/write wait handler with a STREAM RESOURCE so it can go straight
+ * into a userland event loop's stream_select() (phasync::readable()/writable()).
+ *
+ * For a real stream (socket/pipe/TLS) we hand over the stream's own resource.
+ * For a bare fd with no stream — the thread pool's self-pipe — we wrap a dup() of
+ * the fd in a transient php_stream so the loop still gets a selectable resource,
+ * and close that wrapper afterwards (the dup keeps the pool's own fd untouched
+ * for reuse). Either way the handler only waits; the extension does the real I/O. */
+static int phasync_wait_fd(zval *handler, php_stream *stream, php_socket_t fd)
+{
+	zval arg;
+	int rc;
+
+	if (stream != NULL && stream->res != NULL) {
+		/* Borrow the stream's existing resource (no ownership transfer). */
+		ZVAL_RES(&arg, stream->res);
+		return phasync_call_wait_zval(handler, &arg);
+	}
+
+	/* No resource to borrow: wrap a dup of the fd in a throwaway stream. */
+	if (fd == -1) {
+		return -1;
+	}
+	{
+		int dupfd = dup(fd);
+		php_stream *tmp;
+		if (dupfd < 0) {
+			return -1;
+		}
+		tmp = php_stream_fopen_from_fd(dupfd, "r", NULL);
+		if (tmp == NULL) {
+			close(dupfd);
+			return -1;
+		}
+		php_stream_to_zval(tmp, &arg);   /* register as a resource; arg owns 1 ref */
+		rc = phasync_call_wait_zval(handler, &arg);
+		zval_ptr_dtor(&arg);             /* drop our ref -> closes tmp (and dupfd) */
+		return rc;
+	}
 }
 
 /* ---- thread pool: run blocking syscalls off the main thread --------------
@@ -460,7 +512,7 @@ static void phasync_pool_run(phasync_task *t)
 	phasync_pool_submit(t);
 
 	/* park until the worker makes the read end readable */
-	phasync_call_wait(phasync_read_handler(), (zend_long) p->rfd);
+	phasync_wait_fd(phasync_read_handler(), NULL, p->rfd);
 
 	/* The worker will finish this bounded op shortly and write its byte even if
 	 * the fiber was resumed early by an exception, so draining here is safe and
@@ -499,7 +551,7 @@ static void phasync_pool_run_dedicated(phasync_task *t)
 	}
 	pthread_attr_destroy(&attr);
 
-	rc = phasync_call_wait(phasync_read_handler(), (zend_long) pipefd[0]);
+	rc = phasync_wait_fd(phasync_read_handler(), NULL, pipefd[0]);
 
 	/* Always reap the thread, however the fiber came back. If the worker already
 	 * finished, it is past its (only) open() cancellation point with cancellation
@@ -631,7 +683,7 @@ static ssize_t phasync_wrapped_read(php_stream *stream, char *buf, size_t count)
 			stream->eof = 1;
 			return -1;
 		}
-		if (phasync_call_wait(handler, (zend_long) fd) != 0) {
+		if (phasync_wait_fd(handler, stream, fd) != 0) {
 			return -1;
 		}
 	}
@@ -658,7 +710,7 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 		if (errno != EAGAIN && errno != EWOULDBLOCK) {
 			return -1;
 		}
-		if (phasync_call_wait(handler, (zend_long) fd) != 0) {
+		if (phasync_wait_fd(handler, stream, fd) != 0) {
 			return -1;
 		}
 	}
@@ -689,7 +741,7 @@ static ssize_t phasync_wrapped_read_tls(php_stream *stream, char *buf, size_t co
 			return n;                    /* error or real EOF */
 		}
 		fd = phasync_stream_fd(stream);  /* n == 0, not eof -> would block */
-		if (fd == -1 || phasync_call_wait(handler, (zend_long) fd) != 0) {
+		if (fd == -1 || phasync_wait_fd(handler, stream, fd) != 0) {
 			return -1;
 		}
 	}
@@ -714,7 +766,7 @@ static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, si
 			return n;
 		}
 		fd = phasync_stream_fd(stream);  /* 0 -> would block */
-		if (fd == -1 || phasync_call_wait(handler, (zend_long) fd) != 0) {
+		if (fd == -1 || phasync_wait_fd(handler, stream, fd) != 0) {
 			return -1;
 		}
 	}
@@ -889,7 +941,7 @@ static ZEND_NAMED_FUNCTION(phasync_sleep_override)
 		zend_argument_value_error(1, "must be greater than or equal to 0");
 		RETURN_THROWS();
 	}
-	phasync_call_wait(phasync_sleep_handler(), (zend_long) (seconds * 1000000));
+	phasync_call_wait_long(phasync_sleep_handler(), (zend_long) (seconds * 1000000));
 	RETURN_LONG(0);
 }
 
@@ -909,7 +961,7 @@ static ZEND_NAMED_FUNCTION(phasync_usleep_override)
 		zend_argument_value_error(1, "must be greater than or equal to 0");
 		RETURN_THROWS();
 	}
-	phasync_call_wait(phasync_sleep_handler(), usec);
+	phasync_call_wait_long(phasync_sleep_handler(), usec);
 }
 
 static ZEND_NAMED_FUNCTION(phasync_time_nanosleep_override)
@@ -933,7 +985,7 @@ static ZEND_NAMED_FUNCTION(phasync_time_nanosleep_override)
 		zend_argument_value_error(2, "must be greater than or equal to 0");
 		RETURN_THROWS();
 	}
-	phasync_call_wait(phasync_sleep_handler(), (zend_long) (sec * 1000000 + nsec / 1000));
+	phasync_call_wait_long(phasync_sleep_handler(), (zend_long) (sec * 1000000 + nsec / 1000));
 	RETURN_TRUE;
 }
 
@@ -954,7 +1006,7 @@ static ZEND_NAMED_FUNCTION(phasync_time_sleep_until_override)
 	gettimeofday(&tv, NULL);
 	now = (double) tv.tv_sec + (double) tv.tv_usec / 1000000.0;
 	usec = (ts > now) ? (zend_long) ((ts - now) * 1000000.0) : 0;
-	phasync_call_wait(phasync_sleep_handler(), usec);
+	phasync_call_wait_long(phasync_sleep_handler(), usec);
 	RETURN_TRUE;
 }
 

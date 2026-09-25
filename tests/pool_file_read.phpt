@@ -1,5 +1,5 @@
 --TEST--
-fopen() on a regular file POOL-wraps it: fread offloads to the pool and parks the fiber
+fopen() regular file POOL-wrapped: fread offloads to the pool; handler gets a resource
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -11,11 +11,11 @@ file_put_contents($path, "regular-file-contents-0123456789");
 
 \phasync\ext\manage(function () use ($path) {
     $drive = function (Fiber $f) {
-        $fd = $f->start();
+        $res = $f->start();
         while (!$f->isTerminated()) {
-            $r = [$fd]; $w = $e = null;
+            $r = [$res]; $w = $e = null;
             \phasync\ext\stream_select($r, $w, $e, 5);
-            $fd = $f->resume();
+            $res = $f->resume();
         }
     };
     $f = new Fiber(function () use ($path) {
@@ -31,8 +31,8 @@ file_put_contents($path, "regular-file-contents-0123456789");
     });
     $drive($f);
 },
-fn($fd) => Fiber::suspend($fd),
-fn($fd) => Fiber::suspend($fd),
+fn($res) => Fiber::suspend($res),
+fn($res) => Fiber::suspend($res),
 fn($us) => Fiber::suspend($us));
 
 unlink($path);

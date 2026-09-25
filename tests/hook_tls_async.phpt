@@ -43,16 +43,16 @@ $suspended = \phasync\ext\manage(function () use ($port, $ctx) {
     $sig = $fiber->start();
     $suspended = ($sig !== null);
     while (!$fiber->isTerminated()) {
-        [$type,$fd] = $sig;
+        [$type,$res] = $sig;
         $r=$w=$ex=null;
-        if ($type==='read') $r=[$fd]; else $w=[$fd];
+        if ($type==='read') $r=[$res]; else $w=[$res];
         \phasync\ext\stream_select($r,$w,$ex,5);
         $sig = $fiber->resume();
     }
     return $suspended;
 },
-fn($fd)=>Fiber::suspend(['read',$fd]),
-fn($fd)=>Fiber::suspend(['write',$fd]),
+fn($res)=>Fiber::suspend(['read',$res]),
+fn($res)=>Fiber::suspend(['write',$res]),
 fn($us)=>Fiber::suspend(['sleep',$us]));
 
 var_dump($suspended);   // proves it went async, not blocking

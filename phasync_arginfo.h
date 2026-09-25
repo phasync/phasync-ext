@@ -1,5 +1,5 @@
 /* This is a generated file, edit the .stub.php file instead.
- * Stub hash: 2e71780406d9a18d22f7777dba5ded3b47c7ae56 */
+ * Stub hash: d58c407713f53928c239a303adcfffef1e1472cb */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_phasync_ext_stream_select, 0, 4, MAY_BE_LONG|MAY_BE_FALSE)
 	ZEND_ARG_TYPE_INFO(1, read, IS_ARRAY, 1)

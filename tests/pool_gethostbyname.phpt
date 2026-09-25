@@ -1,5 +1,5 @@
 --TEST--
-Hooked gethostbyname() resolves on the thread pool and parks the fiber
+Hooked gethostbyname() resolves on the thread pool; handler gets a stream resource
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -7,14 +7,16 @@ phasync
 --FILE--
 <?php
 \phasync\ext\manage(function () {
-    // drive a fiber: run until it parks on a pipe fd, wait for that fd (the
-    // worker's self-pipe) to become readable, resume, repeat.
+    // Drive a fiber: it parks by suspending the RESOURCE the handler was given
+    // (the worker's completion pipe, wrapped as a stream); wait on that resource
+    // via the fd-capable stream_select, resume, repeat.
     $drive = function (Fiber $f) {
-        $fd = $f->start();
+        $res = $f->start();
         while (!$f->isTerminated()) {
-            $r = [$fd]; $w = $e = null;
+            var_dump(is_resource($res));                 // handler received a resource
+            $r = [$res]; $w = $e = null;
             \phasync\ext\stream_select($r, $w, $e, 5);
-            $fd = $f->resume();
+            $res = $f->resume();
         }
     };
     $f = new Fiber(function () {
@@ -23,10 +25,11 @@ phasync
     $drive($f);
     echo "done\n";
 },
-fn($fd) => Fiber::suspend($fd),
-fn($fd) => Fiber::suspend($fd),
+fn($res) => Fiber::suspend($res),
+fn($res) => Fiber::suspend($res),
 fn($us) => Fiber::suspend($us));
 ?>
 --EXPECT--
+bool(true)
 ip=127.0.0.1
 done

@@ -21,9 +21,14 @@ function stream_select(?array &$read, ?array &$write, ?array &$except, ?int $sec
  * calls one of the three handlers, which are responsible only for *waiting*
  * (typically Fiber::suspend into a scheduler); the extension performs the real
  * I/O afterwards:
- *   - $readHandler(int $fd)  — wait until $fd is readable;
- *   - $writeHandler(int $fd) — wait until $fd is writable;
- *   - $sleepHandler(int $us) — wait $us microseconds (a scheduler timer).
+ *   - $readHandler(resource $stream)  — wait until $stream is readable;
+ *   - $writeHandler(resource $stream) — wait until $stream is writable;
+ *   - $sleepHandler(int $us)          — wait $us microseconds (a scheduler timer).
+ *
+ * The read/write handlers receive a real PHP stream resource — the socket/pipe
+ * being read, or, for thread-pool ops (gethostbyname/file/FIFO), a wrapper around
+ * the worker's completion pipe — so they can be phasync::readable()/writable()
+ * (or feed a native stream_select()) directly, riding the loop's single select.
  *
  * Covers tcp/unix/ssl/tls sockets, proc_open() pipes, sleep()/usleep()/
  * time_nanosleep()/time_sleep_until(), gethostbyname(), and fopen() (regular

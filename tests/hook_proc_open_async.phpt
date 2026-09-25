@@ -1,5 +1,5 @@
 --TEST--
-proc_open pipe fread suspends a fiber transparently under hooks
+proc_open pipe fread suspends a fiber with its stream resource under hooks
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -7,19 +7,15 @@ phasync
 --FILE--
 <?php
 \phasync\ext\manage(function () {
-    // child sleeps briefly then prints, so the first read would block
     $p = proc_open('sh -c "sleep 0.2; printf hello"', [1 => ['pipe','w'], 2 => ['pipe','w']], $pipes);
 
     $fiber = new Fiber(function() use ($pipes) {
-        $data = fread($pipes[1], 100);   // no data yet -> suspends transparently
-        echo "fiber read: $data\n";
+        echo "fiber read: " . fread($pipes[1], 100) . "\n";   // no data yet -> suspends
     });
-    $sig = $fiber->start();
-    echo "suspended: {$sig[0]}\n";
+    $res = $fiber->start();
+    var_dump(is_resource($res));
 
-    // scheduler: wait for the pipe fd to be readable, then resume
-    [$type, $fd] = $sig;
-    $r = [$fd]; $w = $ex = null;
+    $r = [$res]; $w = $ex = null;
     \phasync\ext\stream_select($r, $w, $ex, 2);
     $fiber->resume();
 
@@ -27,11 +23,11 @@ phasync
     proc_close($p);
     echo "done\n";
 },
-fn($fd) => Fiber::suspend(['read', $fd]),
-fn($fd) => Fiber::suspend(['write', $fd]),
-fn($us) => Fiber::suspend(['sleep', $us]));
+fn($res) => Fiber::suspend($res),
+fn($res) => Fiber::suspend($res),
+fn($us) => Fiber::suspend($us));
 ?>
 --EXPECT--
-suspended: read
+bool(true)
 fiber read: hello
 done
