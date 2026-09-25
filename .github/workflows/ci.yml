@@ -15,6 +15,16 @@ jobs:
       fail-fast: false
       matrix:
         php: ['8.2', '8.3', '8.4', '8.5']
+    services:
+      # For tests/mysqlnd_suspends.phpt (skipped when PHASYNC_TEST_MYSQL is unset).
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=24
     steps:
       - uses: actions/checkout@v4
 
@@ -22,7 +32,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: posix
+          extensions: posix, mysqli, pdo_mysql
           tools: none
           coverage: none
 
@@ -40,6 +50,7 @@ jobs:
         env:
           NO_INTERACTION: '1'
           REPORT_EXIT_STATUS: '1'
+          PHASYNC_TEST_MYSQL: '127.0.0.1:3306:root:test'
         run: make test TESTS=tests/
 
       - name: Dump failing test diffs
