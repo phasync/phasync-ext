@@ -45,15 +45,18 @@ function stream_select(?array &$read, ?array &$write, ?array &$except, ?int $sec
 function manage(\Closure $code, \Closure $readHandler, \Closure $writeHandler, \Closure $sleepHandler): mixed {}
 
 /**
- * Whether reads/writes on $stream are intercepted while inside a manage() scope
- * (i.e. they suspend the fiber via the handlers instead of blocking the process).
+ * Whether a read or write on $stream *right now* would suspend the fiber instead
+ * of blocking the process or returning EAGAIN — so a scheduler can skip an
+ * explicit readiness wait and let the read suspend on its own.
  *
- * This is a pure pointer check — it inspects the stream's ops table and performs
- * no syscall — so callers such as a scheduler can cheaply decide to let a read
- * suspend on its own rather than doing an explicit readiness wait first.
+ * All of these must hold (each is a field check — no syscall):
+ *   - a manage() scope is currently active;
+ *   - $stream is a descriptor-backed stream wrapped by this extension;
+ *   - it is not a listening server socket (accept() is not intercepted);
+ *   - the caller has left it in blocking mode (an explicitly non-blocking stream
+ *     returns EAGAIN rather than suspending).
  *
- * Returns false for anything that is not a descriptor-backed, wrapped stream,
- * and for listening server sockets: accept() is not intercepted, so a read/write
- * contract does not apply to them.
+ * Returns false otherwise — including outside any scope, and for non-descriptor
+ * streams (php://memory, userspace wrappers, …).
  */
-function is_managed(mixed $stream): bool {}
+function is_auto_managed(mixed $stream): bool {}

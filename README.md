@@ -102,7 +102,7 @@ function manage(
     \Closure $sleepHandler,  // (int $microseconds) — wait that long (a scheduler timer)
 ): mixed;
 
-function is_managed(mixed $stream): bool;
+function is_auto_managed(mixed $stream): bool;
 ```
 
 The read/write handlers receive a real **PHP stream resource** — the socket/pipe
@@ -128,12 +128,15 @@ returns `EAGAIN`, and honours `stream_set_blocking()` exactly as an unwrapped
 stream would. Only inside a scope, and only for a stream left in blocking mode,
 does a would-block suspend the fiber instead of blocking the process.
 
-`is_managed($stream)` reports whether reads/writes on `$stream` are intercepted
-inside a scope (i.e. would suspend rather than block). It is a **pure ops-pointer
-check — no syscall** — so a scheduler can cheaply skip an explicit readiness wait
-and let the read suspend on its own. It returns `false` for non-descriptor
-streams (`php://memory`, userspace wrappers, …) and for **listening server
-sockets**, whose `accept()` is not intercepted.
+`is_auto_managed($stream)` reports whether a read/write on `$stream` **right now**
+would suspend the fiber instead of blocking or returning `EAGAIN` — so a scheduler
+can cheaply skip an explicit readiness wait and let the read suspend on its own.
+It is **field checks only, no syscall**, and returns `true` only when *all* of:
+a `manage()` scope is active; `$stream` is a wrapped, descriptor-backed stream;
+it is not a **listening server socket** (`accept()` is not intercepted); and the
+caller has left it in blocking mode (an explicitly non-blocking stream returns
+`EAGAIN` rather than suspending). It returns `false` otherwise — including outside
+any scope and for non-descriptor streams (`php://memory`, userspace wrappers, …).
 
 ```php
 use function phasync\ext\manage;

@@ -22,9 +22,11 @@
  *         run on a worker thread pool (they are not readiness-pollable / are
  *         unsolvable single-threaded), waking the fiber via a self-pipe.
  *
- * phasync\ext\is_managed($stream) — pure ops-pointer check (no syscall): whether
- *         reads/writes on $stream suspend inside a scope. False for non-fd streams
- *         and for listening sockets (accept() is not intercepted).
+ * phasync\ext\is_auto_managed($stream) — field checks only (no syscall): whether a
+ *         read/write on $stream *right now* suspends the fiber rather than blocking
+ *         or returning EAGAIN. True only when a scope is active AND the stream is
+ *         wrapped/fd-backed AND not a listener AND left in blocking mode. So a
+ *         caller can skip an explicit readiness wait and let the read suspend.
  */
 #ifdef HAVE_CONFIG_H
 # include "config.h"
@@ -51,7 +53,7 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha3"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha4"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -604,6 +606,11 @@ static ssize_t phasync_wrapped_read_pool(php_stream *stream, char *buf, size_t c
 	t.count = count;
 	phasync_pool_run(&t);
 	errno = t.err;
+	if (t.result == 0) {
+		stream->eof = 1;   /* a 0-byte read on a regular file is EOF (as plain
+		                    * stdio read does); without this feof() never trips
+		                    * and while (!feof($fp)) spins. */
+	}
 	return t.result;
 }
 
@@ -1492,7 +1499,7 @@ static int phasync_emulate_read(zval *array)
 	return ret;
 }
 
-ZEND_FUNCTION(phasync_ext_is_managed)
+ZEND_FUNCTION(phasync_ext_is_auto_managed)
 {
 	zval *zstream;
 	php_stream *stream;
@@ -1502,6 +1509,16 @@ ZEND_FUNCTION(phasync_ext_is_managed)
 		Z_PARAM_ZVAL(zstream)
 	ZEND_PARSE_PARAMETERS_END();
 
+	/* A read/write auto-suspends the fiber *right now* only when all of these
+	 * hold — and each is a field check, no syscall:
+	 *   - a manage() scope is active (otherwise the wrapper delegates natively);
+	 *   - the stream is one of ours (wrapped, fd-backed);
+	 *   - it is not a listening socket (accept() is not intercepted);
+	 *   - the caller has left it blocking (an explicitly non-blocking stream
+	 *     returns EAGAIN instead of suspending). */
+	if (PHASYNC_G(scope_top) == NULL) {
+		RETURN_FALSE;
+	}
 	if (Z_TYPE_P(zstream) != IS_RESOURCE) {
 		RETURN_FALSE;
 	}
@@ -1509,15 +1526,14 @@ ZEND_FUNCTION(phasync_ext_is_managed)
 	if (stream == NULL || stream->ops == NULL) {
 		RETURN_FALSE;
 	}
-	/* Pure pointer check: is this one of our wrapped read ops? (no syscall) */
 	if (stream->ops->read != phasync_wrapped_read
 	 && stream->ops->read != phasync_wrapped_read_tls
 	 && stream->ops->read != phasync_wrapped_read_pool) {
 		RETURN_FALSE;
 	}
 	e = phasync_entry(stream);
-	if (e && e->is_listener) {
-		RETURN_FALSE;   /* accept() is not hooked */
+	if (e && (e->is_listener || !e->want_block)) {
+		RETURN_FALSE;
 	}
 	RETURN_TRUE;
 }
