@@ -1,6 +1,6 @@
 name: Release
 
-# One-click release: builds the 12 per-ABI binaries, bundles them into a
+# One-click release: builds the 16 per-ABI binaries, bundles them into a
 # tag-only commit (so Packagist's tag tarball carries bin/ while main stays
 # binary-free), pushes the tag, and publishes a GitHub release with the .so as
 # assets. Run from the Actions tab with the version to cut.
@@ -27,9 +27,11 @@ jobs:
       fail-fast: true
       matrix:
         include:
+          - { php: '8.2', runner: ubuntu-24.04,     arch: x86_64 }
           - { php: '8.3', runner: ubuntu-24.04,     arch: x86_64 }
           - { php: '8.4', runner: ubuntu-24.04,     arch: x86_64 }
           - { php: '8.5', runner: ubuntu-24.04,     arch: x86_64 }
+          - { php: '8.2', runner: ubuntu-24.04-arm, arch: aarch64 }
           - { php: '8.3', runner: ubuntu-24.04-arm, arch: aarch64 }
           - { php: '8.4', runner: ubuntu-24.04-arm, arch: aarch64 }
           - { php: '8.5', runner: ubuntu-24.04-arm, arch: aarch64 }
@@ -58,9 +60,11 @@ jobs:
       fail-fast: true
       matrix:
         include:
+          - { php: '8.2', runner: ubuntu-24.04,     arch: x86_64 }
           - { php: '8.3', runner: ubuntu-24.04,     arch: x86_64 }
           - { php: '8.4', runner: ubuntu-24.04,     arch: x86_64 }
           - { php: '8.5', runner: ubuntu-24.04,     arch: x86_64 }
+          - { php: '8.2', runner: ubuntu-24.04-arm, arch: aarch64 }
           - { php: '8.3', runner: ubuntu-24.04-arm, arch: aarch64 }
           - { php: '8.4', runner: ubuntu-24.04-arm, arch: aarch64 }
           - { php: '8.5', runner: ubuntu-24.04-arm, arch: aarch64 }
@@ -101,11 +105,11 @@ jobs:
         uses: actions/download-artifact@v4
         with: { path: bin, merge-multiple: true }
 
-      - name: Verify all 12 ABIs are present
+      - name: Verify all 16 ABIs are present
         run: |
           set -eux
           n=$(ls bin/*.so | wc -l)
-          test "$n" -eq 12 || { echo "::error::expected 12 binaries, got $n"; exit 1; }
+          test "$n" -eq 16 || { echo "::error::expected 16 binaries, got $n"; exit 1; }
 
       - name: Create tag-only release commit and tag
         run: |
@@ -114,9 +118,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "__release-${{ inputs.version }}"
           git add -f bin/*.so
-          git commit -m "Release ${{ inputs.version }}: bundle prebuilt binaries (12 ABIs)
+          git commit -m "Release ${{ inputs.version }}: bundle prebuilt binaries (16 ABIs)
 
-          bin/ carries phasync-<ver>-nts-<arch>-<libc>.so for PHP 8.3/8.4/8.5 x
+          bin/ carries phasync-<ver>-nts-<arch>-<libc>.so for PHP 8.2/8.3/8.4/8.5 x
           {x86_64,aarch64} x {glibc,musl}. This commit lives only on the tag;
           main stays binary-free."
           git tag -a "${{ inputs.version }}" -m "phasync-ext ${{ inputs.version }}"

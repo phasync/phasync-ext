@@ -3,7 +3,7 @@
 [![CI](https://github.com/phasync/phasync-ext/actions/workflows/ci.yml/badge.svg)](https://github.com/phasync/phasync-ext/actions/workflows/ci.yml)
 
 A PHP extension that gives [phasync](https://github.com/phasync/phasync) — and any
-fiber-based async code — two things on **PHP 8.3+**, without patching PHP:
+fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
 
 1. **`phasync\ext\stream_select()`** — a drop-in `stream_select()` that uses
    `poll(2)` internally, so it is **not bounded by `FD_SETSIZE`** (the ~1024
@@ -44,7 +44,7 @@ make test
 # load per-run in CLI:  php -d extension=modules/phasync.so your-app.php
 ```
 
-The committed `phasync_arginfo.h` targets the latest PHP. On **PHP 8.3** the
+The committed `phasync_arginfo.h` targets the latest PHP. On **PHP 8.2 and 8.3** the
 `ZEND_RAW_FENTRY` macro has a different arity, so regenerate it first (needs no
 network beyond the one-time PHP-Parser fetch `gen_stub` does itself):
 

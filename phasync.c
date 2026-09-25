@@ -49,7 +49,7 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha9"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha10"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -231,14 +231,21 @@ static void phasync_mark_timed_out(php_stream *stream)
 	}
 }
 
-/* Native php_sockop_read does not wait at all (MSG_DONTWAIT, returns 0) when the
- * current read call has already delivered buffered data, or when the socket's
- * timeout is exactly zero. Mirror that for sockets; pipes/files block natively. */
+/* Since 8.3, native php_sockop_read does not wait at all (MSG_DONTWAIT, returns 0)
+ * when the current read call has already delivered buffered data, or when the
+ * socket's timeout is exactly zero. Mirror that for sockets; pipes/files block
+ * natively. 8.2 has no such rule: a blocking read always waits, and a zero timeout
+ * times out at once — which the normal wait path already reproduces. */
 static bool phasync_read_dont_wait(php_stream *stream)
 {
+#if PHP_VERSION_ID >= 80300
 	php_netstream_data_t *sock = phasync_sock_data(stream);
 	return sock && (stream->has_buffered_data
 		|| (sock->timeout.tv_sec == 0 && sock->timeout.tv_usec == 0));
+#else
+	(void) stream;
+	return false;
+#endif
 }
 
 /* Native php_sockop_write reports a timed-out send with a notice; mirror it. */

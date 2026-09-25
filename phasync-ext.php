@@ -66,7 +66,7 @@ if (!\function_exists('phasync\\ext\\ensure_loaded')) {
             throw new \RuntimeException(
                 "phasync\\ext\\ensure_loaded(): no prebuilt phasync binary is bundled "
                 . "for this platform (" . _abi_key() . ").\n"
-                . "Bundled platforms: PHP 8.3/8.4/8.5, x86_64/aarch64, glibc/musl.\n"
+                . "Bundled platforms: PHP 8.2/8.3/8.4/8.5, x86_64/aarch64, glibc/musl.\n"
                 . "Build it yourself and point PHASYNC_EXT_SO at the result:\n"
                 . "    git clone https://github.com/phasync/phasync-ext\n"
                 . "    cd phasync-ext && phpize && ./configure --enable-phasync && make\n"
