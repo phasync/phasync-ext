@@ -6,6 +6,7 @@ phasync
 <?php if (!class_exists('Fiber')) die('skip requires Fibers'); ?>
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 // A regular file opened inside a scope is POOL-wrapped. A read that returns 0
 // bytes must set EOF, just as PHP's native plain-file read does — otherwise
 // while (!feof($fp)) fread(...) never terminates. The output below is identical
@@ -28,7 +29,7 @@ file_put_contents($path, 'Hello, world!');   // 13 bytes
         \phasync\ext\stream_select($r, $w, $e, 5);
         $res = $f->resume();
     }
-}, fn($r) => Fiber::suspend($r), fn($w) => Fiber::suspend($w), fn($us) => Fiber::suspend($us));
+}, fn($r) => Fiber::suspend($r), fn($w) => Fiber::suspend($w), fn($us) => Fiber::suspend($us), TestTimeout::class);
 
 unlink($path);
 ?>

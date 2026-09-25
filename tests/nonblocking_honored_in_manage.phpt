@@ -6,6 +6,7 @@ phasync
 <?php if (!function_exists('stream_socket_server')) die('skip requires sockets'); ?>
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 $srv  = stream_socket_server('tcp://127.0.0.1:0', $e, $es);
 $name = stream_socket_get_name($srv, false);
 $port = substr($name, strrpos($name, ':') + 1);
@@ -18,7 +19,7 @@ $mark = function ($s) use (&$called) { $called = true; };
 $r = \phasync\ext\manage(function () use ($cli) {
     stream_set_blocking($cli, false);      // caller opts out of blocking
     return fread($cli, 100);               // no data -> must NOT suspend
-}, $mark, $mark, fn($us) => null);
+}, $mark, $mark, fn($us) => null, TestTimeout::class);
 
 var_dump($r === '' || $r === false);       // bool(true): got would-block, natively
 var_dump($called);                         // bool(false): the wait handler never ran

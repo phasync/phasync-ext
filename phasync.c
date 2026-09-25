@@ -3,30 +3,25 @@
  * phasync\ext\stream_select() — growable, poll(2)-based, no FD_SETSIZE limit.
  *         Accepts stream resources and plain integer file descriptors.
  *
- * phasync\ext\manage($code, $read, $write, $sleep) — run $code with transparent
- *         async I/O active for its dynamic extent. The tcp/unix/ssl transports
- *         are re-registered and proc_open()/sleep()/usleep()/time_nanosleep()/
- *         time_sleep_until()/gethostbyname()/fopen() overridden at request start,
- *         and every descriptor-backed stream is wrapped as it is created (plus
- *         STDIN/STDOUT/STDERR and any fds inherited before load). The wrappers
- *         are inert outside a scope: a wrapped stream then blocks, returns EAGAIN
- *         and honours stream_set_blocking() exactly like an unwrapped one. Only
- *         inside a scope, and only for a stream left in blocking mode, does a
- *         would-block invoke the scope's handler with the stream RESOURCE (or the
- *         sleep handler with usec), which waits until ready (typically
- *         Fiber::suspend into a scheduler); the extension then performs the real
- *         I/O. Scopes stack (LIFO) and the handlers are removed automatically when
- *         $code returns or throws. The C side never touches the fiber API — the
- *         userland callbacks own all suspension; it works because PHP fibers are
- *         stackful. Regular-file and DNS blocking and the FIFO open() rendezvous
- *         run on a worker thread pool (they are not readiness-pollable / are
- *         unsolvable single-threaded), waking the fiber via a self-pipe.
- *
- * phasync\ext\is_auto_managed($stream) — field checks only (no syscall): whether a
- *         read/write on $stream *right now* suspends the fiber rather than blocking
- *         or returning EAGAIN. True only when a scope is active AND the stream is
- *         wrapped/fd-backed AND not a listener AND left in blocking mode. So a
- *         caller can skip an explicit readiness wait and let the read suspend.
+ * phasync\ext\manage($code, $read, $write, $sleep, $timeoutException) — run $code
+ *         with transparent async I/O active for its dynamic extent. The tcp/unix/
+ *         ssl transports are re-registered and proc_open()/stream_socket_pair()/
+ *         sleep()/usleep()/time_nanosleep()/time_sleep_until()/gethostbyname()/
+ *         fopen() overridden at request start, and every descriptor-backed stream
+ *         is wrapped as it is created (plus STDIN/STDOUT/STDERR and any fds
+ *         inherited before load). The wrappers are inert outside a scope: a
+ *         wrapped stream then behaves exactly like an unwrapped one. Inside a
+ *         scope, a would-block on a stream left in blocking mode calls the scope's
+ *         handler with the stream RESOURCE and the time the native op would still
+ *         wait (null = forever); the handler returns when the stream is ready, or
+ *         throws. An exception instanceof $timeoutException is caught and the op
+ *         finishes the way native PHP does on a socket timeout; any other
+ *         exception propagates out of the hooked function. The C side never
+ *         touches the fiber API — the userland callbacks own all suspension; it
+ *         works because PHP fibers are stackful. Regular-file and DNS blocking and
+ *         the FIFO open() rendezvous run on a worker thread pool (not
+ *         readiness-pollable / unsolvable single-threaded), waking the fiber via a
+ *         self-pipe.
  */
 #ifdef HAVE_CONFIG_H
 # include "config.h"
@@ -42,6 +37,7 @@
 
 #include <poll.h>
 #include <errno.h>
+#include <math.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -53,12 +49,11 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha6"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha7"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
 	signed char applied; /* fd mode we last forced: -1 unknown, 0 blocking, 1 non-blocking */
-	bool is_listener;   /* server socket: accept() is not hooked, so not "managed" */
 } phasync_hook_entry;
 
 /* Wrapped ops with the original embedded right after it, so the original is
@@ -85,6 +80,7 @@ typedef struct phasync_scope {
 	zval read;
 	zval write;
 	zval sleep;
+	zend_class_entry *timeout_ce;   /* handler exceptions instanceof this = a timeout */
 	struct phasync_scope *prev;
 } phasync_scope;
 
@@ -140,71 +136,206 @@ static php_socket_t phasync_stream_fd(php_stream *stream)
 	return fd;
 }
 
-/* Call a userland wait handler with one already-built argument zval; -1 if it
- * threw. The argument is copied for the call and released afterwards, so the
- * caller keeps ownership of whatever it passed. */
-static int phasync_call_wait_zval(zval *handler, zval *arg)
+/* Tri-state result of a read/write wait handler. */
+#define PHASYNC_WAIT_READY    0    /* handler said ready  -> retry the op          */
+#define PHASYNC_WAIT_TIMEOUT  1    /* handler said timed out -> finish like native */
+#define PHASYNC_WAIT_ERROR    (-1) /* handler threw -> exception pending, propagate */
+
+/* Call the sleep handler as handler(int $microseconds). Returns -1 if it threw. */
+static int phasync_call_sleep(zval *handler, zend_long usec)
 {
-	zval call_args[1], retval;
+	zval arg, retval;
 	int rc = 0;
 
-	ZVAL_COPY(&call_args[0], arg);   /* +1 ref for the duration of the call */
+	ZVAL_LONG(&arg, usec);
 	ZVAL_UNDEF(&retval);
-	if (call_user_function(NULL, NULL, handler, &retval, 1, call_args) == FAILURE || EG(exception)) {
+	if (call_user_function(NULL, NULL, handler, &retval, 1, &arg) == FAILURE || EG(exception)) {
 		rc = -1;
+	}
+	zval_ptr_dtor(&retval);
+	return rc;
+}
+
+/* Call a read/write wait handler as handler(resource $stream, ?float $timeout).
+ * $timeout is how many seconds the native op would still wait (null = forever).
+ * The handler's return value is ignored: returning means the stream is ready
+ * (PHASYNC_WAIT_READY, retry the op). If it throws an instance of the scope's
+ * timeout class, the exception is cleared and the wait counts as timed out
+ * (PHASYNC_WAIT_TIMEOUT — finish the op the native timeout way). Any other
+ * exception is left pending (PHASYNC_WAIT_ERROR) so it propagates out of the
+ * hooked function unchanged. */
+static int phasync_call_wait(zval *handler, zval *arg, double timeout)
+{
+	zval call_args[2], retval;
+	int rc = PHASYNC_WAIT_READY;
+
+	ZVAL_COPY(&call_args[0], arg);        /* +1 ref for the duration of the call */
+	if (isinf(timeout)) {
+		ZVAL_NULL(&call_args[1]);
+	} else {
+		ZVAL_DOUBLE(&call_args[1], timeout);
+	}
+	ZVAL_UNDEF(&retval);
+	if (call_user_function(NULL, NULL, handler, &retval, 2, call_args) == FAILURE) {
+		rc = PHASYNC_WAIT_ERROR;
+	} else if (EG(exception)) {
+		zend_class_entry *tce = PHASYNC_G(scope_top) ? PHASYNC_G(scope_top)->timeout_ce : NULL;
+		if (tce && instanceof_function(EG(exception)->ce, tce)) {
+			zend_clear_exception();
+			rc = PHASYNC_WAIT_TIMEOUT;
+		} else {
+			rc = PHASYNC_WAIT_ERROR;
+		}
 	}
 	zval_ptr_dtor(&call_args[0]);
 	zval_ptr_dtor(&retval);
 	return rc;
 }
 
-/* Call the sleep handler with a microsecond count. */
-static int phasync_call_wait_long(zval *handler, zend_long arg)
+/* If the stream is a socket (tcp/udp/unix/udg all share php_sockop_read as their
+ * read op) return its netstream data — which holds the timeout and the timed-out
+ * flag — otherwise NULL. */
+static php_netstream_data_t *phasync_sock_data(php_stream *stream)
 {
-	zval z;
-	ZVAL_LONG(&z, arg);
-	return phasync_call_wait_zval(handler, &z);
+	const php_stream_ops *orig = stream ? PHASYNC_ORIG(stream) : NULL;
+	if (orig && orig->read == php_stream_socket_ops.read && stream->abstract) {
+		return (php_netstream_data_t *) stream->abstract;
+	}
+	return NULL;
 }
 
-/* Call a read/write wait handler with a STREAM RESOURCE so it can go straight
- * into a userland event loop's stream_select() (phasync::readable()/writable()).
+/* The timeout (seconds) native PHP would apply to a would-block wait here: the
+ * socket's own timeout (stream_set_timeout()/default_socket_timeout; tv_sec == -1
+ * means none), or INF for non-sockets (pipes/FIFOs/files block forever). */
+static double phasync_wait_timeout(php_stream *stream)
+{
+	php_netstream_data_t *sock = phasync_sock_data(stream);
+	if (sock == NULL || sock->timeout.tv_sec == -1) {
+		return INFINITY;
+	}
+	return (double) sock->timeout.tv_sec + (double) sock->timeout.tv_usec / 1000000.0;
+}
+
+/* Flag the stream as timed out exactly as the native socket op does, so
+ * stream_get_meta_data()['timed_out'] === true. No-op for non-sockets. */
+static void phasync_mark_timed_out(php_stream *stream)
+{
+	php_netstream_data_t *sock = phasync_sock_data(stream);
+	if (sock) {
+		sock->timeout_event = true;
+	}
+}
+
+/* Native php_sockop_read does not wait at all (MSG_DONTWAIT, returns 0) when the
+ * current read call has already delivered buffered data, or when the socket's
+ * timeout is exactly zero. Mirror that for sockets; pipes/files block natively. */
+static bool phasync_read_dont_wait(php_stream *stream)
+{
+	php_netstream_data_t *sock = phasync_sock_data(stream);
+	return sock && (stream->has_buffered_data
+		|| (sock->timeout.tv_sec == 0 && sock->timeout.tv_usec == 0));
+}
+
+/* Native php_sockop_write reports a timed-out send with a notice; mirror it. */
+static void phasync_write_timeout_notice(php_stream *stream, size_t count, int err)
+{
+	char *estr;
+
+	if (!phasync_sock_data(stream) || (stream->flags & PHP_STREAM_FLAG_SUPPRESS_ERRORS)) {
+		return;
+	}
+	estr = php_socket_strerror(err, NULL, 0);
+#ifdef php_stream_warn
+	php_stream_warn(stream, NetworkSendFailed,
+		"Send of %zu bytes failed with errno=%d %s", count, err, estr);
+#else
+	php_error_docref(NULL, E_NOTICE,
+		"Send of %zu bytes failed with errno=%d %s", count, err, estr);
+#endif
+	efree(estr);
+}
+
+static double phasync_now(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
+}
+
+/* Wait for the fd via the handler, handing over the stream RESOURCE (so it can go
+ * straight into phasync::readable()/writable() or a native stream_select()) and
+ * the native timeout. See phasync_call_wait for the tri-state return.
  *
- * For a real stream (socket/pipe/TLS) we hand over the stream's own resource.
- * For a bare fd with no stream — the thread pool's self-pipe — we wrap a dup() of
- * the fd in a transient php_stream so the loop still gets a selectable resource,
- * and close that wrapper afterwards (the dup keeps the pool's own fd untouched
- * for reuse). Either way the handler only waits; the extension does the real I/O. */
-static int phasync_wait_fd(zval *handler, php_stream *stream, php_socket_t fd)
+ * For a real stream (socket/pipe/TLS) we borrow the stream's own resource. For a
+ * bare fd with no stream — the thread pool's self-pipe — we wrap a dup() of the fd
+ * in a transient php_stream so the loop still gets a selectable resource, then
+ * close it afterwards (the dup keeps the pool's own fd untouched for reuse). */
+static int phasync_wait_fd(zval *handler, php_stream *stream, php_socket_t fd, double timeout)
 {
 	zval arg;
 	int rc;
 
 	if (stream != NULL && stream->res != NULL) {
-		/* Borrow the stream's existing resource (no ownership transfer). */
-		ZVAL_RES(&arg, stream->res);
-		return phasync_call_wait_zval(handler, &arg);
+		ZVAL_RES(&arg, stream->res);   /* borrow (no ownership transfer) */
+		return phasync_call_wait(handler, &arg, timeout);
 	}
 
-	/* No resource to borrow: wrap a dup of the fd in a throwaway stream. */
 	if (fd == -1) {
-		return -1;
+		return PHASYNC_WAIT_ERROR;
 	}
 	{
 		int dupfd = dup(fd);
 		php_stream *tmp;
 		if (dupfd < 0) {
-			return -1;
+			return PHASYNC_WAIT_ERROR;
 		}
 		tmp = php_stream_fopen_from_fd(dupfd, "r", NULL);
 		if (tmp == NULL) {
 			close(dupfd);
-			return -1;
+			return PHASYNC_WAIT_ERROR;
 		}
 		php_stream_to_zval(tmp, &arg);   /* register as a resource; arg owns 1 ref */
-		rc = phasync_call_wait_zval(handler, &arg);
+		rc = phasync_call_wait(handler, &arg, timeout);
 		zval_ptr_dtor(&arg);             /* drop our ref -> closes tmp (and dupfd) */
 		return rc;
 	}
+}
+
+#define PHASYNC_COOP_ERROR    0   /* stop: exception pending          */
+#define PHASYNC_COOP_RETRY    1   /* ready: retry the op              */
+#define PHASYNC_COOP_TIMEOUT  2   /* stop: native timeout path taken  */
+
+/* One cooperative wait inside a read/write op. *deadline carries the wait's
+ * deadline across retries within one op call (one fill), so a spurious wake-up
+ * is handed only the REMAINING time; callers start each op call with
+ * *deadline < 0, giving every fill a fresh full timeout, as
+ * php_sock_stream_wait_for_data does. On timeout the stream's timed-out flag is
+ * set, exactly as the native socket op sets it. */
+static int phasync_cooperate(zval *handler, php_stream *stream, php_socket_t fd, double *deadline)
+{
+	double timeout = phasync_wait_timeout(stream), wait = INFINITY;
+	int w;
+
+	if (!isinf(timeout)) {
+		double now = phasync_now();
+		if (*deadline < 0) {
+			*deadline = now + timeout;
+		}
+		wait = *deadline - now;
+		if (wait <= 0) {                   /* time used up */
+			phasync_mark_timed_out(stream);
+			return PHASYNC_COOP_TIMEOUT;
+		}
+	}
+	w = phasync_wait_fd(handler, stream, fd, wait);
+	if (w == PHASYNC_WAIT_READY) {
+		return PHASYNC_COOP_RETRY;
+	}
+	if (w == PHASYNC_WAIT_TIMEOUT) {
+		phasync_mark_timed_out(stream);
+		return PHASYNC_COOP_TIMEOUT;
+	}
+	return PHASYNC_COOP_ERROR;
 }
 
 /* ---- thread pool: run blocking syscalls off the main thread --------------
@@ -522,7 +653,7 @@ static void phasync_pool_run(phasync_task *t)
 	phasync_pool_submit(t);
 
 	/* park until the worker makes the read end readable */
-	phasync_wait_fd(phasync_read_handler(), NULL, p->rfd);
+	phasync_wait_fd(phasync_read_handler(), NULL, p->rfd, INFINITY);
 
 	/* The worker will finish this bounded op shortly and write its byte even if
 	 * the fiber was resumed early by an exception, so draining here is safe and
@@ -561,7 +692,7 @@ static void phasync_pool_run_dedicated(phasync_task *t)
 	}
 	pthread_attr_destroy(&attr);
 
-	rc = phasync_wait_fd(phasync_read_handler(), NULL, pipefd[0]);
+	rc = phasync_wait_fd(phasync_read_handler(), NULL, pipefd[0], INFINITY);
 
 	/* Always reap the thread, however the fiber came back. If the worker already
 	 * finished, it is past its (only) open() cancellation point with cancellation
@@ -648,7 +779,6 @@ static phasync_hook_entry *phasync_entry_ensure(php_stream *stream)
 		e = pemalloc(sizeof(*e), 1);
 		e->want_block  = true;    /* streams are blocking until told otherwise */
 		e->applied     = -1;      /* fd mode not forced yet */
-		e->is_listener = false;
 		zend_hash_index_add_ptr(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream, e);
 	}
 	return e;
@@ -707,6 +837,7 @@ static ssize_t phasync_wrapped_read(php_stream *stream, char *buf, size_t count)
 		phasync_apply_mode(stream, fd, e, !e->want_block, false);
 		return orig->read(stream, buf, count);
 	}
+	double deadline = -1;              /* per op call = per fill */
 	phasync_apply_mode(stream, fd, e, true, false);
 	for (;;) {
 		ssize_t n = read(fd, buf, count);
@@ -724,8 +855,11 @@ static ssize_t phasync_wrapped_read(php_stream *stream, char *buf, size_t count)
 			stream->eof = 1;
 			return -1;
 		}
-		if (phasync_wait_fd(handler, stream, fd) != 0) {
-			return -1;
+		if (phasync_read_dont_wait(stream)) {
+			return 0;                    /* native MSG_DONTWAIT short read */
+		}
+		if (phasync_cooperate(handler, stream, fd, &deadline) != PHASYNC_COOP_RETRY) {
+			return -1;                   /* timed out (flag set) or exception pending */
 		}
 	}
 }
@@ -745,9 +879,11 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 		phasync_apply_mode(stream, fd, e, !e->want_block, false);
 		return orig->write(stream, buf, count);
 	}
+	double deadline = -1;              /* per op call = per fill */
 	phasync_apply_mode(stream, fd, e, true, false);
 	for (;;) {
 		ssize_t n = write(fd, buf, count);
+		int err, c;
 		if (n >= 0) {
 			return n;
 		}
@@ -757,9 +893,15 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 		if (errno != EAGAIN && errno != EWOULDBLOCK) {
 			return -1;
 		}
-		if (phasync_wait_fd(handler, stream, fd) != 0) {
-			return -1;
+		err = errno;
+		c = phasync_cooperate(handler, stream, fd, &deadline);
+		if (c == PHASYNC_COOP_RETRY) {
+			continue;
 		}
+		if (c == PHASYNC_COOP_TIMEOUT) {
+			phasync_write_timeout_notice(stream, count, err);
+		}
+		return -1;
 	}
 }
 
@@ -780,6 +922,7 @@ static ssize_t phasync_wrapped_read_tls(php_stream *stream, char *buf, size_t co
 		phasync_apply_mode(stream, fd, e, !e->want_block, true);
 		return orig->read(stream, buf, count);
 	}
+	double deadline = -1;              /* per op call = per fill */
 	phasync_apply_mode(stream, fd, e, true, true);
 	for (;;) {
 		ssize_t n = orig->read(stream, buf, count);
@@ -790,7 +933,7 @@ static ssize_t phasync_wrapped_read_tls(php_stream *stream, char *buf, size_t co
 			return n;                    /* error or real EOF */
 		}
 		fd = phasync_stream_fd(stream);  /* n == 0, not eof -> would block */
-		if (fd == -1 || phasync_wait_fd(handler, stream, fd) != 0) {
+		if (fd == -1 || phasync_cooperate(handler, stream, fd, &deadline) != PHASYNC_COOP_RETRY) {
 			return -1;
 		}
 	}
@@ -807,6 +950,7 @@ static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, si
 		phasync_apply_mode(stream, fd, e, !e->want_block, true);
 		return orig->write(stream, buf, count);
 	}
+	double deadline = -1;              /* per op call = per fill */
 	phasync_apply_mode(stream, fd, e, true, true);
 	for (;;) {
 		ssize_t n = orig->write(stream, buf, count);
@@ -817,7 +961,7 @@ static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, si
 			return n;
 		}
 		fd = phasync_stream_fd(stream);  /* 0 -> would block */
-		if (fd == -1 || phasync_wait_fd(handler, stream, fd) != 0) {
+		if (fd == -1 || phasync_cooperate(handler, stream, fd, &deadline) != PHASYNC_COOP_RETRY) {
 			return -1;
 		}
 	}
@@ -833,14 +977,6 @@ static int phasync_wrapped_set_option(php_stream *stream, int option, int value,
 		phasync_hook_entry *e = phasync_entry_ensure(stream);
 		e->want_block = (value != 0);
 		e->applied    = -1;   /* orig is about to change the fd; re-apply on next I/O */
-	} else if (option == PHP_STREAM_OPTION_XPORT_API && ptrparam) {
-		/* Mark server sockets when they enter listen state, cheaply and once, so
-		 * is_managed() can report false for them without any per-call syscall
-		 * (accept() is not intercepted). */
-		php_stream_xport_param *xp = (php_stream_xport_param *) ptrparam;
-		if (xp->op == STREAM_XPORT_OP_LISTEN) {
-			phasync_entry_ensure(stream)->is_listener = true;
-		}
 	}
 	if (orig->set_option) {
 		/* xport ops (bind/connect/listen/getname/…) all arrive through set_option,
@@ -1034,7 +1170,7 @@ static ZEND_NAMED_FUNCTION(phasync_sleep_override)
 		zend_argument_value_error(1, "must be greater than or equal to 0");
 		RETURN_THROWS();
 	}
-	phasync_call_wait_long(phasync_sleep_handler(), (zend_long) (seconds * 1000000));
+	phasync_call_sleep(phasync_sleep_handler(), (zend_long) (seconds * 1000000));
 	RETURN_LONG(0);
 }
 
@@ -1054,7 +1190,7 @@ static ZEND_NAMED_FUNCTION(phasync_usleep_override)
 		zend_argument_value_error(1, "must be greater than or equal to 0");
 		RETURN_THROWS();
 	}
-	phasync_call_wait_long(phasync_sleep_handler(), usec);
+	phasync_call_sleep(phasync_sleep_handler(), usec);
 }
 
 static ZEND_NAMED_FUNCTION(phasync_time_nanosleep_override)
@@ -1078,7 +1214,7 @@ static ZEND_NAMED_FUNCTION(phasync_time_nanosleep_override)
 		zend_argument_value_error(2, "must be greater than or equal to 0");
 		RETURN_THROWS();
 	}
-	phasync_call_wait_long(phasync_sleep_handler(), (zend_long) (sec * 1000000 + nsec / 1000));
+	phasync_call_sleep(phasync_sleep_handler(), (zend_long) (sec * 1000000 + nsec / 1000));
 	RETURN_TRUE;
 }
 
@@ -1099,7 +1235,7 @@ static ZEND_NAMED_FUNCTION(phasync_time_sleep_until_override)
 	gettimeofday(&tv, NULL);
 	now = (double) tv.tv_sec + (double) tv.tv_usec / 1000000.0;
 	usec = (ts > now) ? (zend_long) ((ts - now) * 1000000.0) : 0;
-	phasync_call_wait_long(phasync_sleep_handler(), usec);
+	phasync_call_sleep(phasync_sleep_handler(), usec);
 	RETURN_TRUE;
 }
 
@@ -1400,20 +1536,34 @@ static void phasync_wrap_existing_streams(void);
 ZEND_FUNCTION(phasync_ext_manage)
 {
 	zval *code, *rh, *wh, *sh;
+	zend_string *timeout_name;
+	zend_class_entry *timeout_ce;
 	phasync_scope frame;
 	zval retval;
 
-	ZEND_PARSE_PARAMETERS_START(4, 4)
+	ZEND_PARSE_PARAMETERS_START(5, 5)
 		Z_PARAM_ZVAL(code)
 		Z_PARAM_ZVAL(rh)
 		Z_PARAM_ZVAL(wh)
 		Z_PARAM_ZVAL(sh)
+		Z_PARAM_STR(timeout_name)
 	ZEND_PARSE_PARAMETERS_END();
+
+	/* Resolved once per scope; a handler exception instanceof this class (subclasses
+	 * included) is the handler's way of saying "the wait's time ran out". */
+	timeout_ce = zend_lookup_class(timeout_name);
+	if (timeout_ce == NULL || !instanceof_function(timeout_ce, zend_ce_throwable)) {
+		if (!EG(exception)) {
+			zend_argument_value_error(5, "must be the name of an existing Throwable class");
+		}
+		RETURN_THROWS();
+	}
 
 	/* Push this scope's handlers (owned copies) and link to the enclosing one. */
 	ZVAL_COPY(&frame.read,  rh);
 	ZVAL_COPY(&frame.write, wh);
 	ZVAL_COPY(&frame.sleep, sh);
+	frame.timeout_ce = timeout_ce;
 	frame.prev = PHASYNC_G(scope_top);
 	PHASYNC_G(scope_top) = &frame;
 
@@ -1563,45 +1713,6 @@ static int phasync_emulate_read(zval *array)
 		zend_array_destroy(ht);
 	}
 	return ret;
-}
-
-ZEND_FUNCTION(phasync_ext_is_auto_managed)
-{
-	zval *zstream;
-	php_stream *stream;
-	phasync_hook_entry *e;
-
-	ZEND_PARSE_PARAMETERS_START(1, 1)
-		Z_PARAM_ZVAL(zstream)
-	ZEND_PARSE_PARAMETERS_END();
-
-	/* A read/write auto-suspends the fiber *right now* only when all of these
-	 * hold — and each is a field check, no syscall:
-	 *   - a manage() scope is active (otherwise the wrapper delegates natively);
-	 *   - the stream is one of ours (wrapped, fd-backed);
-	 *   - it is not a listening socket (accept() is not intercepted);
-	 *   - the caller has left it blocking (an explicitly non-blocking stream
-	 *     returns EAGAIN instead of suspending). */
-	if (PHASYNC_G(scope_top) == NULL) {
-		RETURN_FALSE;
-	}
-	if (Z_TYPE_P(zstream) != IS_RESOURCE) {
-		RETURN_FALSE;
-	}
-	php_stream_from_zval_no_verify(stream, zstream);
-	if (stream == NULL || stream->ops == NULL) {
-		RETURN_FALSE;
-	}
-	if (stream->ops->read != phasync_wrapped_read
-	 && stream->ops->read != phasync_wrapped_read_tls
-	 && stream->ops->read != phasync_wrapped_read_pool) {
-		RETURN_FALSE;
-	}
-	e = phasync_entry(stream);
-	if (e && (e->is_listener || !e->want_block)) {
-		RETURN_FALSE;
-	}
-	RETURN_TRUE;
 }
 
 ZEND_FUNCTION(phasync_ext_stream_select)

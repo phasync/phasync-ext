@@ -12,6 +12,7 @@ if (!function_exists('posix_mkfifo')) {
 ?>
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 $fifo = sys_get_temp_dir() . '/phasync_fifo_' . getmypid();
 @unlink($fifo);
 if (function_exists('posix_mkfifo')) { posix_mkfifo($fifo, 0600); }
@@ -53,7 +54,8 @@ $result->data = null;
 },
 fn($res) => Fiber::suspend($res),
 fn($res) => Fiber::suspend($res),
-fn($us) => Fiber::suspend($us));
+fn($us) => Fiber::suspend($us),
+TestTimeout::class);
 
 @unlink($fifo);
 echo "got: {$result->data}\n";

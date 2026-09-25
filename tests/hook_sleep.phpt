@@ -6,6 +6,7 @@ phasync
 <?php if (!class_exists('Fiber')) die('skip requires Fibers'); ?>
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 $calls = [];
 $sleepH = function ($usec) use (&$calls) { $calls[] = $usec; };   // record, don't wait
 $noop   = fn($fd) => null;
@@ -30,7 +31,7 @@ $noop   = fn($fd) => null;
     usleep(1000);
     var_dump(count($calls) === $before);                 // handler not called
     var_dump(microtime(true) - $t >= 0.0005);            // real sleep happened
-}, $noop, $noop, $sleepH);
+}, $noop, $noop, $sleepH, TestTimeout::class);
 
 // Outside any manage() scope: no handlers at all -> real sleep.
 $t = microtime(true);

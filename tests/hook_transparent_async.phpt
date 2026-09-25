@@ -6,6 +6,7 @@ phasync
 <?php if (!class_exists('Fiber')) die('skip requires Fibers'); ?>
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 \phasync\ext\manage(function () {
     $server = stream_socket_server("tcp://127.0.0.1:0", $errno, $errstr);
     $addr = stream_socket_get_name($server, false);
@@ -28,7 +29,8 @@ phasync
 },
 fn($res) => Fiber::suspend($res),
 fn($res) => Fiber::suspend($res),
-fn($us) => Fiber::suspend($us));
+fn($us) => Fiber::suspend($us),
+TestTimeout::class);
 ?>
 --EXPECT--
 bool(true)

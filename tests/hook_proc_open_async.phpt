@@ -6,6 +6,7 @@ phasync
 <?php if (!class_exists('Fiber')) die('skip requires Fibers'); ?>
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 \phasync\ext\manage(function () {
     $p = proc_open('sh -c "sleep 0.2; printf hello"', [1 => ['pipe','w'], 2 => ['pipe','w']], $pipes);
 
@@ -25,7 +26,8 @@ phasync
 },
 fn($res) => Fiber::suspend($res),
 fn($res) => Fiber::suspend($res),
-fn($us) => Fiber::suspend($us));
+fn($us) => Fiber::suspend($us),
+TestTimeout::class);
 ?>
 --EXPECT--
 bool(true)

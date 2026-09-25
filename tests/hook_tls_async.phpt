@@ -10,6 +10,7 @@ if (!function_exists('proc_open')) die('skip requires proc_open');
 ?>
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 // self-signed cert, generated in-process
 $pk = openssl_pkey_new(['private_key_bits'=>2048, 'private_key_type'=>OPENSSL_KEYTYPE_RSA]);
 $csr = openssl_csr_new(['commonName'=>'localhost'], $pk);
@@ -51,9 +52,10 @@ $suspended = \phasync\ext\manage(function () use ($port, $ctx) {
     }
     return $suspended;
 },
-fn($res)=>Fiber::suspend(['read',$res]),
-fn($res)=>Fiber::suspend(['write',$res]),
-fn($us)=>Fiber::suspend(['sleep',$us]));
+fn($res) => Fiber::suspend(['read',$res]),
+fn($res) => Fiber::suspend(['write',$res]),
+fn($us)=>Fiber::suspend(['sleep',$us]),
+TestTimeout::class);
 
 var_dump($suspended);   // proves it went async, not blocking
 foreach ($pipes as $pp) @fclose($pp);

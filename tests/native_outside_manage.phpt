@@ -6,6 +6,7 @@ phasync
 <?php if (!function_exists('stream_socket_server')) die('skip requires sockets'); ?>
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 // A loopback socket goes through the tcp factory, so it is wrapped. With no
 // manage() scope active the wrapper must be indistinguishable from a raw socket.
 $srv  = stream_socket_server('tcp://127.0.0.1:0', $e, $es);
@@ -33,7 +34,7 @@ var_dump(fread($cli, 100));                 // string(3) "abc"
 // 4. Back to blocking, and after a manage() scope has come and gone the stream
 //    is still perfectly native.
 stream_set_blocking($cli, true);
-\phasync\ext\manage(fn() => null, fn($x) => null, fn($x) => null, fn($x) => null);
+\phasync\ext\manage(fn() => null, fn($x) => null, fn($x) => null, fn($x) => null, TestTimeout::class);
 fwrite($conn, 'world');
 usleep(20000);
 var_dump(fread($cli, 100));                 // string(5) "world"

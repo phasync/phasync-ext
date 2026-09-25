@@ -9,6 +9,7 @@ if (!function_exists('stream_socket_server')) die('skip requires sockets');
 ?>
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 // Wrapping replaces stream->ops with a copy; the socket layer decides unix-vs-inet
 // by ops-pointer identity, so a naive wrap made unix:// parse as ip:port ("Failed
 // to parse address"). This must work both outside and inside a manage() scope.
@@ -35,7 +36,7 @@ echo "outside: " . roundtrip($path) . "\n";
 // Inside a manage() scope.
 echo "inside: " . \phasync\ext\manage(
     fn() => roundtrip($path),
-    fn(...$a) => true, fn(...$a) => true, fn(...$a) => null
+    fn(...$a) => null, fn(...$a) => null, fn(...$a) => null, TestTimeout::class
 ) . "\n";
 @unlink($path);
 ?>

@@ -6,6 +6,7 @@ phasync
 <?php if (!class_exists('Fiber')) die('skip requires Fibers'); ?>
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 \phasync\ext\manage(function () {
     // Drive a fiber: it parks by suspending the RESOURCE the handler was given
     // (the worker's completion pipe, wrapped as a stream); wait on that resource
@@ -27,7 +28,8 @@ phasync
 },
 fn($res) => Fiber::suspend($res),
 fn($res) => Fiber::suspend($res),
-fn($us) => Fiber::suspend($us));
+fn($us) => Fiber::suspend($us),
+TestTimeout::class);
 ?>
 --EXPECT--
 bool(true)

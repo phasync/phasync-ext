@@ -6,6 +6,7 @@ phasync
 <?php if (!class_exists('Fiber')) die('skip requires Fibers'); ?>
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 $path = tempnam(sys_get_temp_dir(), 'phasync_pool_');
 file_put_contents($path, "regular-file-contents-0123456789");
 
@@ -33,7 +34,8 @@ file_put_contents($path, "regular-file-contents-0123456789");
 },
 fn($res) => Fiber::suspend($res),
 fn($res) => Fiber::suspend($res),
-fn($us) => Fiber::suspend($us));
+fn($us) => Fiber::suspend($us),
+TestTimeout::class);
 
 unlink($path);
 echo "done\n";

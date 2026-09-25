@@ -96,13 +96,12 @@ function stream_select(?array &$read, ?array &$write, ?array &$except,
                        ?int $seconds, ?int $microseconds = null): int|false;
 
 function manage(
-    \Closure $code,          // run with async I/O active; its return value is returned
-    \Closure $readHandler,   // (resource $stream) — wait until readable
-    \Closure $writeHandler,  // (resource $stream) — wait until writable
-    \Closure $sleepHandler,  // (int $microseconds) — wait that long (a scheduler timer)
+    \Closure $code,           // run with async I/O active; its return value is returned
+    \Closure $readHandler,    // (resource $stream, ?float $timeout) — wait until readable
+    \Closure $writeHandler,   // (resource $stream, ?float $timeout) — wait until writable
+    \Closure $sleepHandler,   // (int $microseconds) — wait that long (a scheduler timer)
+    string   $timeoutException, // class a handler throws when the wait's time ran out
 ): mixed;
-
-function is_auto_managed(mixed $stream): bool;
 ```
 
 The read/write handlers receive a real **PHP stream resource** — the socket/pipe
@@ -114,10 +113,26 @@ extension performs the actual I/O afterwards. A handler called outside an event
 loop can just do a small blocking `phasync\ext\stream_select()` to satisfy the
 contract. The sleep handler receives a µs duration.
 
+The second handler argument is how long the **native** op would still wait, in
+seconds: a socket's `stream_set_timeout()`/`default_socket_timeout`, counted per
+low-level wait exactly as PHP counts it (a retry within the same wait gets only the
+remaining time), or `null` where PHP would wait forever (pipes, files, FIFOs,
+thread-pool operations). Handler return values are ignored: **returning means
+"ready"**, and the op is retried. To report that the time ran out, the handler
+**throws an instance of `$timeoutException`** (subclasses included). The extension
+catches and clears it and finishes the op exactly as native PHP does on a socket
+timeout — partial data or `false`, `stream_get_meta_data()['timed_out']` set, and
+the notice PHP emits for a timed-out send — so no exception escapes. Any *other*
+exception (such as a coroutine cancellation) propagates out of the I/O call
+unchanged. This keeps `fgets()`/`fread()`/`fwrite()`/`stream_get_contents()`
+identical to native PHP, including timeout behaviour, whether or not the extension
+is loaded. phasync passes `phasync\TimeoutException::class` and its own
+`phasync::readable()`/`writable()` as the handlers.
+
 `manage()` scopes are **automatic and stacking**: the handlers apply only while
 `$code` runs and are removed when it returns or throws (no separate enable/disable
-step), and a nested `manage()` shadows the outer handlers (LIFO), restoring them
-on return. Sleep and the thread-pool ops only take effect inside a fiber; outside
+step), and a nested `manage()` shadows the outer handlers and timeout class (LIFO),
+restoring them on return. Sleep and the thread-pool ops only take effect inside a fiber; outside
 one they run as the ordinary blocking call.
 
 Descriptor-backed streams are **wrapped as soon as they are created**: sockets
@@ -133,15 +148,9 @@ returns `EAGAIN`, and honours `stream_set_blocking()` exactly as an unwrapped
 stream would. Only inside a scope, and only for a stream left in blocking mode,
 does a would-block suspend the fiber instead of blocking the process.
 
-`is_auto_managed($stream)` reports whether a read/write on `$stream` **right now**
-would suspend the fiber instead of blocking or returning `EAGAIN` — so a scheduler
-can cheaply skip an explicit readiness wait and let the read suspend on its own.
-It is **field checks only, no syscall**, and returns `true` only when *all* of:
-a `manage()` scope is active; `$stream` is a wrapped, descriptor-backed stream;
-it is not a **listening server socket** (`accept()` is not intercepted); and the
-caller has left it in blocking mode (an explicitly non-blocking stream returns
-`EAGAIN` rather than suspending). It returns `false` otherwise — including outside
-any scope and for non-descriptor streams (`php://memory`, userspace wrappers, …).
+Two coroutines waiting on the same stream in the same direction is the caller's
+data race, as in Go or Rust; the extension does not serialise them (phasync refuses
+a second waiter loudly).
 
 ```php
 use function phasync\ext\manage;
@@ -151,9 +160,11 @@ manage(
         // start fibers, drive them with phasync\ext\stream_select(); blocking
         // fread()/fwrite()/gethostbyname()/sleep() inside a fiber yield here.
     },
-    fn($stream) => \Fiber::suspend($stream),  // readable
-    fn($stream) => \Fiber::suspend($stream),  // writable
+    // readable/writable: return once ready; throw MyTimeout if $timeout ran out
+    fn($stream, ?float $timeout) => \Fiber::suspend($stream),
+    fn($stream, ?float $timeout) => \Fiber::suspend($stream),
     fn(int $us) => \Fiber::suspend($us),      // timer
+    MyTimeout::class,
 );
 ```
 

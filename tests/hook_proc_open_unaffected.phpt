@@ -4,6 +4,7 @@ proc_open output is read correctly under active hooks (resource-based handler)
 phasync
 --FILE--
 <?php
+final class TestTimeout extends Exception {}
 $mini = function ($res) { $r = [$res]; $w = $e = null; \phasync\ext\stream_select($r, $w, $e, 2); };
 $out = \phasync\ext\manage(function () {
     $p = proc_open('printf "proc-output"', [1 => ['pipe','w'], 2 => ['pipe','w']], $pipes);
@@ -11,7 +12,7 @@ $out = \phasync\ext\manage(function () {
     fclose($pipes[1]); fclose($pipes[2]);
     proc_close($p);
     return $out;
-}, $mini, $mini, fn($us) => null);
+}, $mini, $mini, fn($us) => null, TestTimeout::class);
 echo $out === 'proc-output' ? "ok\n" : "FAIL: $out\n";
 ?>
 --EXPECT--
