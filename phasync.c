@@ -391,6 +391,7 @@ typedef enum {
 	PHASYNC_OP_READ,
 	PHASYNC_OP_WRITE,
 	PHASYNC_OP_GETHOSTBYNAME,
+	PHASYNC_OP_GETADDRINFO,
 	PHASYNC_OP_OPEN            /* blocking open() (FIFO rendezvous), own thread   */
 } phasync_op_type;
 
@@ -404,6 +405,8 @@ typedef struct phasync_task {
 	const char  *host;        /* GETHOSTBYNAME input (plain C string)          */
 	char         hostresult[64];
 	int          hostok;
+	struct addrinfo  hints;   /* GETADDRINFO input                             */
+	struct addrinfo *ai;      /* GETADDRINFO result (caller freeaddrinfo()s)   */
 	char         path[PATH_MAX]; /* OPEN: path (own copy, worker-stable)        */
 	int          oflags;      /* OPEN: open(2) flags                           */
 	int          omode;       /* OPEN: open(2) mode                            */
@@ -452,6 +455,11 @@ static void phasync_task_exec(phasync_task *t)
 				}
 			}
 			if (res) freeaddrinfo(res);
+			break;
+		}
+		case PHASYNC_OP_GETADDRINFO: {
+			t->ai = NULL;
+			t->result = getaddrinfo(t->host, NULL, &t->hints, &t->ai);
 			break;
 		}
 	}
@@ -1120,6 +1128,186 @@ static int phasync_accept_cooperative(php_stream *stream, php_stream_xport_param
 	}
 }
 
+/* tcp:// connect (stream_socket_client/fsockopen/pfsockopen), inside a scope and
+ * in a fiber. Native resolves the host (blocking getaddrinfo), then tries each
+ * address in order within one timeout budget, each attempt a blocking connect.
+ * Here: resolve on the worker pool (same hints as php_network_getaddresses, so
+ * the same order), then for each address hand the ORIGINAL connect that single IP
+ * literal in async mode — PHP still creates the socket with every context option
+ * (bindto, tcp_nodelay, keepalive, linger, buffers) — and wait for writability via
+ * the write handler with the remaining budget. Errors are recorded exactly as the
+ * socket layer does, so the calling PHP function emits its own native warning. A
+ * failed lookup falls back to the native connect so its error message is PHP's. */
+static int phasync_ipv6_usable(void)
+{
+	static int usable = -1;       /* php_network_getaddresses' ipv6_borked probe */
+	if (usable == -1) {
+		int s6 = socket(AF_INET6, SOCK_DGRAM, 0);
+		usable = s6 >= 0;
+		if (s6 >= 0) {
+			close(s6);
+		}
+	}
+	return usable;
+}
+
+static int phasync_connect_cooperative(php_stream *stream, php_stream_xport_param *xp)
+{
+	php_netstream_data_t *sock = phasync_sock_data(stream);
+	char *name = xp->inputs.name, host[256], literal[INET6_ADDRSTRLEN + 16];
+	size_t namelen = xp->inputs.namelen, hostlen, portlen;
+	const char *port;
+	struct timeval *tv = xp->inputs.timeout;
+	double deadline;
+	struct addrinfo hints, *res = NULL, *ai;
+	unsigned char bin[sizeof(struct in6_addr)];
+	phasync_hook_entry *e;
+	int attempted = 0;
+
+	if (sock == NULL || name == NULL || namelen == 0) {
+		return phasync_orig_set_option(stream, PHP_STREAM_OPTION_XPORT_API, 0, xp);
+	}
+	/* "host:port" or "[v6]:port", as xp_socket's parse_ip_address reads it */
+	if (name[0] == '[') {
+		const char *end = memchr(name, ']', namelen);
+		if (!end || end + 1 >= name + namelen || end[1] != ':') {
+			return phasync_orig_set_option(stream, PHP_STREAM_OPTION_XPORT_API, 0, xp);
+		}
+		hostlen = end - name - 1;
+		memcpy(host, name + 1, MIN(hostlen, sizeof(host) - 1));
+		port = end + 2;
+	} else {
+		const char *colon = zend_memrchr(name, ':', namelen);
+		if (!colon) {
+			return phasync_orig_set_option(stream, PHP_STREAM_OPTION_XPORT_API, 0, xp);
+		}
+		hostlen = colon - name;
+		memcpy(host, name, MIN(hostlen, sizeof(host) - 1));
+		port = colon + 1;
+	}
+	if (hostlen >= sizeof(host)) {
+		return phasync_orig_set_option(stream, PHP_STREAM_OPTION_XPORT_API, 0, xp);
+	}
+	host[hostlen] = '\0';
+	portlen = name + namelen - port;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = phasync_ipv6_usable() ? AF_UNSPEC : AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	if (inet_pton(AF_INET, host, bin) == 1 || inet_pton(AF_INET6, host, bin) == 1) {
+		hints.ai_flags = AI_NUMERICHOST;             /* no DNS to offload */
+		if (getaddrinfo(host, NULL, &hints, &res) != 0) {
+			res = NULL;
+		}
+	} else {
+		phasync_task t;
+		memset(&t, 0, sizeof(t));
+		t.type  = PHASYNC_OP_GETADDRINFO;
+		t.host  = host;
+		t.hints = hints;
+		phasync_pool_run(&t);
+		if (EG(exception)) {
+			if (t.ai) freeaddrinfo(t.ai);
+			xp->outputs.returncode = -1;
+			return PHP_STREAM_OPTION_RETURN_OK;       /* exception pending: propagates */
+		}
+		res = t.result == 0 ? t.ai : NULL;
+		if (!res && t.ai) freeaddrinfo(t.ai);
+	}
+	if (res == NULL) {
+		/* Lookup failed: let the native connect produce PHP's exact error. */
+		return phasync_orig_set_option(stream, PHP_STREAM_OPTION_XPORT_API, 0, xp);
+	}
+	/* Like native, the connect budget starts after the lookup, not before it. */
+	deadline = tv ? phasync_now() + (double) tv->tv_sec + (double) tv->tv_usec / 1000000.0 : 0;
+
+	for (ai = res; ai; ai = ai->ai_next) {
+		double remaining = tv ? deadline - phasync_now() : INFINITY;
+		char ip[INET6_ADDRSTRLEN];
+		int r;
+
+		if (attempted && remaining <= 0) {
+			break;                    /* native: no further attempts once time is up */
+		}
+		if (getnameinfo(ai->ai_addr, ai->ai_addrlen, ip, sizeof(ip), NULL, 0, NI_NUMERICHOST) != 0) {
+			continue;
+		}
+		snprintf(literal, sizeof(literal), ai->ai_family == AF_INET6 ? "[%s]:%.*s" : "%s:%.*s",
+			ip, (int) portlen, port);
+		if (xp->outputs.error_text) {  /* native frees the previous attempt's error */
+			zend_string_release(xp->outputs.error_text);
+			xp->outputs.error_text = NULL;
+		}
+		xp->inputs.name = literal;
+		xp->inputs.namelen = strlen(literal);
+		xp->op = STREAM_XPORT_OP_CONNECT_ASYNC;
+		r = phasync_orig_set_option(stream, PHP_STREAM_OPTION_XPORT_API, 0, xp);
+		xp->op = STREAM_XPORT_OP_CONNECT;
+		xp->inputs.name = name;
+		xp->inputs.namelen = namelen;
+		attempted = 1;
+		if (r != PHP_STREAM_OPTION_RETURN_OK) {
+			freeaddrinfo(res);
+			return r;
+		}
+		if (xp->outputs.returncode == 1) {                 /* EINPROGRESS */
+			int err = 0;
+			socklen_t l = sizeof(err);
+			int w = remaining > 0
+				? phasync_wait_fd(phasync_write_handler(), stream, sock->socket, remaining)
+				: PHASYNC_WAIT_TIMEOUT;
+			if (w == PHASYNC_WAIT_ERROR) {
+				close(sock->socket);
+				sock->socket = -1;
+				xp->outputs.returncode = -1;
+				freeaddrinfo(res);
+				return PHP_STREAM_OPTION_RETURN_OK;       /* exception pending: propagates */
+			}
+			if (w == PHASYNC_WAIT_TIMEOUT) {
+				err = ETIMEDOUT;
+			} else if (getsockopt(sock->socket, SOL_SOCKET, SO_ERROR, &err, &l) != 0) {
+				err = errno;
+			}
+			if (err == 0) {
+				xp->outputs.returncode = 0;
+			} else {
+				close(sock->socket);
+				sock->socket = -1;
+				xp->outputs.returncode = -1;
+				xp->outputs.error_code = err;
+				if (xp->want_errortext) {
+					xp->outputs.error_text = php_socket_error_str(err);
+				}
+				if (w == PHASYNC_WAIT_TIMEOUT) {
+					break;
+				}
+				continue;
+			}
+		}
+		if (xp->outputs.returncode == 0) {
+			/* Connected. The native sync path leaves the socket blocking. */
+			int fl = fcntl(sock->socket, F_GETFL, 0);
+			if (fl != -1) {
+				fcntl(sock->socket, F_SETFL, fl & ~O_NONBLOCK);
+			}
+			xp->outputs.error_code = 0;
+			if (xp->outputs.error_text) {
+				zend_string_release(xp->outputs.error_text);
+				xp->outputs.error_text = NULL;
+			}
+			if ((e = phasync_entry(stream))) {
+				e->applied = -1;       /* a new fd: re-apply our mode on next I/O */
+			}
+			freeaddrinfo(res);
+			return PHP_STREAM_OPTION_RETURN_OK;
+		}
+		/* -1: failed at once; the socket layer closed it and recorded the error */
+	}
+	freeaddrinfo(res);
+	xp->outputs.returncode = -1;
+	return PHP_STREAM_OPTION_RETURN_OK;
+}
+
 /* Record the caller's intended blocking mode and pass it through, so the native
  * op (used outside a scope) sees the real intent while we still know it. */
 static int phasync_wrapped_set_option(php_stream *stream, int option, int value, void *ptrparam)
@@ -1132,6 +1320,13 @@ static int phasync_wrapped_set_option(php_stream *stream, int option, int value,
 	        && ((php_stream_xport_param *) ptrparam)->op == STREAM_XPORT_OP_ACCEPT
 	        && phasync_read_handler() != NULL && EG(active_fiber) != NULL) {
 		return phasync_accept_cooperative(stream, (php_stream_xport_param *) ptrparam);
+	} else if (option == PHP_STREAM_OPTION_XPORT_API && ptrparam
+	        && ((php_stream_xport_param *) ptrparam)->op == STREAM_XPORT_OP_CONNECT
+	        && stream->ops->read == phasync_wrapped_read       /* not tls://: crypto follows */
+	        && phasync_write_handler() != NULL && EG(active_fiber) != NULL
+	        && (strcmp(PHASYNC_ORIG(stream)->label, "tcp_socket") == 0
+	            || strcmp(PHASYNC_ORIG(stream)->label, "tcp_socket/ssl") == 0)) {
+		return phasync_connect_cooperative(stream, (php_stream_xport_param *) ptrparam);
 	}
 	return phasync_orig_set_option(stream, option, value, ptrparam);
 }
