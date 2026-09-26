@@ -33,6 +33,7 @@
 #include "ext/standard/info.h"
 #include "php_streams.h"
 #include "php_network.h"
+#include "SAPI.h"
 #include "zend_exceptions.h"
 #include "phasync_arginfo.h"
 
@@ -66,7 +67,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha16"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha17"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -177,6 +178,7 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_shell_exec)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_proc_close)(INTERNAL_FUNCTION_PARAMETERS);
 	phasync_spawn *spawn;         /* armed by an exec-family call until its pipe is seen */
+	bool ub_writing;              /* a fiber is suspended inside an echo (CLI stdout) */
 	zif_handler orig_fs[PHASYNC_FS_NFUNCS];
 	HashTable fs_hooks;           /* (uintptr_t)zend_function -> index in phasync_fs_funcs */
 	int fs_offload;               /* INI: phasync.fs_offload */
@@ -3290,6 +3292,46 @@ static ZEND_NAMED_FUNCTION(phasync_fs_override)
 	orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
+/* ---- echo/print to the CLI's stdout -----------------------------------------
+ *
+ * The CLI SAPI writes output straight to fd 1, so echo blocks the whole process
+ * on a full pipe (a slow log reader). Inside a scope, in a fiber, wait for fd 1 to
+ * be writable and let the SAPI write at most PIPE_BUF bytes at a time, which then
+ * can't block. Another fiber's output meanwhile waits its turn, so each echo stays
+ * contiguous as it is natively. */
+static size_t (*phasync_ub_write_orig)(const char *str, size_t len);
+
+static size_t phasync_ub_write(const char *str, size_t len)
+{
+	zval *handler = phasync_write_handler();
+	size_t done = 0, n;
+
+	if (handler == NULL || EG(active_fiber) == NULL) {
+		return phasync_ub_write_orig(str, len);
+	}
+	while (PHASYNC_G(ub_writing)) {
+		if (phasync_call_sleep(phasync_sleep_handler(), 1000) < 0) {
+			return 0;                    /* exception pending */
+		}
+	}
+	PHASYNC_G(ub_writing) = true;
+	while (done < len) {
+		struct pollfd pfd = { STDOUT_FILENO, POLLOUT, 0 };
+		if (poll(&pfd, 1, 0) == 0) {
+			if (phasync_wait_fd(handler, NULL, STDOUT_FILENO, INFINITY) != PHASYNC_WAIT_READY) {
+				break;
+			}
+			continue;
+		}
+		if ((n = phasync_ub_write_orig(str + done, MIN(len - done, PIPE_BUF))) == 0) {
+			break;
+		}
+		done += n;
+	}
+	PHASYNC_G(ub_writing) = false;
+	return done;
+}
+
 /* stream_socket_pair() builds its sockets with socketpair(2) via
  * php_stream_sock_open_from_socket(), bypassing the transport factory — so wrap
  * both returned streams here (RAW; they are ordinary sockets). Wrapped
@@ -4137,6 +4179,10 @@ static PHP_MINIT_FUNCTION(phasync)
 	php_stream_stdio_ops.read = phasync_stdio_read;
 	php_stream_stdio_ops.write = phasync_stdio_write;
 	php_stream_stdio_ops.set_option = phasync_stdio_set_option;
+	if (strcmp(sapi_module.name, "cli") == 0) {
+		phasync_ub_write_orig = sapi_module.ub_write;
+		sapi_module.ub_write = phasync_ub_write;
+	}
 	return SUCCESS;
 }
 
@@ -4181,6 +4227,9 @@ static PHP_MSHUTDOWN_FUNCTION(phasync)
 	php_stream_stdio_ops.read = phasync_stdio_read_orig;
 	php_stream_stdio_ops.write = phasync_stdio_write_orig;
 	php_stream_stdio_ops.set_option = phasync_stdio_set_option_orig;
+	if (phasync_ub_write_orig) {
+		sapi_module.ub_write = phasync_ub_write_orig;
+	}
 	UNREGISTER_INI_ENTRIES();
 	return SUCCESS;
 }
@@ -4231,6 +4280,7 @@ static PHP_RINIT_FUNCTION(phasync)
 {
 	PHASYNC_G(scope_top) = NULL;
 	PHASYNC_G(spawn) = NULL;
+	PHASYNC_G(ub_writing) = false;
 	PHASYNC_G(hooks_installed) = 0;
 	zend_hash_clean(&PHASYNC_G(hooked));
 	/* Always-on: the transport factories and function overrides go in at the

@@ -19,6 +19,9 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
    - `proc_open()` pipes and `proc_close()`; `popen()`/`pclose()`, `shell_exec()`
      (and backticks), `exec()`, `system()`, `passthru()` — both the output pipe
      and the wait for the child to exit
+   - `STDIN`/`STDOUT`/`STDERR` and `php://stdin|stdout|stderr` reads and writes
+     on pipes, sockets and ttys; in the CLI also `echo`/`print` to a stdout that
+     would block (each echo stays contiguous, as natively)
    - `sleep()`, `usleep()`, `time_nanosleep()`, `time_sleep_until()`
    - DNS: `gethostbyname()`, `gethostbynamel()`, `gethostbyaddr()`,
      `dns_get_record()`, `checkdnsrr()`/`dns_check_record()`, `getmxrr()`/`dns_get_mx()`
