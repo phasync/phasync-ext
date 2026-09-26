@@ -38,6 +38,14 @@
 #include <poll.h>
 #include <errno.h>
 #include <math.h>
+#include <sys/epoll.h>
+#if __has_include("ext/sockets/php_sockets.h")
+# ifndef HAVE_SOCKETS
+#  define HAVE_SOCKETS 1   /* the header's body is guarded by it; only the struct is used */
+# endif
+# include "ext/sockets/php_sockets.h"
+# define PHASYNC_HAVE_SOCKETS 1
+#endif
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -97,6 +105,9 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_gethostbyname)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_fopen)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_stream_socket_pair)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_stream_select)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_socket_select)(INTERNAL_FUNCTION_PARAMETERS);
+	int select_depth;             /* >0 while our override probes the original select */
 	zend_long thread_pool_size;   /* INI: phasync.thread_pool_size */
 	bool hooks_installed;         /* transports + fn overrides physically in place */
 	HashTable hooked;             /* (uintptr_t)stream    -> phasync_hook_entry* */
@@ -1037,32 +1048,92 @@ static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, si
 	}
 }
 
+/* Delegate a set_option call to the original ops. xport ops (bind/connect/listen/
+ * accept/getname/…) all arrive through set_option, and the socket layer decides
+ * unix-vs-inet by *pointer identity* (php_stream_is(stream,
+ * &php_stream_unix_socket_ops), xp_socket.c). Our wrapped ops is a copy with a
+ * different address, which would make a unix socket look like inet ("Failed to
+ * parse address"), so restore the real ops pointer for the (synchronous) call. */
+static int phasync_orig_set_option(php_stream *stream, int option, int value, void *ptrparam)
+{
+	const php_stream_ops *orig = PHASYNC_ORIG(stream), *saved = stream->ops;
+	int r;
+
+	if (!orig->set_option) {
+		return PHP_STREAM_OPTION_RETURN_NOTIMPL;
+	}
+	stream->ops = (php_stream_ops *) orig;
+	r = orig->set_option(stream, option, value, ptrparam);
+	stream->ops = saved;
+	return r;
+}
+
+/* stream_socket_accept() with a timeout, inside a scope and in a fiber: wait for
+ * the listener to become readable via the read handler instead of blocking the
+ * process, then accept with a zero timeout. On timeout, report exactly what the
+ * socket layer reports (php_network_accept_incoming: ETIMEDOUT + its error text),
+ * so the calling PHP function emits its own native warning. A zero timeout keeps
+ * its explicit don't-wait meaning and goes straight to the original. */
+static int phasync_accept_cooperative(php_stream *stream, php_stream_xport_param *xp)
+{
+	struct timeval *tv = xp->inputs.timeout, zero = { 0, 0 };
+	double deadline = tv ? phasync_now() + (double) tv->tv_sec + (double) tv->tv_usec / 1000000.0 : 0;
+	php_socket_t fd = phasync_stream_fd(stream);
+
+	if (fd == -1 || (tv && tv->tv_sec == 0 && tv->tv_usec == 0)) {
+		return phasync_orig_set_option(stream, PHP_STREAM_OPTION_XPORT_API, 0, xp);
+	}
+	for (;;) {
+		double remaining = tv ? deadline - phasync_now() : INFINITY;
+		int w = remaining > 0
+			? phasync_wait_fd(phasync_read_handler(), stream, fd, remaining)
+			: PHASYNC_WAIT_TIMEOUT;
+		int r;
+
+		if (w == PHASYNC_WAIT_TIMEOUT) {
+			xp->outputs.client = NULL;
+			xp->outputs.returncode = -1;
+			xp->outputs.error_code = ETIMEDOUT;
+			if (xp->want_errortext) {
+				xp->outputs.error_text = php_socket_error_str(ETIMEDOUT);
+			}
+			return PHP_STREAM_OPTION_RETURN_OK;
+		}
+		if (w == PHASYNC_WAIT_ERROR) {
+			xp->outputs.client = NULL;
+			xp->outputs.returncode = -1;
+			return PHP_STREAM_OPTION_RETURN_OK;   /* exception pending: propagates */
+		}
+		xp->inputs.timeout = &zero;
+		r = phasync_orig_set_option(stream, PHP_STREAM_OPTION_XPORT_API, 0, xp);
+		xp->inputs.timeout = tv;
+		if (r != PHP_STREAM_OPTION_RETURN_OK || xp->outputs.client
+		 || (xp->outputs.error_code != ETIMEDOUT && xp->outputs.error_code != EAGAIN
+		     && xp->outputs.error_code != EWOULDBLOCK)) {
+			return r;
+		}
+		/* Someone else took the connection between readiness and accept: wait again. */
+		if (xp->outputs.error_text) {
+			zend_string_release(xp->outputs.error_text);
+			xp->outputs.error_text = NULL;
+		}
+	}
+}
+
 /* Record the caller's intended blocking mode and pass it through, so the native
  * op (used outside a scope) sees the real intent while we still know it. */
 static int phasync_wrapped_set_option(php_stream *stream, int option, int value, void *ptrparam)
 {
-	const php_stream_ops *orig = PHASYNC_ORIG(stream);
-
 	if (option == PHP_STREAM_OPTION_BLOCKING) {
 		phasync_hook_entry *e = phasync_entry_ensure(stream);
 		e->want_block = (value != 0);
 		e->applied    = -1;   /* orig is about to change the fd; re-apply on next I/O */
+	} else if (option == PHP_STREAM_OPTION_XPORT_API && ptrparam
+	        && ((php_stream_xport_param *) ptrparam)->op == STREAM_XPORT_OP_ACCEPT
+	        && phasync_read_handler() != NULL && EG(active_fiber) != NULL) {
+		return phasync_accept_cooperative(stream, (php_stream_xport_param *) ptrparam);
 	}
-	if (orig->set_option) {
-		/* xport ops (bind/connect/listen/getname/…) all arrive through set_option,
-		 * and the socket layer decides unix-vs-inet by *pointer identity*
-		 * (php_stream_is(stream, &php_stream_unix_socket_ops), xp_socket.c). Our
-		 * wrapped ops is a copy with a different address, which would make a unix
-		 * socket look like inet ("Failed to parse address"). Restore the real ops
-		 * pointer for the duration of the (synchronous) delegated call. */
-		const php_stream_ops *saved = stream->ops;
-		int r;
-		stream->ops = (php_stream_ops *) orig;
-		r = orig->set_option(stream, option, value, ptrparam);
-		stream->ops = saved;
-		return r;
-	}
-	return PHP_STREAM_OPTION_RETURN_NOTIMPL;
+	return phasync_orig_set_option(stream, option, value, ptrparam);
 }
 
 static int phasync_wrapped_close(php_stream *stream, int close_handle)
@@ -1490,6 +1561,224 @@ static ZEND_NAMED_FUNCTION(phasync_stream_socket_pair_override)
 	}
 }
 
+/* ---- stream_select() / socket_select() inside a scope --------------------
+ *
+ * A library's own stream_select()/socket_select() with a timeout would block the
+ * whole process. Inside a scope, in a fiber, the call instead:
+ *   1. probes the ORIGINAL function with a zero timeout, so every result (arrays,
+ *      count, buffered-data emulation, warnings) is exactly native;
+ *   2. if nothing is ready, registers all the descriptors in an epoll instance —
+ *      itself a pollable fd, readable when any of them is — and waits on it via
+ *      the read handler with the remaining timeout;
+ *   3. probes again; a handler timeout means the select timed out (native: 0, all
+ *      arrays emptied). */
+
+static php_socket_t phasync_select_fd_stream(zval *elem)
+{
+	php_stream *s = NULL;
+	php_socket_t fd = -1;
+
+	ZVAL_DEREF(elem);
+	if (Z_TYPE_P(elem) != IS_RESOURCE) {
+		return -1;
+	}
+	php_stream_from_zval_no_verify(s, elem);
+	if (s == NULL || php_stream_cast(s, PHP_STREAM_AS_FD_FOR_SELECT | PHP_STREAM_CAST_INTERNAL,
+			(void *) &fd, 0) != SUCCESS) {
+		return -1;
+	}
+	return fd;
+}
+
+#ifdef PHASYNC_HAVE_SOCKETS
+static php_socket_t phasync_select_fd_socket(zval *elem)
+{
+	ZVAL_DEREF(elem);
+	/* Matched by name rather than socket_ce, so ext/sockets stays optional. */
+	if (Z_TYPE_P(elem) != IS_OBJECT || !zend_string_equals_literal(Z_OBJCE_P(elem)->name, "Socket")) {
+		return -1;
+	}
+	return Z_SOCKET_P(elem)->bsd_socket;
+}
+#endif
+
+/* An epoll fd watching every descriptor in the three sets (read/write/except),
+ * or -1 if none could be registered. */
+static int phasync_select_epoll(zval *sets[3], php_socket_t (*fd_of)(zval *))
+{
+	static const uint32_t ev[3] = { EPOLLIN, EPOLLOUT, EPOLLPRI };
+	HashTable events;
+	zval *elem;
+	int epfd, i, n = 0;
+
+	zend_hash_init(&events, 8, NULL, NULL, 0);
+	for (i = 0; i < 3; i++) {
+		if (Z_TYPE_P(sets[i]) != IS_ARRAY) {
+			continue;
+		}
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(sets[i]), elem) {
+			php_socket_t fd = fd_of(elem);
+			zval *cur;
+			if (fd < 0) {
+				continue;
+			}
+			if ((cur = zend_hash_index_find(&events, (zend_ulong) fd))) {
+				Z_LVAL_P(cur) |= ev[i];
+			} else {
+				zval z;
+				ZVAL_LONG(&z, ev[i]);
+				zend_hash_index_add_new(&events, (zend_ulong) fd, &z);
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+	epfd = epoll_create1(EPOLL_CLOEXEC);
+	if (epfd >= 0) {
+		zend_ulong fd;
+		zval *e;
+		ZEND_HASH_FOREACH_NUM_KEY_VAL(&events, fd, e) {
+			struct epoll_event ee = { .events = (uint32_t) Z_LVAL_P(e), .data.fd = (int) fd };
+			if (epoll_ctl(epfd, EPOLL_CTL_ADD, (int) fd, &ee) == 0) {
+				n++;          /* regular files can't be registered (EPERM): always ready */
+			}
+		} ZEND_HASH_FOREACH_END();
+		if (n == 0) {
+			close(epfd);
+			epfd = -1;
+		}
+	}
+	zend_hash_destroy(&events);
+	return epfd;
+}
+
+static void phasync_select_common(INTERNAL_FUNCTION_PARAMETERS, const char *fname,
+		void (*orig)(INTERNAL_FUNCTION_PARAMETERS), php_socket_t (*fd_of)(zval *))
+{
+	zval *sets[3], saved[3], fn;
+	zend_long sec = 0, usec = 0;
+	bool secnull = 1, usecnull = 1;
+	double deadline = 0;
+	int i;
+
+	if (PHASYNC_G(select_depth) || phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+		orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	ZEND_PARSE_PARAMETERS_START(4, 5)
+		Z_PARAM_ARRAY_EX2(sets[0], 1, 1, 0)
+		Z_PARAM_ARRAY_EX2(sets[1], 1, 1, 0)
+		Z_PARAM_ARRAY_EX2(sets[2], 1, 1, 0)
+		Z_PARAM_LONG_OR_NULL(sec, secnull)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_LONG_OR_NULL(usec, usecnull)
+	ZEND_PARSE_PARAMETERS_END();
+
+	/* A zero timeout never waits, and anything the original would reject (negative
+	 * values, a null that isn't allowed) must fail exactly as it does natively. */
+	if ((!secnull && sec == 0 && (usecnull || usec == 0))
+	 || (!secnull && sec < 0) || (!usecnull && usec < 0)
+	 || (secnull && !usecnull && usec != 0)
+	 || (ZEND_NUM_ARGS() >= 5 && Z_TYPE_P(ZEND_CALL_ARG(execute_data, 5)) == IS_NULL
+	     && strcmp(fname, "socket_select") == 0)) {
+		orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	if (!secnull) {
+		deadline = phasync_now() + (double) sec + (double) (usecnull ? 0 : usec) / 1000000.0;
+	}
+
+	for (i = 0; i < 3; i++) {
+		if (sets[i]) {
+			ZVAL_COPY(&saved[i], sets[i]);
+		} else {
+			ZVAL_NULL(&saved[i]);
+		}
+	}
+	ZVAL_STRING(&fn, fname);
+
+	for (;;) {
+		zval args[5], ret, tmp;
+		zval *savedp[3] = { &saved[0], &saved[1], &saved[2] };
+		double remaining;
+		int epfd, w;
+
+		/* 1. zero-timeout probe of the original, on copies of the original arrays */
+		for (i = 0; i < 3; i++) {
+			ZVAL_COPY(&tmp, &saved[i]);
+			ZVAL_NEW_REF(&args[i], &tmp);
+		}
+		ZVAL_LONG(&args[3], 0);
+		ZVAL_LONG(&args[4], 0);
+		ZVAL_UNDEF(&ret);
+		PHASYNC_G(select_depth)++;
+		call_user_function(NULL, NULL, &fn, &ret, 5, args);
+		PHASYNC_G(select_depth)--;
+
+		if (EG(exception) || Z_TYPE(ret) != IS_LONG || Z_LVAL(ret) != 0) {
+			if (!EG(exception)) {
+				for (i = 0; i < 3; i++) {
+					if (sets[i]) {
+						zval_ptr_dtor(sets[i]);
+						ZVAL_COPY(sets[i], Z_REFVAL(args[i]));
+					}
+				}
+				ZVAL_COPY(return_value, &ret);
+			}
+			for (i = 0; i < 5; i++) zval_ptr_dtor(&args[i]);
+			zval_ptr_dtor(&ret);
+			break;
+		}
+		for (i = 0; i < 5; i++) zval_ptr_dtor(&args[i]);
+		zval_ptr_dtor(&ret);
+
+		remaining = secnull ? INFINITY : deadline - phasync_now();
+		if (remaining <= 0) {
+			w = PHASYNC_WAIT_TIMEOUT;
+		} else {
+			/* 2. wait for any of them via one pollable epoll fd */
+			epfd = phasync_select_epoll(savedp, fd_of);
+			if (epfd < 0) {
+				/* nothing pollable to wait on: fall back to the native call */
+				for (i = 0; i < 3; i++) zval_ptr_dtor(&saved[i]);
+				zval_ptr_dtor(&fn);
+				orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+				return;
+			}
+			w = phasync_wait_fd(phasync_read_handler(), NULL, epfd, remaining);
+			close(epfd);
+		}
+		if (w == PHASYNC_WAIT_TIMEOUT) {
+			for (i = 0; i < 3; i++) {       /* native timeout: 0, every array emptied */
+				if (sets[i]) {
+					zval_ptr_dtor(sets[i]);
+					ZVAL_EMPTY_ARRAY(sets[i]);
+				}
+			}
+			RETVAL_LONG(0);
+			break;
+		}
+		if (w == PHASYNC_WAIT_ERROR) {
+			break;                           /* exception pending: propagate */
+		}
+		/* 3. ready (or spurious): probe again */
+	}
+	for (i = 0; i < 3; i++) zval_ptr_dtor(&saved[i]);
+	zval_ptr_dtor(&fn);
+}
+
+static ZEND_NAMED_FUNCTION(phasync_stream_select_override)
+{
+	phasync_select_common(INTERNAL_FUNCTION_PARAM_PASSTHRU, "stream_select",
+		PHASYNC_G(orig_stream_select), phasync_select_fd_stream);
+}
+
+#ifdef PHASYNC_HAVE_SOCKETS
+static ZEND_NAMED_FUNCTION(phasync_socket_select_override)
+{
+	phasync_select_common(INTERNAL_FUNCTION_PARAM_PASSTHRU, "socket_select",
+		PHASYNC_G(orig_socket_select), phasync_select_fd_socket);
+}
+#endif
+
 /* ---- enable_hooks / disable_hooks ---------------------------------------- */
 
 static zend_internal_function *phasync_find_ifunc(const char *name, size_t len)
@@ -1539,6 +1828,16 @@ static void phasync_install_hooks(void)
 		PHASYNC_G(orig_stream_socket_pair) = f->handler;
 		f->handler = phasync_stream_socket_pair_override;
 	}
+	if ((f = phasync_find_ifunc("stream_select", sizeof("stream_select") - 1))) {
+		PHASYNC_G(orig_stream_select) = f->handler;
+		f->handler = phasync_stream_select_override;
+	}
+#ifdef PHASYNC_HAVE_SOCKETS
+	if ((f = phasync_find_ifunc("socket_select", sizeof("socket_select") - 1))) {
+		PHASYNC_G(orig_socket_select) = f->handler;
+		f->handler = phasync_socket_select_override;
+	}
+#endif
 	if ((f = phasync_find_ifunc("sleep", sizeof("sleep") - 1))) {
 		PHASYNC_G(orig_sleep) = f->handler;
 		f->handler = phasync_sleep_override;
@@ -1591,6 +1890,14 @@ static void phasync_restore_hooks(void)
 	if (PHASYNC_G(orig_stream_socket_pair) && (f = phasync_find_ifunc("stream_socket_pair", sizeof("stream_socket_pair") - 1))) {
 		f->handler = PHASYNC_G(orig_stream_socket_pair);
 	}
+	if (PHASYNC_G(orig_stream_select) && (f = phasync_find_ifunc("stream_select", sizeof("stream_select") - 1))) {
+		f->handler = PHASYNC_G(orig_stream_select);
+	}
+#ifdef PHASYNC_HAVE_SOCKETS
+	if (PHASYNC_G(orig_socket_select) && (f = phasync_find_ifunc("socket_select", sizeof("socket_select") - 1))) {
+		f->handler = PHASYNC_G(orig_socket_select);
+	}
+#endif
 	if (PHASYNC_G(orig_sleep) && (f = phasync_find_ifunc("sleep", sizeof("sleep") - 1))) {
 		f->handler = PHASYNC_G(orig_sleep);
 	}
