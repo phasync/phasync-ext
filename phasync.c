@@ -103,6 +103,8 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_time_nanosleep)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_time_sleep_until)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_gethostbyname)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_gethostbynamel)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_gethostbyaddr)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_fopen)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_stream_socket_pair)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_stream_select)(INTERNAL_FUNCTION_PARAMETERS);
@@ -392,6 +394,7 @@ typedef enum {
 	PHASYNC_OP_WRITE,
 	PHASYNC_OP_GETHOSTBYNAME,
 	PHASYNC_OP_GETADDRINFO,
+	PHASYNC_OP_NAMEINFO,
 	PHASYNC_OP_OPEN            /* blocking open() (FIFO rendezvous), own thread   */
 } phasync_op_type;
 
@@ -403,8 +406,12 @@ typedef struct phasync_task {
 	ssize_t      result;
 	int          err;
 	const char  *host;        /* GETHOSTBYNAME input (plain C string)          */
-	char         hostresult[64];
+	char         hostresult[NI_MAXHOST]; /* NAMEINFO result                       */
 	int          hostok;
+	struct in_addr addrs[64]; /* GETHOSTBYNAME: h_addr_list (IPv4)             */
+	int          naddrs;
+	struct sockaddr_storage sa; /* NAMEINFO input                              */
+	socklen_t    salen;
 	struct addrinfo  hints;   /* GETADDRINFO input                             */
 	struct addrinfo *ai;      /* GETADDRINFO result (caller freeaddrinfo()s)   */
 	char         path[PATH_MAX]; /* OPEN: path (own copy, worker-stable)        */
@@ -443,20 +450,32 @@ static void phasync_task_exec(phasync_task *t)
 			t->err = errno;
 			break;
 		case PHASYNC_OP_GETHOSTBYNAME: {
-			struct addrinfo hints, *res = NULL;
-			memset(&hints, 0, sizeof(hints));
-			hints.ai_family = AF_INET;
-			hints.ai_socktype = SOCK_STREAM;
-			t->hostok = 0;
-			if (getaddrinfo(t->host, NULL, &hints, &res) == 0 && res) {
-				struct sockaddr_in *sa = (struct sockaddr_in *) res->ai_addr;
-				if (inet_ntop(AF_INET, &sa->sin_addr, t->hostresult, sizeof(t->hostresult))) {
-					t->hostok = 1;
+			/* php_network_gethostbyname() is gethostbyname_r() on Linux: use the
+			 * same call so the addresses (and their order) are exactly native. */
+			struct hostent he, *res = NULL;
+			char stackbuf[8192], *buf = stackbuf;
+			size_t buflen = sizeof(stackbuf);
+			int herr = 0, rc;
+			while ((rc = gethostbyname_r(t->host, &he, buf, buflen, &res, &herr)) == ERANGE
+			       && buflen < (1 << 20)) {
+				buflen *= 2;
+				buf = (buf == stackbuf) ? malloc(buflen) : realloc(buf, buflen);
+				if (!buf) break;
+			}
+			t->hostok = (rc == 0 && res != NULL);
+			t->naddrs = 0;
+			if (t->hostok && res->h_addrtype == AF_INET) {
+				for (int i = 0; res->h_addr_list[i] && t->naddrs < (int) (sizeof(t->addrs) / sizeof(t->addrs[0])); i++) {
+					memcpy(&t->addrs[t->naddrs++], res->h_addr_list[i], sizeof(struct in_addr));
 				}
 			}
-			if (res) freeaddrinfo(res);
+			if (buf && buf != stackbuf) free(buf);
 			break;
 		}
+		case PHASYNC_OP_NAMEINFO:
+			t->hostok = getnameinfo((struct sockaddr *) &t->sa, t->salen, t->hostresult,
+				sizeof(t->hostresult), NULL, 0, NI_NAMEREQD) == 0;
+			break;
 		case PHASYNC_OP_GETADDRINFO: {
 			t->ai = NULL;
 			t->result = getaddrinfo(t->host, NULL, &t->hints, &t->ai);
@@ -1595,34 +1614,111 @@ static ZEND_NAMED_FUNCTION(phasync_time_sleep_until_override)
 
 static ZEND_NAMED_FUNCTION(phasync_gethostbyname_override)
 {
-	zend_string *host;
+	char *host;
+	size_t hostlen;
 	phasync_task t;
-	char hostbuf[256];
+	char ip[INET_ADDRSTRLEN];
 
-	if (phasync_read_handler() == NULL) {
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_gethostbyname)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
 	ZEND_PARSE_PARAMETERS_START(1, 1)
-		Z_PARAM_STR(host)
+		Z_PARAM_PATH(host, hostlen)
 	ZEND_PARSE_PARAMETERS_END();
 
-	if (ZSTR_LEN(host) == 0 || ZSTR_LEN(host) >= sizeof(hostbuf)) {
-		PHASYNC_G(orig_gethostbyname)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	if (hostlen == 0 || hostlen > MAXFQDNLEN) {
+		PHASYNC_G(orig_gethostbyname)(INTERNAL_FUNCTION_PARAM_PASSTHRU);   /* native warning */
 		return;
 	}
-	memcpy(hostbuf, ZSTR_VAL(host), ZSTR_LEN(host));
-	hostbuf[ZSTR_LEN(host)] = '\0';
-
 	memset(&t, 0, sizeof(t));
 	t.type = PHASYNC_OP_GETHOSTBYNAME;
-	t.host = hostbuf;
+	t.host = host;
 	phasync_pool_run(&t);   /* resolves on a pool thread; parks the fiber */
 
+	if (t.hostok && t.naddrs > 0 && inet_ntop(AF_INET, &t.addrs[0], ip, sizeof(ip))) {
+		RETURN_STRING(ip);
+	}
+	RETURN_STRINGL(host, hostlen);   /* native returns the input unchanged on failure */
+}
+
+/* gethostbynamel(): the same lookup as gethostbyname(), every address. */
+static ZEND_NAMED_FUNCTION(phasync_gethostbynamel_override)
+{
+	char *host;
+	size_t hostlen;
+	phasync_task t;
+	char ip[INET_ADDRSTRLEN];
+
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+		PHASYNC_G(orig_gethostbynamel)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_PATH(host, hostlen)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (hostlen > MAXFQDNLEN) {
+		PHASYNC_G(orig_gethostbynamel)(INTERNAL_FUNCTION_PARAM_PASSTHRU);  /* native warning */
+		return;
+	}
+	memset(&t, 0, sizeof(t));
+	t.type = PHASYNC_OP_GETHOSTBYNAME;
+	t.host = host;
+	phasync_pool_run(&t);
+	if (EG(exception)) {
+		return;
+	}
+	if (!t.hostok) {
+		RETURN_FALSE;
+	}
+	array_init(return_value);
+	for (int i = 0; i < t.naddrs; i++) {
+		if (inet_ntop(AF_INET, &t.addrs[i], ip, sizeof(ip))) {
+			add_next_index_string(return_value, ip);
+		}
+	}
+}
+
+/* gethostbyaddr(): the reverse lookup (getnameinfo, NI_NAMEREQD) on the pool. */
+static ZEND_NAMED_FUNCTION(phasync_gethostbyaddr_override)
+{
+	char *addr;
+	size_t addrlen;
+	phasync_task t;
+
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+		PHASYNC_G(orig_gethostbyaddr)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_PATH(addr, addrlen)
+	ZEND_PARSE_PARAMETERS_END();
+
+	memset(&t, 0, sizeof(t));
+	{
+		struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *) &t.sa;
+		struct sockaddr_in  *sa4 = (struct sockaddr_in *) &t.sa;
+		if (inet_pton(AF_INET6, addr, &sa6->sin6_addr) == 1) {   /* same order as native */
+			sa6->sin6_family = AF_INET6;
+			t.salen = sizeof(*sa6);
+		} else if (inet_pton(AF_INET, addr, &sa4->sin_addr) == 1) {
+			sa4->sin_family = AF_INET;
+			t.salen = sizeof(*sa4);
+		} else {
+			PHASYNC_G(orig_gethostbyaddr)(INTERNAL_FUNCTION_PARAM_PASSTHRU);  /* native warning */
+			return;
+		}
+	}
+	t.type = PHASYNC_OP_NAMEINFO;
+	phasync_pool_run(&t);
+	if (EG(exception)) {
+		return;
+	}
 	if (t.hostok) {
 		RETURN_STRING(t.hostresult);
 	}
-	RETURN_STR_COPY(host);  /* gethostbyname() returns the input unchanged on failure */
+	RETURN_STRINGL(addr, addrlen);   /* native: no name -> the address itself */
 }
 
 /* Translate an fopen() mode string to open(2) flags (for the FIFO fast path). */
@@ -2058,6 +2154,14 @@ static void phasync_install_hooks(void)
 		PHASYNC_G(orig_gethostbyname) = f->handler;
 		f->handler = phasync_gethostbyname_override;
 	}
+	if ((f = phasync_find_ifunc("gethostbynamel", sizeof("gethostbynamel") - 1))) {
+		PHASYNC_G(orig_gethostbynamel) = f->handler;
+		f->handler = phasync_gethostbynamel_override;
+	}
+	if ((f = phasync_find_ifunc("gethostbyaddr", sizeof("gethostbyaddr") - 1))) {
+		PHASYNC_G(orig_gethostbyaddr) = f->handler;
+		f->handler = phasync_gethostbyaddr_override;
+	}
 	if ((f = phasync_find_ifunc("fopen", sizeof("fopen") - 1))) {
 		PHASYNC_G(orig_fopen) = f->handler;
 		f->handler = phasync_fopen_override;
@@ -2112,6 +2216,12 @@ static void phasync_restore_hooks(void)
 	}
 	if (PHASYNC_G(orig_gethostbyname) && (f = phasync_find_ifunc("gethostbyname", sizeof("gethostbyname") - 1))) {
 		f->handler = PHASYNC_G(orig_gethostbyname);
+	}
+	if (PHASYNC_G(orig_gethostbynamel) && (f = phasync_find_ifunc("gethostbynamel", sizeof("gethostbynamel") - 1))) {
+		f->handler = PHASYNC_G(orig_gethostbynamel);
+	}
+	if (PHASYNC_G(orig_gethostbyaddr) && (f = phasync_find_ifunc("gethostbyaddr", sizeof("gethostbyaddr") - 1))) {
+		f->handler = PHASYNC_G(orig_gethostbyaddr);
 	}
 	if (PHASYNC_G(orig_fopen) && (f = phasync_find_ifunc("fopen", sizeof("fopen") - 1))) {
 		f->handler = PHASYNC_G(orig_fopen);
