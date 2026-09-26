@@ -23,7 +23,11 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
    - DNS: `gethostbyname()`, `gethostbynamel()`, `gethostbyaddr()`,
      `dns_get_record()`, `checkdnsrr()`/`dns_check_record()`, `getmxrr()`/`dns_get_mx()`
      (via a thread pool)
-   - `fopen()` (regular files + FIFO open, via a thread pool)
+   - regular-file reads and writes, via a thread pool: `fopen()`'d files (and FIFO
+     open), `file_get_contents()`, `file_put_contents()`, `file()`, `readfile()`,
+     `fpassthru()`, `copy()`, `stream_copy_to_stream()`, `md5_file()`/`sha1_file()`/
+     `hash_file()`, `SplFileObject` — never `include`/`require`, which must not
+     suspend mid-compile
    - filesystem metadata and namespace calls on network/FUSE mounts: `stat()`,
      `lstat()`, `file_exists()`, `is_file()`/`is_dir()`/`is_link()`/`is_readable()`/
      `is_writable()`/`is_executable()`, `filesize()`/`filemtime()` & co.,

@@ -66,7 +66,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha15"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha16"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -97,6 +97,9 @@ static const struct { const char *name; phasync_fs_op op; } phasync_fs_funcs[] =
 	{"linkinfo", PHASYNC_FS_WARM}, {"readlink", PHASYNC_FS_WARM}, {"realpath", PHASYNC_FS_WARM},
 	{"scandir", PHASYNC_FS_WARM_DIR}, {"opendir", PHASYNC_FS_WARM_DIR}, {"dir", PHASYNC_FS_WARM_DIR},
 	{"glob", PHASYNC_FS_WARM_GLOB},
+	{"file_get_contents", PHASYNC_FS_WARM}, {"file_put_contents", PHASYNC_FS_WARM},
+	{"file", PHASYNC_FS_WARM}, {"readfile", PHASYNC_FS_WARM}, {"copy", PHASYNC_FS_WARM},
+	{"md5_file", PHASYNC_FS_WARM}, {"sha1_file", PHASYNC_FS_WARM},
 	{"unlink", PHASYNC_FS_UNLINK}, {"rmdir", PHASYNC_FS_RMDIR}, {"mkdir", PHASYNC_FS_MKDIR},
 	{"rename", PHASYNC_FS_RENAME},
 };
@@ -1939,6 +1942,13 @@ static int phasync_wrapped_set_option(php_stream *stream, int option, int value,
 		phasync_hook_entry *e = phasync_entry_ensure(stream);
 		e->want_block = (value != 0);
 		e->applied    = -1;   /* orig is about to change the fd; re-apply on next I/O */
+	} else if (option == PHP_STREAM_OPTION_MMAP_API && value == PHP_STREAM_MMAP_SUPPORTED
+	        && stream->ops->read == phasync_wrapped_read_pool
+	        && phasync_read_handler() != NULL && EG(active_fiber) != NULL) {
+		/* mmap()ed reads (readfile(), fpassthru(), stream_copy_to_stream()) fault
+		 * pages in synchronously: report mmap unsupported so they use the pooled
+		 * read op instead. */
+		return PHP_STREAM_OPTION_RETURN_NOTIMPL;
 	} else if (option == PHP_STREAM_OPTION_XPORT_API && ptrparam
 	        && ((php_stream_xport_param *) ptrparam)->op == STREAM_XPORT_OP_ACCEPT
 	        && phasync_read_handler() != NULL && EG(active_fiber) != NULL) {
@@ -2088,6 +2098,8 @@ static php_stream *phasync_ssl_factory(const char *proto, size_t protolen,
 static const char *phasync_ssl_schemes[] = {
 	"ssl", "tls", "sslv3", "tlsv1.0", "tlsv1.1", "tlsv1.2", "tlsv1.3", NULL
 };
+
+static int phasync_fs_path(zval *z, char *out);
 
 /* ---- proc_open() override: wrap the pipe streams it produces -------------- */
 
@@ -2726,6 +2738,21 @@ static ZEND_NAMED_FUNCTION(phasync_fopen_override)
 		return;
 	}
 
+	/* On a network/FUSE mount even the stat() below can stall: warm it on the pool. */
+	if (phasync_read_handler() && EG(active_fiber)) {
+		phasync_task w;
+		zval z;
+		ZVAL_STR(&z, filename);
+		if (phasync_fs_path(&z, w.path) == 1) {
+			w.type = PHASYNC_OP_FS;
+			w.fsop = PHASYNC_FS_WARM;
+			phasync_pool_run(&w);
+			if (EG(exception)) {
+				RETURN_THROWS();
+			}
+		}
+	}
+
 	/* FIFO? Detect before opening — the open() is what blocks. */
 	if (stat(ZSTR_VAL(filename), &st) == 0 && S_ISFIFO(st.st_mode)) {
 		phasync_task t;
@@ -2827,12 +2854,58 @@ static int phasync_new_child_pidfd(const phasync_spawn *sp)
 }
 
 static ssize_t (*phasync_stdio_read_orig)(php_stream *stream, char *buf, size_t count);
+static ssize_t (*phasync_stdio_write_orig)(php_stream *stream, const char *buf, size_t count);
+static int (*phasync_stdio_set_option_orig)(php_stream *stream, int option, int value, void *ptrparam);
 
-/* php_stream_stdio_ops.read, patched process-wide at MINIT: php_exec() and
- * shell_exec() build their pipe stream internally, so there is no other hook.
- * Inert unless an exec-family override armed PHASYNC_G(spawn). Those read their
- * popen() pipe right after spawning, before anything else runs, so the first FIFO
- * read then is that pipe: taint it with the child's pidfd and wrap it. */
+/* Regular files opened internally (file_get_contents(), file_put_contents(),
+ * file(), copy(), readfile(), md5_file() ...) bypass the fopen() override: wrap
+ * them POOL on their first read/write (or mmap check) inside a scope, in a fiber.
+ * Never for a file being compiled: include/require (under a user frame) and the
+ * internal functions that compile (opcache_compile_file() ...) read through a
+ * stdio stream too, but must not suspend mid-compile. Zend's streams are the
+ * unbuffered ones marked auto-cleanup (__exposed); file_get_contents() also
+ * unbuffers its stream, but never exposes it. */
+static bool phasync_stdio_promote_file(php_stream *stream)
+{
+	zend_execute_data *ex = EG(current_execute_data);
+	php_socket_t fd;
+	struct stat st;
+
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL
+	 || stream->ops != &php_stream_stdio_ops
+	 || ((stream->flags & PHP_STREAM_FLAG_NO_BUFFER) && stream->__exposed)
+	 || ex == NULL || ex->func == NULL || ZEND_USER_CODE(ex->func->type)
+	 || stream->readfilters.head || stream->writefilters.head
+	 || (fd = phasync_stream_fd(stream)) == -1 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+		return false;
+	}
+	phasync_wrap_stream(stream, PHASYNC_MODE_POOL);
+	return true;
+}
+
+static int phasync_stdio_set_option(php_stream *stream, int option, int value, void *ptrparam)
+{
+	if (option == PHP_STREAM_OPTION_MMAP_API && value == PHP_STREAM_MMAP_SUPPORTED
+	 && phasync_stdio_promote_file(stream)) {
+		return stream->ops->set_option(stream, option, value, ptrparam);  /* now wrapped: declines */
+	}
+	return phasync_stdio_set_option_orig(stream, option, value, ptrparam);
+}
+
+static ssize_t phasync_stdio_write(php_stream *stream, const char *buf, size_t count)
+{
+	if (phasync_stdio_promote_file(stream)) {
+		return stream->ops->write(stream, buf, count);
+	}
+	return phasync_stdio_write_orig(stream, buf, count);
+}
+
+/* php_stream_stdio_ops.read/write, patched process-wide at MINIT, for streams
+ * built internally, where there is no other hook: regular files (above), and the
+ * pipe of php_exec()/shell_exec(). For those an exec-family override arms
+ * PHASYNC_G(spawn); they read their popen() pipe right after spawning, before
+ * anything else runs, so the first FIFO read then is that pipe: taint it with the
+ * child's pidfd and wrap it. */
 static ssize_t phasync_stdio_read(php_stream *stream, char *buf, size_t count)
 {
 	phasync_spawn *sp = PHASYNC_G(spawn);
@@ -2844,6 +2917,9 @@ static ssize_t phasync_stdio_read(php_stream *stream, char *buf, size_t count)
 		PHASYNC_G(spawn) = NULL;
 		phasync_entry_ensure(stream)->pidfd = phasync_new_child_pidfd(sp);
 		phasync_wrap_stream(stream, PHASYNC_MODE_RAW);
+		return stream->ops->read(stream, buf, count);
+	}
+	if (phasync_stdio_promote_file(stream)) {
 		return stream->ops->read(stream, buf, count);
 	}
 	return phasync_stdio_read_orig(stream, buf, count);
@@ -4056,7 +4132,11 @@ static PHP_MINIT_FUNCTION(phasync)
 {
 	REGISTER_INI_ENTRIES();
 	phasync_stdio_read_orig = php_stream_stdio_ops.read;
+	phasync_stdio_write_orig = php_stream_stdio_ops.write;
+	phasync_stdio_set_option_orig = php_stream_stdio_ops.set_option;
 	php_stream_stdio_ops.read = phasync_stdio_read;
+	php_stream_stdio_ops.write = phasync_stdio_write;
+	php_stream_stdio_ops.set_option = phasync_stdio_set_option;
 	return SUCCESS;
 }
 
@@ -4099,6 +4179,8 @@ static PHP_MSHUTDOWN_FUNCTION(phasync)
 {
 	phasync_pool_shutdown();
 	php_stream_stdio_ops.read = phasync_stdio_read_orig;
+	php_stream_stdio_ops.write = phasync_stdio_write_orig;
+	php_stream_stdio_ops.set_option = phasync_stdio_set_option_orig;
 	UNREGISTER_INI_ENTRIES();
 	return SUCCESS;
 }
