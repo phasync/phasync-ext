@@ -57,7 +57,7 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha11"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha12"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -1253,8 +1253,13 @@ static int phasync_connect_cooperative(php_stream *stream, php_stream_xport_para
 		if (xp->outputs.returncode == 1) {                 /* EINPROGRESS */
 			int err = 0;
 			socklen_t l = sizeof(err);
+			/* Wait on a transient resource we own, never the stream's own: the stream
+			 * is still being created, and its creator may not expect anyone else to
+			 * hold it — mysqlnd frees its stream's zend_resource raw right after
+			 * connecting (mysqlnd_fixup_regular_list), which would leave a handler's
+			 * references dangling (heap corruption). */
 			int w = remaining > 0
-				? phasync_wait_fd(phasync_write_handler(), stream, sock->socket, remaining)
+				? phasync_wait_fd(phasync_write_handler(), NULL, sock->socket, remaining)
 				: PHASYNC_WAIT_TIMEOUT;
 			if (w == PHASYNC_WAIT_ERROR) {
 				close(sock->socket);
