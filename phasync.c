@@ -7,8 +7,8 @@
  *         with transparent async I/O active for its dynamic extent. The tcp/unix/
  *         ssl transports are re-registered, and proc_open()/proc_close()/popen()/
  *         exec()/system()/passthru()/shell_exec()/stream_socket_pair()/
- *         stream_select()/socket_select()/the sleep and DNS functions/fopen()
- *         overridden at request start, and every descriptor-backed stream
+ *         stream_select()/socket_select()/the sleep, DNS and filesystem
+ *         functions/fopen() overridden at request start, and every descriptor-backed stream
  *         is wrapped as it is created (plus STDIN/STDOUT/STDERR and any fds
  *         inherited before load). The wrappers are inert outside a scope: a
  *         wrapped stream then behaves exactly like an unwrapped one. Inside a
@@ -47,6 +47,7 @@
 # include <resolv.h>
 #endif
 #include "ext/standard/php_dns.h"
+#include "ext/standard/php_filestat.h"
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -58,19 +59,58 @@
 #include <arpa/inet.h>
 #include <limits.h>
 #include <sys/syscall.h>
+#include <dirent.h>
 #include <sys/wait.h>
 
 #ifndef SYS_pidfd_open
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha14"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha15"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
 	signed char applied; /* fd mode we last forced: -1 unknown, 0 blocking, 1 non-blocking */
 	int pidfd;          /* process pipe: pidfd of its child (the taint), or -1 */
 } phasync_hook_entry;
+
+/* Filesystem functions made cooperative (see "filesystem functions" below). */
+typedef enum {
+	PHASYNC_FS_WARM,        /* stat the path on the pool, then the original      */
+	PHASYNC_FS_WARM_DIR,    /* read the directory on the pool, then the original */
+	PHASYNC_FS_WARM_GLOB,   /* WARM_DIR on the pattern's directory               */
+	PHASYNC_FS_UNLINK,      /* do it on the pool; the original only on failure   */
+	PHASYNC_FS_RMDIR,
+	PHASYNC_FS_MKDIR,
+	PHASYNC_FS_MKDIR_P,
+	PHASYNC_FS_RENAME
+} phasync_fs_op;
+
+static const struct { const char *name; phasync_fs_op op; } phasync_fs_funcs[] = {
+	{"stat", PHASYNC_FS_WARM}, {"lstat", PHASYNC_FS_WARM}, {"file_exists", PHASYNC_FS_WARM},
+	{"is_file", PHASYNC_FS_WARM}, {"is_dir", PHASYNC_FS_WARM}, {"is_link", PHASYNC_FS_WARM},
+	{"is_readable", PHASYNC_FS_WARM}, {"is_writable", PHASYNC_FS_WARM},
+	{"is_writeable", PHASYNC_FS_WARM}, {"is_executable", PHASYNC_FS_WARM},
+	{"filesize", PHASYNC_FS_WARM}, {"filemtime", PHASYNC_FS_WARM}, {"fileatime", PHASYNC_FS_WARM},
+	{"filectime", PHASYNC_FS_WARM}, {"fileperms", PHASYNC_FS_WARM}, {"fileinode", PHASYNC_FS_WARM},
+	{"fileowner", PHASYNC_FS_WARM}, {"filegroup", PHASYNC_FS_WARM}, {"filetype", PHASYNC_FS_WARM},
+	{"linkinfo", PHASYNC_FS_WARM}, {"readlink", PHASYNC_FS_WARM}, {"realpath", PHASYNC_FS_WARM},
+	{"scandir", PHASYNC_FS_WARM_DIR}, {"opendir", PHASYNC_FS_WARM_DIR}, {"dir", PHASYNC_FS_WARM_DIR},
+	{"glob", PHASYNC_FS_WARM_GLOB},
+	{"unlink", PHASYNC_FS_UNLINK}, {"rmdir", PHASYNC_FS_RMDIR}, {"mkdir", PHASYNC_FS_MKDIR},
+	{"rename", PHASYNC_FS_RENAME},
+};
+#define PHASYNC_FS_NFUNCS (sizeof(phasync_fs_funcs) / sizeof(phasync_fs_funcs[0]))
+
+#define PHASYNC_FS_OFFLOAD_NETWORK 0   /* phasync.fs_offload: network/FUSE mounts only */
+#define PHASYNC_FS_OFFLOAD_ALL     1
+#define PHASYNC_FS_OFFLOAD_NONE    2
+
+typedef struct {
+	char  *path;
+	size_t len;
+	bool   slow;
+} phasync_mount;
 
 /* This thread's children just before an exec-family call spawns one. */
 #define PHASYNC_MAX_CHILDREN 256
@@ -134,6 +174,13 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_shell_exec)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_proc_close)(INTERNAL_FUNCTION_PARAMETERS);
 	phasync_spawn *spawn;         /* armed by an exec-family call until its pipe is seen */
+	zif_handler orig_fs[PHASYNC_FS_NFUNCS];
+	HashTable fs_hooks;           /* (uintptr_t)zend_function -> index in phasync_fs_funcs */
+	int fs_offload;               /* INI: phasync.fs_offload */
+	int mountinfo_fd;             /* /proc/self/mountinfo, kept open to poll for changes */
+	phasync_mount *mounts;
+	int nmounts;
+	bool any_slow_mount;
 	int select_depth;             /* >0 while our override probes the original select */
 	zend_long thread_pool_size;   /* INI: phasync.thread_pool_size */
 	bool hooks_installed;         /* transports + fn overrides physically in place */
@@ -421,6 +468,7 @@ typedef enum {
 	PHASYNC_OP_GETADDRINFO,
 	PHASYNC_OP_NAMEINFO,
 	PHASYNC_OP_DNSQUERY,
+	PHASYNC_OP_FS,             /* filesystem metadata/namespace op (phasync_fs_op) */
 	PHASYNC_OP_OPEN            /* blocking open() (FIFO rendezvous), own thread   */
 } phasync_op_type;
 
@@ -443,7 +491,9 @@ typedef struct phasync_task {
 	struct addrinfo *ai;      /* GETADDRINFO result (caller freeaddrinfo()s)   */
 	char         path[PATH_MAX]; /* OPEN: path (own copy, worker-stable)        */
 	int          oflags;      /* OPEN: open(2) flags                           */
-	int          omode;       /* OPEN: open(2) mode                            */
+	int          omode;       /* OPEN: open(2) mode; FS: mkdir(2) mode          */
+	phasync_fs_op fsop;       /* FS: which operation                           */
+	char         path2[PATH_MAX]; /* FS rename: destination                     */
 	int          write_fd;    /* self-pipe write end */
 	struct phasync_task *next;
 } phasync_task;
@@ -928,9 +978,52 @@ static uint8_t *phasync_dns_parserr(uint8_t *cp, uint8_t *end, phasync_querybuf 
 #undef CHECKCP
 #endif /* HAVE_FULL_DNS_FUNCS */
 
+/* Worker side of PHASYNC_OP_FS: plain syscalls on t->path (absolute). */
+static int phasync_fs_exec(phasync_task *t)
+{
+	struct stat st;
+	DIR *d;
+	char *p;
+
+	switch (t->fsop) {
+		case PHASYNC_FS_WARM:
+			lstat(t->path, &st);
+			return stat(t->path, &st);
+		case PHASYNC_FS_WARM_DIR:
+		case PHASYNC_FS_WARM_GLOB:
+			if ((d = opendir(t->path)) == NULL) {
+				return -1;
+			}
+			while (readdir(d) != NULL);
+			return closedir(d);
+		case PHASYNC_FS_UNLINK:
+			return unlink(t->path);
+		case PHASYNC_FS_RMDIR:
+			return rmdir(t->path);
+		case PHASYNC_FS_RENAME:
+			return rename(t->path, t->path2);
+		case PHASYNC_FS_MKDIR_P:
+			for (p = t->path; (p = strchr(p + 1, '/')) != NULL; *p = '/') {
+				*p = '\0';
+				if (mkdir(t->path, t->omode) < 0 && errno != EEXIST) {
+					*p = '/';
+					return -1;
+				}
+			}
+			ZEND_FALLTHROUGH;
+		case PHASYNC_FS_MKDIR:
+			return mkdir(t->path, t->omode);
+	}
+	return -1;
+}
+
 static void phasync_task_exec(phasync_task *t)
 {
 	switch (t->type) {
+		case PHASYNC_OP_FS:
+			t->result = phasync_fs_exec(t);
+			t->err = errno;
+			break;
 		case PHASYNC_OP_READ:
 			do { t->result = read(t->fd, t->buf, t->count); }
 			while (t->result < 0 && errno == EINTR);
@@ -2852,6 +2945,275 @@ static ZEND_NAMED_FUNCTION(phasync_proc_close_override)
 	PHASYNC_G(orig_proc_close)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
+/* ---- filesystem functions --------------------------------------------------
+ *
+ * Metadata and namespace calls are fast on a local disk and would only get slower
+ * through the pool (~30µs+ a call vs ~1µs; autoloaders make thousands), so by
+ * default only paths on network/FUSE mounts are offloaded, where a call can stall
+ * for a round trip or worse (phasync.fs_offload=all offloads everything, =none
+ * nothing). Read-only calls stat (or read) the path on the pool, warming the
+ * kernel's caches, and then run the original, which answers from them — results,
+ * PHP's stat cache and warnings stay native. unlink/rmdir/mkdir/rename run on the
+ * pool; on failure the original runs to fail again with the native warning. */
+
+static bool phasync_fs_slow_type(const char *type)
+{
+	static const char *const slow[] = {
+		"nfs", "nfs4", "cifs", "smb3", "smbfs", "9p", "ceph", "glusterfs", "lustre",
+		"gpfs", "beegfs", "afs", "virtiofs", "davfs", NULL
+	};
+	const char *const *s;
+
+	if (strcmp(type, "fuse") == 0 || strcmp(type, "fuseblk") == 0 || strncmp(type, "fuse.", 5) == 0) {
+		return true;                     /* fuse.sshfs, fuse.s3fs, ...: userland */
+	}
+	for (s = slow; *s; s++) {
+		if (strcmp(type, *s) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void phasync_mounts_free(void)
+{
+	for (int i = 0; i < PHASYNC_G(nmounts); i++) {
+		free(PHASYNC_G(mounts)[i].path);
+	}
+	free(PHASYNC_G(mounts));
+	PHASYNC_G(mounts) = NULL;
+	PHASYNC_G(nmounts) = 0;
+	PHASYNC_G(any_slow_mount) = false;
+}
+
+/* (Re)load the mount table when it changed: /proc/self/mountinfo polls POLLPRI
+ * after a mount or unmount. Lines look like
+ *   36 35 98:0 /mnt1 /mnt/parent rw,noatime master:1 - ext3 /dev/root rw */
+static void phasync_mounts_refresh(void)
+{
+	int fd = PHASYNC_G(mountinfo_fd);
+	char *buf = NULL, *line, *next;
+	size_t size = 0, len = 0;
+	ssize_t n;
+
+	if (fd == -2) {
+		return;                          /* no /proc: nothing counts as slow */
+	}
+	if (fd == -1) {
+		if ((fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC)) < 0) {
+			PHASYNC_G(mountinfo_fd) = -2;
+			return;
+		}
+		PHASYNC_G(mountinfo_fd) = fd;
+	} else {
+		struct pollfd pfd = { fd, POLLPRI, 0 };
+		if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & (POLLPRI | POLLERR))) {
+			return;                      /* unchanged */
+		}
+	}
+	lseek(fd, 0, SEEK_SET);
+	do {
+		if (len + 4096 > size) {
+			char *nb = realloc(buf, size = size ? size * 2 : 16384);
+			if (nb == NULL) {
+				free(buf);
+				return;
+			}
+			buf = nb;
+		}
+		n = read(fd, buf + len, size - len - 1);
+		len += n > 0 ? (size_t) n : 0;
+	} while (n > 0);
+	buf[len] = '\0';
+
+	phasync_mounts_free();
+	for (line = buf; *line; line = next) {
+		char *mnt = line, *end, *type, *o, *i;
+		int field;
+
+		next = strchr(line, '\n');
+		next = next ? (*next = '\0', next + 1) : line + strlen(line);
+		for (field = 0; field < 4 && mnt; field++) {
+			mnt = strchr(mnt, ' ');
+			mnt = mnt ? mnt + 1 : NULL;
+		}
+		if (!mnt || !(end = strchr(mnt, ' ')) || !(type = strstr(end, " - "))) {
+			continue;
+		}
+		*end = '\0';
+		type += 3;
+		if ((o = strchr(type, ' '))) {
+			*o = '\0';
+		}
+		for (i = o = mnt; *i; o++) {     /* unescape \ooo (spaces etc.) */
+			if (i[0] == '\\' && i[1] >= '0' && i[1] <= '3' && i[2] >= '0' && i[2] <= '7' && i[3] >= '0' && i[3] <= '7') {
+				*o = (char) (((i[1] - '0') << 6) | ((i[2] - '0') << 3) | (i[3] - '0'));
+				i += 4;
+			} else {
+				*o = *i++;
+			}
+		}
+		*o = '\0';
+		if (PHASYNC_G(nmounts) % 64 == 0) {
+			phasync_mount *nm = realloc(PHASYNC_G(mounts), (PHASYNC_G(nmounts) + 64) * sizeof(*nm));
+			if (nm == NULL) {
+				break;
+			}
+			PHASYNC_G(mounts) = nm;
+		}
+		phasync_mount *m = &PHASYNC_G(mounts)[PHASYNC_G(nmounts)++];
+		m->path = strdup(mnt);
+		m->len = strlen(mnt);
+		m->slow = phasync_fs_slow_type(type);
+		PHASYNC_G(any_slow_mount) |= m->slow;
+	}
+	free(buf);
+}
+
+/* Is this absolute path offloaded? Under the network policy: when the mount it
+ * lies on (lexically, the longest matching mount point; the later of stacked
+ * ones) is a network/FUSE filesystem. */
+static bool phasync_fs_offloaded(const char *path)
+{
+	int best = -1;
+	size_t bestlen = 0;
+
+	if (PHASYNC_G(fs_offload) != PHASYNC_FS_OFFLOAD_NETWORK) {
+		return PHASYNC_G(fs_offload) == PHASYNC_FS_OFFLOAD_ALL;
+	}
+	phasync_mounts_refresh();
+	if (!PHASYNC_G(any_slow_mount)) {
+		return false;
+	}
+	for (int i = 0; i < PHASYNC_G(nmounts); i++) {
+		phasync_mount *m = &PHASYNC_G(mounts)[i];
+		if (m->len >= bestlen && strncmp(path, m->path, m->len) == 0
+		 && (path[m->len] == '/' || path[m->len] == '\0' || m->len == 1)) {
+			best = i;
+			bestlen = m->len;
+		}
+	}
+	return best >= 0 && PHASYNC_G(mounts)[best].slow;
+}
+
+/* Copy a plain local path argument into out (PATH_MAX), made absolute. Returns
+ * 1 if it is offloaded, 0 if not, -1 if it isn't a plain local path (a stream
+ * wrapper, an embedded NUL, too long: then the original handles it). */
+static int phasync_fs_path(zval *z, char *out)
+{
+	size_t len, cwdlen = 0;
+
+	if (Z_TYPE_P(z) != IS_STRING || (len = Z_STRLEN_P(z)) == 0
+	 || strlen(Z_STRVAL_P(z)) != len || strstr(Z_STRVAL_P(z), "://") != NULL) {
+		return -1;
+	}
+	if (Z_STRVAL_P(z)[0] != '/') {
+		if (VCWD_GETCWD(out, PATH_MAX) == NULL) {
+			return -1;
+		}
+		cwdlen = strlen(out);
+		out[cwdlen++] = '/';
+	}
+	if (cwdlen + len >= PATH_MAX) {
+		return -1;
+	}
+	memcpy(out + cwdlen, Z_STRVAL_P(z), len + 1);
+	return phasync_fs_offloaded(out) ? 1 : 0;
+}
+
+static ZEND_NAMED_FUNCTION(phasync_fs_override)
+{
+	zval *idx = zend_hash_index_find(&PHASYNC_G(fs_hooks), (zend_ulong) (uintptr_t) EX(func));
+	zif_handler orig = PHASYNC_G(orig_fs)[Z_LVAL_P(idx)];
+	uint32_t argc = ZEND_NUM_ARGS();
+	phasync_task t;
+	char *p;
+
+	t.fsop = phasync_fs_funcs[Z_LVAL_P(idx)].op;
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL || argc < 1) {
+		orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	switch (t.fsop) {
+		case PHASYNC_FS_WARM:
+		case PHASYNC_FS_WARM_DIR:
+			if (phasync_fs_path(ZEND_CALL_ARG(execute_data, 1), t.path) != 1) {
+				break;
+			}
+			t.type = PHASYNC_OP_FS;
+			phasync_pool_run(&t);
+			break;
+		case PHASYNC_FS_WARM_GLOB:
+			if (phasync_fs_path(ZEND_CALL_ARG(execute_data, 1), t.path) != 1) {
+				break;
+			}
+			t.path[strcspn(t.path, "*?[{")] = '\0';   /* the directory before the first wildcard */
+			*(strrchr(t.path, '/') + (strrchr(t.path, '/') == t.path)) = '\0';
+			t.type = PHASYNC_OP_FS;
+			phasync_pool_run(&t);
+			break;
+		case PHASYNC_FS_UNLINK:
+		case PHASYNC_FS_RMDIR:
+		case PHASYNC_FS_MKDIR:
+		case PHASYNC_FS_RENAME: {
+			/* No stream context, plain argument types, and no open_basedir refusal
+			 * (the original reports that); anything else is left to the original. */
+			uint32_t nargs = t.fsop == PHASYNC_FS_RENAME ? 2 : t.fsop == PHASYNC_FS_MKDIR ? 3 : 1;
+			zval *ctx = argc > nargs ? ZEND_CALL_ARG(execute_data, nargs + 1) : NULL;
+			int slow;
+
+			if ((ctx && Z_TYPE_P(ctx) != IS_NULL)
+			 || (slow = phasync_fs_path(ZEND_CALL_ARG(execute_data, 1), t.path)) < 0
+			 || (PG(open_basedir) && *PG(open_basedir) && php_check_open_basedir_ex(t.path, 0))) {
+				break;
+			}
+			if (t.fsop == PHASYNC_FS_RENAME) {
+				int slow2;
+				if (argc < 2 || (slow2 = phasync_fs_path(ZEND_CALL_ARG(execute_data, 2), t.path2)) < 0
+				 || (PG(open_basedir) && *PG(open_basedir) && php_check_open_basedir_ex(t.path2, 0))) {
+					break;
+				}
+				slow |= slow2;
+			}
+			if (t.fsop == PHASYNC_FS_MKDIR) {
+				zval *mode = argc >= 2 ? ZEND_CALL_ARG(execute_data, 2) : NULL;
+				zval *rec  = argc >= 3 ? ZEND_CALL_ARG(execute_data, 3) : NULL;
+				if ((mode && Z_TYPE_P(mode) != IS_LONG) || (rec && Z_TYPE_P(rec) != IS_TRUE && Z_TYPE_P(rec) != IS_FALSE)) {
+					break;
+				}
+				t.omode = mode ? (int) Z_LVAL_P(mode) : 0777;
+				if (rec && Z_TYPE_P(rec) == IS_TRUE) {
+					t.fsop = PHASYNC_FS_MKDIR_P;
+					for (p = t.path + strlen(t.path) - 1; p > t.path && *p == '/'; p--) {
+						*p = '\0';               /* mkdir -p a/b/ creates a/b */
+					}
+				}
+			}
+			if (!slow) {
+				break;
+			}
+			t.type = PHASYNC_OP_FS;
+			phasync_pool_run(&t);
+			if (EG(exception)) {
+				return;
+			}
+			if (t.result == 0) {
+				if (t.fsop != PHASYNC_FS_MKDIR && t.fsop != PHASYNC_FS_MKDIR_P) {
+					php_clear_stat_cache(1, NULL, 0);   /* as the native op does */
+				}
+				RETURN_TRUE;
+			}
+			break;                       /* failed: the original reports it natively */
+		}
+		default:
+			break;
+	}
+	if (EG(exception)) {
+		return;
+	}
+	orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
 /* stream_socket_pair() builds its sockets with socketpair(2) via
  * php_stream_sock_open_from_socket(), bypassing the transport factory — so wrap
  * both returned streams here (RAW; they are ordinary sockets). Wrapped
@@ -3177,6 +3539,15 @@ static void phasync_install_hooks(void)
 		PHASYNC_G(orig_proc_close) = f->handler;
 		f->handler = phasync_proc_close_override;
 	}
+	for (zend_long i = 0; i < (zend_long) PHASYNC_FS_NFUNCS; i++) {
+		if ((f = phasync_find_ifunc(phasync_fs_funcs[i].name, strlen(phasync_fs_funcs[i].name)))) {
+			zval zi;
+			ZVAL_LONG(&zi, i);
+			PHASYNC_G(orig_fs)[i] = f->handler;
+			f->handler = phasync_fs_override;
+			zend_hash_index_update(&PHASYNC_G(fs_hooks), (zend_ulong) (uintptr_t) f, &zi);
+		}
+	}
 	if ((f = phasync_find_ifunc("stream_select", sizeof("stream_select") - 1))) {
 		PHASYNC_G(orig_stream_select) = f->handler;
 		f->handler = phasync_stream_select_override;
@@ -3282,6 +3653,12 @@ static void phasync_restore_hooks(void)
 	if (PHASYNC_G(orig_proc_close) && (f = phasync_find_ifunc("proc_close", sizeof("proc_close") - 1))) {
 		f->handler = PHASYNC_G(orig_proc_close);
 	}
+	for (size_t i = 0; i < PHASYNC_FS_NFUNCS; i++) {
+		if (PHASYNC_G(orig_fs)[i] && (f = phasync_find_ifunc(phasync_fs_funcs[i].name, strlen(phasync_fs_funcs[i].name)))) {
+			f->handler = PHASYNC_G(orig_fs)[i];
+		}
+	}
+	zend_hash_clean(&PHASYNC_G(fs_hooks));
 	if (PHASYNC_G(orig_stream_select) && (f = phasync_find_ifunc("stream_select", sizeof("stream_select") - 1))) {
 		f->handler = PHASYNC_G(orig_stream_select);
 	}
@@ -3655,9 +4032,24 @@ static void phasync_ops_dtor(zval *zv)
 }
 
 
+static ZEND_INI_MH(phasync_update_fs_offload)
+{
+	if (zend_string_equals_literal_ci(new_value, "network")) {
+		PHASYNC_G(fs_offload) = PHASYNC_FS_OFFLOAD_NETWORK;
+	} else if (zend_string_equals_literal_ci(new_value, "all")) {
+		PHASYNC_G(fs_offload) = PHASYNC_FS_OFFLOAD_ALL;
+	} else if (zend_string_equals_literal_ci(new_value, "none")) {
+		PHASYNC_G(fs_offload) = PHASYNC_FS_OFFLOAD_NONE;
+	} else {
+		return FAILURE;
+	}
+	return SUCCESS;
+}
+
 PHP_INI_BEGIN()
 	STD_PHP_INI_ENTRY("phasync.thread_pool_size", "8", PHP_INI_SYSTEM, OnUpdateLong,
 		thread_pool_size, zend_phasync_globals, phasync_globals)
+	PHP_INI_ENTRY("phasync.fs_offload", "network", PHP_INI_ALL, phasync_update_fs_offload)
 PHP_INI_END()
 
 static PHP_MINIT_FUNCTION(phasync)
@@ -3685,12 +4077,22 @@ static PHP_GINIT_FUNCTION(phasync)
 	memset(phasync_globals, 0, sizeof(*phasync_globals));
 	zend_hash_init(&phasync_globals->hooked, 8, NULL, phasync_hook_entry_dtor, 1);
 	zend_hash_init(&phasync_globals->wrapped_ops_cache, 8, NULL, phasync_ops_dtor, 1);
+	zend_hash_init(&phasync_globals->fs_hooks, 32, NULL, NULL, 1);
+	phasync_globals->mountinfo_fd = -1;
 }
 
 static PHP_GSHUTDOWN_FUNCTION(phasync)
 {
 	zend_hash_destroy(&phasync_globals->hooked);
 	zend_hash_destroy(&phasync_globals->wrapped_ops_cache);
+	zend_hash_destroy(&phasync_globals->fs_hooks);
+	for (int i = 0; i < phasync_globals->nmounts; i++) {
+		free(phasync_globals->mounts[i].path);
+	}
+	free(phasync_globals->mounts);
+	if (phasync_globals->mountinfo_fd >= 0) {
+		close(phasync_globals->mountinfo_fd);
+	}
 }
 
 static PHP_MSHUTDOWN_FUNCTION(phasync)

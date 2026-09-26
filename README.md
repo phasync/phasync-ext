@@ -24,6 +24,12 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
      `dns_get_record()`, `checkdnsrr()`/`dns_check_record()`, `getmxrr()`/`dns_get_mx()`
      (via a thread pool)
    - `fopen()` (regular files + FIFO open, via a thread pool)
+   - filesystem metadata and namespace calls on network/FUSE mounts: `stat()`,
+     `lstat()`, `file_exists()`, `is_file()`/`is_dir()`/`is_link()`/`is_readable()`/
+     `is_writable()`/`is_executable()`, `filesize()`/`filemtime()` & co.,
+     `realpath()`, `readlink()`, `linkinfo()`, `scandir()`, `glob()`,
+     `opendir()`/`dir()`, `unlink()`, `rename()`, `mkdir()`, `rmdir()`
+     (via a thread pool; see below)
 
    The extension performs the real I/O; on a would-block it invokes one of the
    handlers you pass to `manage()`, which decides how to wait (typically
@@ -185,6 +191,19 @@ offloaded to a small worker thread pool: the worker runs only the raw syscall
 fiber through a self-pipe that reuses the scope's read handler. Workers are pooled;
 the pool size is the `phasync.thread_pool_size` INI (default 8; idle workers cost
 only a lazily-paged stack, so a larger pool is cheap).
+
+Filesystem metadata calls (`stat()`, `file_exists()`, `scandir()`, `unlink()`, …)
+take about a microsecond on a local disk, and a pool round trip would make them
+slower (tens of µs), which hurts code that makes thousands of them, like an
+autoloader. So by default only paths on network or FUSE mounts (NFS, SMB/CIFS, 9p,
+CephFS, virtiofs, sshfs and other `fuse.*` …, read from `/proc/self/mountinfo`) go
+through the pool, where a call can stall for a network round trip or longer. The
+`phasync.fs_offload` INI changes that: `network` (default), `all` (also for slow
+local disks), or `none`. Read-only calls stat or read the path on the pool, warming
+the kernel's caches, and then run the original function, so results, PHP's stat
+cache and warnings are exactly native. `unlink()`/`rename()`/`mkdir()`/`rmdir()`
+run on the pool; if one fails, the original function runs and reports the error
+with its usual warning.
 
 Named pipes (FIFOs) are the case cooperative scheduling *cannot* solve at all:
 `open()` blocks in the kernel until the other end is opened, before any fd exists
