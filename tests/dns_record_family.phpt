@@ -38,7 +38,10 @@ $cases = [
     'SOA php.net'        => fn() => dns_get_record('php.net', DNS_SOA),
     'ANY localhost'      => fn() => dns_get_record('localhost'),
     'raw A php.net'      => fn() => dns_get_record('php.net', 1, $a, $b, true),
-    'NS authns/addtl'    => function () { $r = dns_get_record('php.net', DNS_NS, $auth, $add); return [$r, $auth, $add]; },
+    // The resolver's additional section repeats records a varying number of times
+    // between two live queries: compare it as a set.
+    'NS authns/addtl'    => function () { $r = dns_get_record('php.net', DNS_NS, $auth, $add);
+                                          return [$r, $auth, array_values(array_unique(array_map('json_encode', norm($add))))]; },
     'NXDOMAIN'           => fn() => dns_get_record('no-such-host.invalid', DNS_A),
     'bad type'           => fn() => dns_get_record('php.net', 0x40000000),
     'getmxrr php.net'    => function () { $ok = getmxrr('php.net', $mx, $w); return [$ok, $mx, $w]; },
