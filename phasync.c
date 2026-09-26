@@ -62,12 +62,13 @@
 #include <sys/syscall.h>
 #include <dirent.h>
 #include <sys/wait.h>
+#include <sys/file.h>
 
 #ifndef SYS_pidfd_open
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha17"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha18"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -2887,6 +2888,25 @@ static bool phasync_stdio_promote_file(php_stream *stream)
 
 static int phasync_stdio_set_option(php_stream *stream, int option, int value, void *ptrparam)
 {
+	/* flock() (and LOCK_EX in file_put_contents(), SplFileObject::flock()) blocks
+	 * in flock(2) until the lock is free, with no descriptor to wait on. Inside a
+	 * scope, in a fiber, try without blocking and sleep through the sleep handler
+	 * between tries (1ms, doubling to 20ms). Plain and wrapped stdio streams both
+	 * end up here. */
+	if (option == PHP_STREAM_OPTION_LOCKING && ptrparam == NULL
+	 && (value == LOCK_SH || value == LOCK_EX)
+	 && phasync_sleep_handler() != NULL && EG(active_fiber) != NULL) {
+		zend_long usec = 1000;
+		int rc;
+		while ((rc = phasync_stdio_set_option_orig(stream, option, value | LOCK_NB, NULL)) != 0
+		       && errno == EWOULDBLOCK) {
+			if (phasync_call_sleep(phasync_sleep_handler(), usec) < 0) {
+				return -1;               /* exception pending */
+			}
+			usec = MIN(usec * 2, 20000);
+		}
+		return rc;
+	}
 	if (option == PHP_STREAM_OPTION_MMAP_API && value == PHP_STREAM_MMAP_SUPPORTED
 	 && phasync_stdio_promote_file(stream)) {
 		return stream->ops->set_option(stream, option, value, ptrparam);  /* now wrapped: declines */

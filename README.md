@@ -23,6 +23,9 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
      on pipes, sockets and ttys; in the CLI also `echo`/`print` to a stdout that
      would block (each echo stays contiguous, as natively)
    - `sleep()`, `usleep()`, `time_nanosleep()`, `time_sleep_until()`
+   - `flock()`, `file_put_contents(..., LOCK_EX)`, `SplFileObject::flock()` on a
+     held lock (retried without blocking, sleeping via the sleep handler between
+     tries: 1ms, doubling to 20ms — there is no descriptor to wait on)
    - DNS: `gethostbyname()`, `gethostbynamel()`, `gethostbyaddr()`,
      `dns_get_record()`, `checkdnsrr()`/`dns_check_record()`, `getmxrr()`/`dns_get_mx()`
      (via a thread pool)
