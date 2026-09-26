@@ -68,7 +68,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha18"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha19"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -180,6 +180,7 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_proc_close)(INTERNAL_FUNCTION_PARAMETERS);
 	phasync_spawn *spawn;         /* armed by an exec-family call until its pipe is seen */
 	bool ub_writing;              /* a fiber is suspended inside an echo (CLI stdout) */
+	int no_suspend;               /* >0: pool ops run inline (phasync\ext\stream_select) */
 	zif_handler orig_fs[PHASYNC_FS_NFUNCS];
 	HashTable fs_hooks;           /* (uintptr_t)zend_function -> index in phasync_fs_funcs */
 	int fs_offload;               /* INI: phasync.fs_offload */
@@ -1323,7 +1324,7 @@ static void phasync_pool_run(phasync_task *t)
 {
 	phasync_pipe *p;
 
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL || PHASYNC_G(no_suspend)
 	 || (p = phasync_pipe_get()) == NULL) {
 		/* No fiber to yield from (or no scheduler / pipe failed): run inline. */
 		phasync_task_exec(t);
@@ -1432,17 +1433,10 @@ static void phasync_pool_run_dedicated(phasync_task *t)
 /* Pool-mode ops: offload the blocking read/write to a worker thread (for regular
  * files, which are not readiness-pollable). Falls back to the original op when
  * there's no scheduler or no fd. */
-static ssize_t phasync_wrapped_read_pool(php_stream *stream, char *buf, size_t count)
+static ssize_t phasync_pool_read_fd(php_stream *stream, php_socket_t fd, char *buf, size_t count)
 {
-	const php_stream_ops *orig = PHASYNC_ORIG(stream);
-	php_socket_t fd = phasync_stream_fd(stream);
 	phasync_task t;
 
-	/* Outside a scope (or not in a fiber) there is nothing to yield to: be the
-	 * native op exactly. */
-	if (fd == -1 || phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
-		return orig->read(stream, buf, count);
-	}
 	memset(&t, 0, sizeof(t));
 	t.type = PHASYNC_OP_READ;
 	t.fd = fd;
@@ -1458,15 +1452,10 @@ static ssize_t phasync_wrapped_read_pool(php_stream *stream, char *buf, size_t c
 	return t.result;
 }
 
-static ssize_t phasync_wrapped_write_pool(php_stream *stream, const char *buf, size_t count)
+static ssize_t phasync_pool_write_fd(php_socket_t fd, const char *buf, size_t count)
 {
-	const php_stream_ops *orig = PHASYNC_ORIG(stream);
-	php_socket_t fd = phasync_stream_fd(stream);
 	phasync_task t;
 
-	if (fd == -1 || phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
-		return orig->write(stream, buf, count);
-	}
 	memset(&t, 0, sizeof(t));
 	t.type = PHASYNC_OP_WRITE;
 	t.fd = fd;
@@ -1475,6 +1464,28 @@ static ssize_t phasync_wrapped_write_pool(php_stream *stream, const char *buf, s
 	phasync_pool_run(&t);
 	errno = t.err;
 	return t.result;
+}
+
+static ssize_t phasync_wrapped_read_pool(php_stream *stream, char *buf, size_t count)
+{
+	php_socket_t fd = phasync_stream_fd(stream);
+
+	/* Outside a scope (or not in a fiber) there is nothing to yield to: be the
+	 * native op exactly. */
+	if (fd == -1 || phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+		return PHASYNC_ORIG(stream)->read(stream, buf, count);
+	}
+	return phasync_pool_read_fd(stream, fd, buf, count);
+}
+
+static ssize_t phasync_wrapped_write_pool(php_stream *stream, const char *buf, size_t count)
+{
+	php_socket_t fd = phasync_stream_fd(stream);
+
+	if (fd == -1 || phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+		return PHASYNC_ORIG(stream)->write(stream, buf, count);
+	}
+	return phasync_pool_write_fd(fd, buf, count);
 }
 
 /* ---- wrapped stream ops (shared across socket + pipe originals) ----------- */
@@ -2861,14 +2872,16 @@ static ssize_t (*phasync_stdio_write_orig)(php_stream *stream, const char *buf, 
 static int (*phasync_stdio_set_option_orig)(php_stream *stream, int option, int value, void *ptrparam);
 
 /* Regular files opened internally (file_get_contents(), file_put_contents(),
- * file(), copy(), readfile(), md5_file() ...) bypass the fopen() override: wrap
- * them POOL on their first read/write (or mmap check) inside a scope, in a fiber.
+ * file(), copy(), readfile(), md5_file() ...) bypass the fopen() override: their
+ * reads/writes go to the pool (and mmap is declined) inside a scope, in a fiber.
+ * The stream keeps the stdio ops: PHP checks php_stream_is(STDIO) on streams it
+ * builds internally (php://temp's spill file, for one) and breaks if they change.
  * Never for a file being compiled: include/require (under a user frame) and the
  * internal functions that compile (opcache_compile_file() ...) read through a
  * stdio stream too, but must not suspend mid-compile. Zend's streams are the
  * unbuffered ones marked auto-cleanup (__exposed); file_get_contents() also
  * unbuffers its stream, but never exposes it. */
-static bool phasync_stdio_promote_file(php_stream *stream)
+static php_socket_t phasync_stdio_poolable(php_stream *stream)
 {
 	zend_execute_data *ex = EG(current_execute_data);
 	php_socket_t fd;
@@ -2880,10 +2893,9 @@ static bool phasync_stdio_promote_file(php_stream *stream)
 	 || ex == NULL || ex->func == NULL || ZEND_USER_CODE(ex->func->type)
 	 || stream->readfilters.head || stream->writefilters.head
 	 || (fd = phasync_stream_fd(stream)) == -1 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
-		return false;
+		return -1;
 	}
-	phasync_wrap_stream(stream, PHASYNC_MODE_POOL);
-	return true;
+	return fd;
 }
 
 static int phasync_stdio_set_option(php_stream *stream, int option, int value, void *ptrparam)
@@ -2908,16 +2920,18 @@ static int phasync_stdio_set_option(php_stream *stream, int option, int value, v
 		return rc;
 	}
 	if (option == PHP_STREAM_OPTION_MMAP_API && value == PHP_STREAM_MMAP_SUPPORTED
-	 && phasync_stdio_promote_file(stream)) {
-		return stream->ops->set_option(stream, option, value, ptrparam);  /* now wrapped: declines */
+	 && phasync_stdio_poolable(stream) != -1) {
+		return PHP_STREAM_OPTION_RETURN_NOTIMPL;   /* read via the pool instead */
 	}
 	return phasync_stdio_set_option_orig(stream, option, value, ptrparam);
 }
 
 static ssize_t phasync_stdio_write(php_stream *stream, const char *buf, size_t count)
 {
-	if (phasync_stdio_promote_file(stream)) {
-		return stream->ops->write(stream, buf, count);
+	php_socket_t fd = phasync_stdio_poolable(stream);
+
+	if (fd != -1) {
+		return phasync_pool_write_fd(fd, buf, count);
 	}
 	return phasync_stdio_write_orig(stream, buf, count);
 }
@@ -2941,8 +2955,8 @@ static ssize_t phasync_stdio_read(php_stream *stream, char *buf, size_t count)
 		phasync_wrap_stream(stream, PHASYNC_MODE_RAW);
 		return stream->ops->read(stream, buf, count);
 	}
-	if (phasync_stdio_promote_file(stream)) {
-		return stream->ops->read(stream, buf, count);
+	if ((fd = phasync_stdio_poolable(stream)) != -1) {
+		return phasync_pool_read_fd(stream, fd, buf, count);
 	}
 	return phasync_stdio_read_orig(stream, buf, count);
 }
@@ -4048,10 +4062,14 @@ ZEND_FUNCTION(phasync_ext_stream_select)
 		Z_PARAM_LONG_OR_NULL(usec, usecnull)
 	ZEND_PARSE_PARAMETERS_END();
 
+	/* The scheduler's own select must never suspend, but casting a stream to its
+	 * fd can do I/O (php://temp spills its buffer to a file): run that inline. */
 	zend_hash_init(&events_by_fd, 8, NULL, NULL, 0);
+	PHASYNC_G(no_suspend)++;
 	sets += phasync_collect(r_array, &events_by_fd, POLLIN);
 	sets += phasync_collect(w_array, &events_by_fd, POLLOUT);
 	sets += phasync_collect(e_array, &events_by_fd, POLLPRI);
+	PHASYNC_G(no_suspend)--;
 
 	if (sets == 0) {
 		zend_hash_destroy(&events_by_fd);
@@ -4301,6 +4319,7 @@ static PHP_RINIT_FUNCTION(phasync)
 	PHASYNC_G(scope_top) = NULL;
 	PHASYNC_G(spawn) = NULL;
 	PHASYNC_G(ub_writing) = false;
+	PHASYNC_G(no_suspend) = 0;
 	PHASYNC_G(hooks_installed) = 0;
 	zend_hash_clean(&PHASYNC_G(hooked));
 	/* Always-on: the transport factories and function overrides go in at the
