@@ -5,9 +5,10 @@
  *
  * phasync\ext\manage($code, $read, $write, $sleep, $timeoutException) — run $code
  *         with transparent async I/O active for its dynamic extent. The tcp/unix/
- *         ssl transports are re-registered and proc_open()/stream_socket_pair()/
- *         sleep()/usleep()/time_nanosleep()/time_sleep_until()/gethostbyname()/
- *         fopen() overridden at request start, and every descriptor-backed stream
+ *         ssl transports are re-registered, and proc_open()/proc_close()/popen()/
+ *         exec()/system()/passthru()/shell_exec()/stream_socket_pair()/
+ *         stream_select()/socket_select()/the sleep and DNS functions/fopen()
+ *         overridden at request start, and every descriptor-backed stream
  *         is wrapped as it is created (plus STDIN/STDOUT/STDERR and any fds
  *         inherited before load). The wrappers are inert outside a scope: a
  *         wrapped stream then behaves exactly like an unwrapped one. Inside a
@@ -56,13 +57,27 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <limits.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha13"
+#ifndef SYS_pidfd_open
+# define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
+#endif
+
+#define PHP_PHASYNC_VERSION "0.4.0-alpha14"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
 	signed char applied; /* fd mode we last forced: -1 unknown, 0 blocking, 1 non-blocking */
+	int pidfd;          /* process pipe: pidfd of its child (the taint), or -1 */
 } phasync_hook_entry;
+
+/* This thread's children just before an exec-family call spawns one. */
+#define PHASYNC_MAX_CHILDREN 256
+typedef struct {
+	pid_t before[PHASYNC_MAX_CHILDREN];
+	int   n;                /* -1: /proc children unavailable */
+} phasync_spawn;
 
 /* Wrapped ops with the original embedded right after it, so the original is
  * recoverable from any stream carrying these ops (including accepted sockets,
@@ -112,6 +127,13 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_stream_socket_pair)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_stream_select)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_socket_select)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_popen)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_exec)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_system)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_passthru)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_shell_exec)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_proc_close)(INTERNAL_FUNCTION_PARAMETERS);
+	phasync_spawn *spawn;         /* armed by an exec-family call until its pipe is seen */
 	int select_depth;             /* >0 while our override probes the original select */
 	zend_long thread_pool_size;   /* INI: phasync.thread_pool_size */
 	bool hooks_installed;         /* transports + fn overrides physically in place */
@@ -1370,6 +1392,7 @@ static phasync_hook_entry *phasync_entry_ensure(php_stream *stream)
 		e = pemalloc(sizeof(*e), 1);
 		e->want_block  = true;    /* streams are blocking until told otherwise */
 		e->applied     = -1;      /* fd mode not forced yet */
+		e->pidfd       = -1;
 		zend_hash_index_add_ptr(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream, e);
 	}
 	return e;
@@ -1844,6 +1867,25 @@ static int phasync_wrapped_close(php_stream *stream, int close_handle)
 	phasync_hook_entry *e = phasync_entry(stream);
 
 	if (e) {
+		if (e->pidfd != -1) {
+			/* A process pipe: pclose() below waits for the child. Inside a scope,
+			 * in a fiber, wait for its exit here instead, on the pidfd (readable
+			 * once the child exits, without reaping it), so pclose() then reaps at
+			 * once with the native status. Like pclose(), first close our end, by
+			 * duping /dev/null over it (the fd stays valid for fclose()), so a
+			 * child still using the pipe gets EOF/EPIPE instead of blocking. */
+			zval *handler = phasync_read_handler();
+			php_socket_t fd = phasync_stream_fd(stream);
+			int devnull;
+			if (close_handle && handler && EG(active_fiber) && fd != -1
+			 && (devnull = open("/dev/null", O_RDWR | O_CLOEXEC)) >= 0) {
+				if (dup2(devnull, fd) >= 0) {
+					phasync_wait_fd(handler, NULL, e->pidfd, INFINITY);
+				}
+				close(devnull);
+			}
+			close(e->pidfd);
+		}
 		/* If we forced a detached fd non-blocking but the caller wanted blocking,
 		 * hand it back the way they left it. */
 		if (!close_handle && e->applied == 1 && e->want_block) {
@@ -2632,6 +2674,184 @@ static ZEND_NAMED_FUNCTION(phasync_fopen_override)
 	}
 }
 
+/* ---- process family: popen(), exec(), system(), passthru(), shell_exec(),
+ * proc_close() --------------------------------------------------------------
+ *
+ * Their pipe reads/writes cooperate through the wrapped ops like any pipe; the
+ * blocking wait for the child in pclose()/proc_close() cooperates through a pidfd
+ * of the child. popen() doesn't expose the pid, so it is found by diffing this
+ * thread's /proc children around the spawn (an unreaped child's pid can't be
+ * reused, so that is race-free). Without /proc children or pidfd_open() (Linux
+ * < 5.3) the child wait stays native. */
+
+/* This thread's children from /proc; -1 when unavailable. */
+static int phasync_children(pid_t *out)
+{
+	char path[64], buf[PHASYNC_MAX_CHILDREN * 8], *p, *end;
+	ssize_t len;
+	int fd, n = 0;
+
+	snprintf(path, sizeof(path), "/proc/self/task/%ld/children", (long) syscall(SYS_gettid));
+	if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0) {
+		return -1;
+	}
+	len = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (len < 0 || len == (ssize_t) sizeof(buf) - 1) {
+		return -1;                       /* unreadable, or too many to be sure */
+	}
+	buf[len] = '\0';
+	for (p = buf; n < PHASYNC_MAX_CHILDREN; p = end) {
+		long pid = strtol(p, &end, 10);
+		if (end == p) {
+			break;
+		}
+		out[n++] = (pid_t) pid;
+	}
+	return n;
+}
+
+/* A pidfd of the one child spawned since sp was taken; -1 if not exactly one. */
+static int phasync_new_child_pidfd(const phasync_spawn *sp)
+{
+	pid_t now[PHASYNC_MAX_CHILDREN], pid = 0;
+	int n, i, j;
+
+	if (sp->n < 0 || (n = phasync_children(now)) < 0) {
+		return -1;
+	}
+	for (i = 0; i < n; i++) {
+		for (j = 0; j < sp->n && sp->before[j] != now[i]; j++);
+		if (j < sp->n) {
+			continue;
+		}
+		if (pid) {
+			return -1;
+		}
+		pid = now[i];
+	}
+	return pid ? (int) syscall(SYS_pidfd_open, pid, 0) : -1;
+}
+
+static ssize_t (*phasync_stdio_read_orig)(php_stream *stream, char *buf, size_t count);
+
+/* php_stream_stdio_ops.read, patched process-wide at MINIT: php_exec() and
+ * shell_exec() build their pipe stream internally, so there is no other hook.
+ * Inert unless an exec-family override armed PHASYNC_G(spawn). Those read their
+ * popen() pipe right after spawning, before anything else runs, so the first FIFO
+ * read then is that pipe: taint it with the child's pidfd and wrap it. */
+static ssize_t phasync_stdio_read(php_stream *stream, char *buf, size_t count)
+{
+	phasync_spawn *sp = PHASYNC_G(spawn);
+	php_socket_t fd;
+	struct stat st;
+
+	if (sp && stream->ops == &php_stream_stdio_ops
+	 && (fd = phasync_stream_fd(stream)) != -1 && fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode)) {
+		PHASYNC_G(spawn) = NULL;
+		phasync_entry_ensure(stream)->pidfd = phasync_new_child_pidfd(sp);
+		phasync_wrap_stream(stream, PHASYNC_MODE_RAW);
+		return stream->ops->read(stream, buf, count);
+	}
+	return phasync_stdio_read_orig(stream, buf, count);
+}
+
+static void phasync_exec_family(INTERNAL_FUNCTION_PARAMETERS, void (*orig)(INTERNAL_FUNCTION_PARAMETERS))
+{
+	phasync_spawn sp;
+
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+		orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	sp.n = phasync_children(sp.before);
+	PHASYNC_G(spawn) = &sp;
+	orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	PHASYNC_G(spawn) = NULL;             /* never left armed, whatever happened */
+}
+
+static ZEND_NAMED_FUNCTION(phasync_exec_override)
+{
+	phasync_exec_family(INTERNAL_FUNCTION_PARAM_PASSTHRU, PHASYNC_G(orig_exec));
+}
+static ZEND_NAMED_FUNCTION(phasync_system_override)
+{
+	phasync_exec_family(INTERNAL_FUNCTION_PARAM_PASSTHRU, PHASYNC_G(orig_system));
+}
+static ZEND_NAMED_FUNCTION(phasync_passthru_override)
+{
+	phasync_exec_family(INTERNAL_FUNCTION_PARAM_PASSTHRU, PHASYNC_G(orig_passthru));
+}
+static ZEND_NAMED_FUNCTION(phasync_shell_exec_override)
+{
+	phasync_exec_family(INTERNAL_FUNCTION_PARAM_PASSTHRU, PHASYNC_G(orig_shell_exec));
+}
+
+/* popen() streams are wrapped like proc_open() pipes, and tainted. */
+static ZEND_NAMED_FUNCTION(phasync_popen_override)
+{
+	phasync_spawn sp;
+	php_stream *s = NULL;
+
+	sp.n = phasync_children(sp.before);
+	PHASYNC_G(orig_popen)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	if (Z_TYPE_P(return_value) != IS_RESOURCE) {
+		return;
+	}
+	php_stream_from_zval_no_verify(s, return_value);
+	if (s) {
+		phasync_entry_ensure(s)->pidfd = phasync_new_child_pidfd(&sp);
+		phasync_wrap_stream(s, PHASYNC_MODE_RAW);
+	}
+}
+
+/* ext/standard's php_process_handle: its leading fields, the same from PHP 8.2 to
+ * master on POSIX. */
+typedef struct {
+	pid_t           child;
+	int             npipes;
+	zend_resource **pipes;
+} phasync_proc_handle;
+
+static ZEND_NAMED_FUNCTION(phasync_proc_close_override)
+{
+	zval *handler = phasync_read_handler(), *zproc;
+	const char *type;
+	phasync_proc_handle *proc;
+	siginfo_t si;
+	int pidfd, i, w;
+
+	if (handler == NULL || EG(active_fiber) == NULL || ZEND_NUM_ARGS() != 1
+	 || Z_TYPE_P(zproc = ZEND_CALL_ARG(execute_data, 1)) != IS_RESOURCE
+	 || (type = zend_rsrc_list_get_rsrc_type(Z_RES_P(zproc))) == NULL || strcmp(type, "process") != 0) {
+		PHASYNC_G(orig_proc_close)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	proc = Z_RES_P(zproc)->ptr;
+	/* First close the pipes, as the native close does, so a child waiting for EOF
+	 * on its stdin can exit. */
+	for (i = 0; i < proc->npipes; i++) {
+		if (proc->pipes[i] != NULL) {
+			GC_DELREF(proc->pipes[i]);
+			zend_list_close(proc->pipes[i]);
+			proc->pipes[i] = NULL;
+		}
+	}
+	/* waitid(WNOWAIT) checks the pid is still our child (proc_get_status() may have
+	 * reaped it); then the pidfd turns readable when it exits, and the original
+	 * reaps it at once. */
+	pidfd = (int) syscall(SYS_pidfd_open, proc->child, 0);
+	if (pidfd >= 0) {
+		w = waitid(P_PID, proc->child, &si, WEXITED | WNOHANG | WNOWAIT) == 0
+			? phasync_wait_fd(handler, NULL, pidfd, INFINITY) : PHASYNC_WAIT_READY;
+		close(pidfd);
+		if (w == PHASYNC_WAIT_ERROR) {
+			return;                      /* exception pending: propagate */
+		}
+	}
+	PHASYNC_G(orig_proc_close)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
 /* stream_socket_pair() builds its sockets with socketpair(2) via
  * php_stream_sock_open_from_socket(), bypassing the transport factory — so wrap
  * both returned streams here (RAW; they are ordinary sockets). Wrapped
@@ -2933,6 +3153,30 @@ static void phasync_install_hooks(void)
 		PHASYNC_G(orig_stream_socket_pair) = f->handler;
 		f->handler = phasync_stream_socket_pair_override;
 	}
+	if ((f = phasync_find_ifunc("popen", sizeof("popen") - 1))) {
+		PHASYNC_G(orig_popen) = f->handler;
+		f->handler = phasync_popen_override;
+	}
+	if ((f = phasync_find_ifunc("exec", sizeof("exec") - 1))) {
+		PHASYNC_G(orig_exec) = f->handler;
+		f->handler = phasync_exec_override;
+	}
+	if ((f = phasync_find_ifunc("system", sizeof("system") - 1))) {
+		PHASYNC_G(orig_system) = f->handler;
+		f->handler = phasync_system_override;
+	}
+	if ((f = phasync_find_ifunc("passthru", sizeof("passthru") - 1))) {
+		PHASYNC_G(orig_passthru) = f->handler;
+		f->handler = phasync_passthru_override;
+	}
+	if ((f = phasync_find_ifunc("shell_exec", sizeof("shell_exec") - 1))) {
+		PHASYNC_G(orig_shell_exec) = f->handler;
+		f->handler = phasync_shell_exec_override;
+	}
+	if ((f = phasync_find_ifunc("proc_close", sizeof("proc_close") - 1))) {
+		PHASYNC_G(orig_proc_close) = f->handler;
+		f->handler = phasync_proc_close_override;
+	}
 	if ((f = phasync_find_ifunc("stream_select", sizeof("stream_select") - 1))) {
 		PHASYNC_G(orig_stream_select) = f->handler;
 		f->handler = phasync_stream_select_override;
@@ -3019,6 +3263,24 @@ static void phasync_restore_hooks(void)
 	}
 	if (PHASYNC_G(orig_stream_socket_pair) && (f = phasync_find_ifunc("stream_socket_pair", sizeof("stream_socket_pair") - 1))) {
 		f->handler = PHASYNC_G(orig_stream_socket_pair);
+	}
+	if (PHASYNC_G(orig_popen) && (f = phasync_find_ifunc("popen", sizeof("popen") - 1))) {
+		f->handler = PHASYNC_G(orig_popen);
+	}
+	if (PHASYNC_G(orig_exec) && (f = phasync_find_ifunc("exec", sizeof("exec") - 1))) {
+		f->handler = PHASYNC_G(orig_exec);
+	}
+	if (PHASYNC_G(orig_system) && (f = phasync_find_ifunc("system", sizeof("system") - 1))) {
+		f->handler = PHASYNC_G(orig_system);
+	}
+	if (PHASYNC_G(orig_passthru) && (f = phasync_find_ifunc("passthru", sizeof("passthru") - 1))) {
+		f->handler = PHASYNC_G(orig_passthru);
+	}
+	if (PHASYNC_G(orig_shell_exec) && (f = phasync_find_ifunc("shell_exec", sizeof("shell_exec") - 1))) {
+		f->handler = PHASYNC_G(orig_shell_exec);
+	}
+	if (PHASYNC_G(orig_proc_close) && (f = phasync_find_ifunc("proc_close", sizeof("proc_close") - 1))) {
+		f->handler = PHASYNC_G(orig_proc_close);
 	}
 	if (PHASYNC_G(orig_stream_select) && (f = phasync_find_ifunc("stream_select", sizeof("stream_select") - 1))) {
 		f->handler = PHASYNC_G(orig_stream_select);
@@ -3401,6 +3663,8 @@ PHP_INI_END()
 static PHP_MINIT_FUNCTION(phasync)
 {
 	REGISTER_INI_ENTRIES();
+	phasync_stdio_read_orig = php_stream_stdio_ops.read;
+	php_stream_stdio_ops.read = phasync_stdio_read;
 	return SUCCESS;
 }
 
@@ -3432,6 +3696,7 @@ static PHP_GSHUTDOWN_FUNCTION(phasync)
 static PHP_MSHUTDOWN_FUNCTION(phasync)
 {
 	phasync_pool_shutdown();
+	php_stream_stdio_ops.read = phasync_stdio_read_orig;
 	UNREGISTER_INI_ENTRIES();
 	return SUCCESS;
 }
@@ -3481,6 +3746,7 @@ static void phasync_wrap_existing_streams(bool include_files)
 static PHP_RINIT_FUNCTION(phasync)
 {
 	PHASYNC_G(scope_top) = NULL;
+	PHASYNC_G(spawn) = NULL;
 	PHASYNC_G(hooks_installed) = 0;
 	zend_hash_clean(&PHASYNC_G(hooked));
 	/* Always-on: the transport factories and function overrides go in at the

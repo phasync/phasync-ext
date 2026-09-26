@@ -12,11 +12,18 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
 2. **Transparent async I/O via `phasync\ext\manage()`** — run a closure with
    blocking I/O cooperatively yielding the current fiber instead of blocking the
    process, for the dynamic extent of that closure. It covers:
-   - `tcp://` / `unix://` sockets (incl. `fsockopen`, `stream_socket_client/server`)
+   - `tcp://` / `unix://` sockets (incl. `fsockopen`, `stream_socket_client/server`),
+     including `tcp://` connect + its DNS lookup, and `stream_socket_accept()`
    - `ssl://` / `tls://` sockets
-   - `proc_open()` pipes
+   - `stream_select()` and `socket_select()`
+   - `proc_open()` pipes and `proc_close()`; `popen()`/`pclose()`, `shell_exec()`
+     (and backticks), `exec()`, `system()`, `passthru()` — both the output pipe
+     and the wait for the child to exit
    - `sleep()`, `usleep()`, `time_nanosleep()`, `time_sleep_until()`
-   - `gethostbyname()` and `fopen()` (regular files + FIFO open, via a thread pool)
+   - DNS: `gethostbyname()`, `gethostbynamel()`, `gethostbyaddr()`,
+     `dns_get_record()`, `checkdnsrr()`/`dns_check_record()`, `getmxrr()`/`dns_get_mx()`
+     (via a thread pool)
+   - `fopen()` (regular files + FIFO open, via a thread pool)
 
    The extension performs the real I/O; on a would-block it invokes one of the
    handlers you pass to `manage()`, which decides how to wait (typically
@@ -104,8 +111,10 @@ function manage(
 ```
 
 The read/write handlers receive a real **PHP stream resource** — the socket/pipe
-being read, or, for thread-pool ops (`gethostbyname()`/file/FIFO), a wrapper
-around the worker's completion pipe — so they can be handed straight to
+being read, or, for thread-pool ops (DNS/file/FIFO), a wrapper around the
+worker's completion pipe, and for the wait for a child process (`pclose()`,
+`proc_close()`, the end of `exec()` & co.) a wrapper around a pidfd that turns
+readable when the child exits — so they can be handed straight to
 `phasync::readable()`/`writable()` (or a native `stream_select()`) and ride the
 event loop's single select. The handlers are responsible only for *waiting*; the
 extension performs the actual I/O afterwards. A handler called outside an event
@@ -136,7 +145,7 @@ one they run as the ordinary blocking call.
 
 Descriptor-backed streams are **wrapped as soon as they are created**: sockets
 from the tcp/unix/ssl transports (`stream_socket_client/server`, `fsockopen`),
-`stream_socket_pair()`, `proc_open()` pipes, `fopen()` of regular files/FIFOs, and
+`stream_socket_pair()`, `proc_open()` and `popen()` pipes, `fopen()` of regular files/FIFOs, and
 the fd-backed `php://` streams (`php://stdin|stdout|stderr`, `php://fd/N`). Streams
 that predate the hooks are swept up too — fds inherited across `ensure_loaded()`'s
 re-exec are wrapped at request start, and the `STDIN`/`STDOUT`/`STDERR` constants
