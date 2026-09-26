@@ -51,6 +51,7 @@ jobs:
           NO_INTERACTION: '1'
           REPORT_EXIT_STATUS: '1'
           PHASYNC_TEST_MYSQL: '127.0.0.1:3306:root:test'
+          TEST_PHP_ARGS: '--show-diff'
         run: make test TESTS=tests/
 
       - name: Dump failing test diffs
