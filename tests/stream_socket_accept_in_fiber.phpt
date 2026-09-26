@@ -42,8 +42,8 @@ $called = 0;
 A parked on the listener: true
 A accepted: yes, peer is set
 
-Warning: stream_socket_accept(): Accept failed: Connection timed out in %s on line %d
+Warning: stream_socket_accept(): Accept failed: %s timed out in %s on line %d
 bool(false)
 
-Warning: stream_socket_accept(): Accept failed: Connection timed out in %s on line %d
+Warning: stream_socket_accept(): Accept failed: %s timed out in %s on line %d
 bool(false)

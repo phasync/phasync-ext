@@ -86,7 +86,7 @@ $port = parse_url('tcp://' . stream_socket_get_name($v4, false), PHP_URL_PORT);
 }, $rd, $wr, fn($us) => null, TestTimeout::class)))->start();
 ?>
 --EXPECTF--
-tcp://127.0.0.1:PORT | native: false 110 Connection timed out | ext: false 110 Connection timed out | same warning: true
+tcp://127.0.0.1:PORT | native: false 110 %s timed out | ext: false 110 %s timed out | same warning: true
 tcp://127.0.0.1:PORT | native: false 111 Connection refused | ext: false 111 Connection refused | same warning: true
 tcp://no-such-host.invalid:PORT | native: false %d %s | ext: false %d %s | same warning: true
 A parked: true

@@ -6,6 +6,8 @@ phasync
 <?php
 if (!class_exists('Fiber')) die('skip requires Fibers');
 if (!function_exists('proc_open')) die('skip requires proc_open');
+// The body runs in a child PHP with the normal ini; skip if that has no ext/sockets.
+if (trim((string) shell_exec(escapeshellarg(PHP_BINARY) . ' -r "echo function_exists(\'socket_select\') ? 1 : 0;"')) !== '1') die('skip requires ext/sockets');
 ?>
 --FILE--
 <?php
@@ -14,7 +16,6 @@ if (!function_exists('proc_open')) die('skip requires proc_open');
 $child = tempnam(sys_get_temp_dir(), 'phasync_ss_') . '.php';
 file_put_contents($child, <<<'CHILD'
 <?php
-if (!function_exists('socket_select')) { echo "no sockets\nno sockets\n"; exit; }
 final class TestTimeout extends Exception {}
 socket_create_pair(AF_UNIX, SOCK_STREAM, 0, $p);
 $log = [];

@@ -39,13 +39,13 @@
 #include <errno.h>
 #include <math.h>
 #include <sys/epoll.h>
-#if __has_include("ext/sockets/php_sockets.h")
-# ifndef HAVE_SOCKETS
-#  define HAVE_SOCKETS 1   /* the header's body is guarded by it; only the struct is used */
-# endif
-# include "ext/sockets/php_sockets.h"
-# define PHASYNC_HAVE_SOCKETS 1
+#ifdef HAVE_ARPA_NAMESER_H
+# include <arpa/nameser.h>
 #endif
+#ifdef HAVE_RESOLV_H
+# include <resolv.h>
+#endif
+#include "ext/standard/php_dns.h"
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -57,7 +57,7 @@
 #include <arpa/inet.h>
 #include <limits.h>
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha12"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha13"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -105,6 +105,9 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_gethostbyname)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_gethostbynamel)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_gethostbyaddr)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_dns_check_record)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_dns_get_record)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_dns_get_mx)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_fopen)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_stream_socket_pair)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_stream_select)(INTERNAL_FUNCTION_PARAMETERS);
@@ -395,6 +398,7 @@ typedef enum {
 	PHASYNC_OP_GETHOSTBYNAME,
 	PHASYNC_OP_GETADDRINFO,
 	PHASYNC_OP_NAMEINFO,
+	PHASYNC_OP_DNSQUERY,
 	PHASYNC_OP_OPEN            /* blocking open() (FIFO rendezvous), own thread   */
 } phasync_op_type;
 
@@ -412,6 +416,7 @@ typedef struct phasync_task {
 	int          naddrs;
 	struct sockaddr_storage sa; /* NAMEINFO input                              */
 	socklen_t    salen;
+	int          qtype;       /* DNSQUERY: record type; buf/count = answer buffer */
 	struct addrinfo  hints;   /* GETADDRINFO input                             */
 	struct addrinfo *ai;      /* GETADDRINFO result (caller freeaddrinfo()s)   */
 	char         path[PATH_MAX]; /* OPEN: path (own copy, worker-stable)        */
@@ -431,6 +436,476 @@ static int             phasync_pool_stop;
 
 /* Run one task's blocking syscall (shared by pool workers, the FIFO-open
  * dedicated thread, and the inline fallback). Touches only fds/buffers. */
+#ifdef HAVE_FULL_DNS_FUNCS
+/* ---- DNS: dns_get_record() / dns_get_mx() / dns_check_record() ------------
+ *
+ * Portions of this section are derived from PHP's ext/standard/dns.c:
+ *   Copyright (c) The PHP Group and Contributors. SPDX-License-Identifier:
+ *   BSD-3-Clause. See LICENSE.php-src for the full license text.
+ * The parser and the functions' logic are kept as in PHP (identical from 8.2 to
+ * master); only the resolver query itself runs on the worker pool. */
+
+#ifndef DNS_T_A
+#define DNS_T_A		1
+#endif
+#ifndef DNS_T_NS
+#define DNS_T_NS	2
+#endif
+#ifndef DNS_T_CNAME
+#define DNS_T_CNAME	5
+#endif
+#ifndef DNS_T_SOA
+#define DNS_T_SOA	6
+#endif
+#ifndef DNS_T_PTR
+#define DNS_T_PTR	12
+#endif
+#ifndef DNS_T_HINFO
+#define DNS_T_HINFO	13
+#endif
+#ifndef DNS_T_MX
+#define DNS_T_MX	15
+#endif
+#ifndef DNS_T_TXT
+#define DNS_T_TXT	16
+#endif
+#ifndef DNS_T_AAAA
+#define DNS_T_AAAA	28
+#endif
+#ifndef DNS_T_SRV
+#define DNS_T_SRV	33
+#endif
+#ifndef DNS_T_NAPTR
+#define DNS_T_NAPTR	35
+#endif
+#ifndef DNS_T_A6
+#define DNS_T_A6	38
+#endif
+#ifndef DNS_T_CAA
+#define DNS_T_CAA	257
+#endif
+#ifndef DNS_T_ANY
+#define DNS_T_ANY	255
+#endif
+#ifndef HFIXEDSZ
+#define HFIXEDSZ	12
+#endif
+#ifndef QFIXEDSZ
+#define QFIXEDSZ	4
+#endif
+#define PHASYNC_DNS_MAXHOSTNAMELEN 1024
+
+typedef union {
+	HEADER qb1;
+	uint8_t qb2[65536];
+} phasync_querybuf;
+
+/* php_dns_free_handle() (php_dns.h) calls this dns.c helper under res_nsearch. */
+#if defined(__GLIBC__)
+#define php_dns_free_res(__res__) phasync_dns_free_res(__res__)
+static void phasync_dns_free_res(struct __res_state *res)
+{
+	int ns;
+	for (ns = 0; ns < MAXNS; ns++) {
+		if (res->_u._ext.nsaddrs[ns] != NULL) {
+			free(res->_u._ext.nsaddrs[ns]);
+			res->_u._ext.nsaddrs[ns] = NULL;
+		}
+	}
+}
+#else
+#define php_dns_free_res(__res__)
+#endif
+
+/* Runs on a worker thread: pure libc, no engine. */
+static void phasync_dns_query_worker(phasync_task *t)
+{
+#if defined(HAVE_RES_NSEARCH)
+	struct __res_state state;
+	struct __res_state *handle = &state;
+	memset(&state, 0, sizeof(state));
+	if (res_ninit(handle)) {
+		t->hostok = 0;
+		t->result = -1;
+		return;
+	}
+#else
+	void *handle = NULL;
+	res_init();
+#endif
+	t->hostok = 1;
+	t->result = php_dns_search(handle, t->host, C_IN, t->qtype, (u_char *) t->buf, (int) t->count);
+	t->err = php_dns_errno(handle);
+	php_dns_free_handle(handle);
+	(void) handle;
+}
+
+static void phasync_pool_run(phasync_task *t);
+
+/* The query on the pool (inline if there's no fiber to yield from). */
+static int phasync_dns_search(const char *host, int type, phasync_querybuf *answer, int *dns_errno, int *init_ok)
+{
+	phasync_task t;
+	memset(&t, 0, sizeof(t));
+	t.type  = PHASYNC_OP_DNSQUERY;
+	t.host  = host;
+	t.qtype = type;
+	t.buf   = (char *) answer->qb2;
+	t.count = sizeof(*answer);
+	phasync_pool_run(&t);
+	*dns_errno = t.err;
+	*init_ok = t.hostok;
+	return (int) t.result;
+}
+
+#define CHECKCP(n) do { \
+	if (cp + n > end) { \
+		return NULL; \
+	} \
+} while (0)
+
+static uint8_t *phasync_dns_parserr(uint8_t *cp, uint8_t *end, phasync_querybuf *answer, int type_to_fetch, int store, bool raw, zval *subarray)
+{
+	u_short type, class, dlen;
+	u_long ttl;
+	long n, i;
+	u_short s;
+	uint8_t *tp, *p;
+	char name[PHASYNC_DNS_MAXHOSTNAMELEN] = {0};
+	int have_v6_break = 0, in_v6_break = 0;
+
+	ZVAL_UNDEF(subarray);
+
+	n = dn_expand(answer->qb2, end, cp, name, sizeof(name) - 2);
+	if (n < 0) {
+		return NULL;
+	}
+	cp += n;
+
+	CHECKCP(10);
+	GETSHORT(type, cp);
+	GETSHORT(class, cp);
+	GETLONG(ttl, cp);
+	GETSHORT(dlen, cp);
+	CHECKCP(dlen);
+	if (dlen == 0) {
+		return NULL;
+	}
+	if (type_to_fetch != DNS_T_ANY && type != type_to_fetch) {
+		cp += dlen;
+		return cp;
+	}
+	if (!store) {
+		cp += dlen;
+		return cp;
+	}
+
+	array_init(subarray);
+	add_assoc_string(subarray, "host", name);
+	add_assoc_string(subarray, "class", "IN");
+	add_assoc_long(subarray, "ttl", ttl);
+	(void) class;
+
+	if (raw) {
+		add_assoc_long(subarray, "type", type);
+		add_assoc_stringl(subarray, "data", (char*) cp, (uint32_t) dlen);
+		cp += dlen;
+		return cp;
+	}
+
+	switch (type) {
+		case DNS_T_A:
+			CHECKCP(4);
+			add_assoc_string(subarray, "type", "A");
+			snprintf(name, sizeof(name), "%d.%d.%d.%d", cp[0], cp[1], cp[2], cp[3]);
+			add_assoc_string(subarray, "ip", name);
+			cp += dlen;
+			break;
+		case DNS_T_MX:
+			CHECKCP(2);
+			add_assoc_string(subarray, "type", "MX");
+			GETSHORT(n, cp);
+			add_assoc_long(subarray, "pri", n);
+			ZEND_FALLTHROUGH;
+		case DNS_T_CNAME:
+			if (type == DNS_T_CNAME) {
+				add_assoc_string(subarray, "type", "CNAME");
+			}
+			ZEND_FALLTHROUGH;
+		case DNS_T_NS:
+			if (type == DNS_T_NS) {
+				add_assoc_string(subarray, "type", "NS");
+			}
+			ZEND_FALLTHROUGH;
+		case DNS_T_PTR:
+			if (type == DNS_T_PTR) {
+				add_assoc_string(subarray, "type", "PTR");
+			}
+			n = dn_expand(answer->qb2, end, cp, name, (sizeof name) - 2);
+			if (n < 0) {
+				return NULL;
+			}
+			cp += n;
+			add_assoc_string(subarray, "target", name);
+			break;
+		case DNS_T_HINFO:
+			add_assoc_string(subarray, "type", "HINFO");
+			CHECKCP(1);
+			n = *cp & 0xFF;
+			cp++;
+			CHECKCP(n);
+			add_assoc_stringl(subarray, "cpu", (char*)cp, n);
+			cp += n;
+			CHECKCP(1);
+			n = *cp & 0xFF;
+			cp++;
+			CHECKCP(n);
+			add_assoc_stringl(subarray, "os", (char*)cp, n);
+			cp += n;
+			break;
+		case DNS_T_CAA:
+			add_assoc_string(subarray, "type", "CAA");
+			CHECKCP(1);
+			n = *cp & 0xFF;
+			add_assoc_long(subarray, "flags", n);
+			cp++;
+			CHECKCP(1);
+			n = *cp & 0xFF;
+			cp++;
+			CHECKCP(n);
+			add_assoc_stringl(subarray, "tag", (char*)cp, n);
+			cp += n;
+			if ( (size_t) dlen < ((size_t)n) + 2 ) {
+				return NULL;
+			}
+			n = dlen - n - 2;
+			CHECKCP(n);
+			add_assoc_stringl(subarray, "value", (char*)cp, n);
+			cp += n;
+			break;
+		case DNS_T_TXT:
+			{
+				int l1 = 0, l2 = 0;
+				zval entries;
+				zend_string *tps;
+
+				add_assoc_string(subarray, "type", "TXT");
+				tps = zend_string_alloc(dlen, 0);
+				array_init(&entries);
+				while (l1 < dlen) {
+					n = cp[l1];
+					if ((l1 + n) >= dlen) {
+						n = dlen - (l1 + 1);
+					}
+					if (n) {
+						memcpy(ZSTR_VAL(tps) + l2 , cp + l1 + 1, n);
+						add_next_index_stringl(&entries, (char *) cp + l1 + 1, n);
+					}
+					l1 = l1 + n + 1;
+					l2 = l2 + n;
+				}
+				ZSTR_VAL(tps)[l2] = '\0';
+				ZSTR_LEN(tps) = l2;
+				cp += dlen;
+				add_assoc_str(subarray, "txt", tps);
+				add_assoc_zval(subarray, "entries", &entries);
+			}
+			break;
+		case DNS_T_SOA:
+			add_assoc_string(subarray, "type", "SOA");
+			n = dn_expand(answer->qb2, end, cp, name, (sizeof name) -2);
+			if (n < 0) {
+				return NULL;
+			}
+			cp += n;
+			add_assoc_string(subarray, "mname", name);
+			n = dn_expand(answer->qb2, end, cp, name, (sizeof name) -2);
+			if (n < 0) {
+				return NULL;
+			}
+			cp += n;
+			add_assoc_string(subarray, "rname", name);
+			CHECKCP(5*4);
+			GETLONG(n, cp);
+			add_assoc_long(subarray, "serial", n);
+			GETLONG(n, cp);
+			add_assoc_long(subarray, "refresh", n);
+			GETLONG(n, cp);
+			add_assoc_long(subarray, "retry", n);
+			GETLONG(n, cp);
+			add_assoc_long(subarray, "expire", n);
+			GETLONG(n, cp);
+			add_assoc_long(subarray, "minimum-ttl", n);
+			break;
+		case DNS_T_AAAA:
+			tp = (uint8_t*)name;
+			CHECKCP(8*2);
+			for(i=0; i < 8; i++) {
+				GETSHORT(s, cp);
+				if (s != 0) {
+					if (tp > (uint8_t *)name) {
+						in_v6_break = 0;
+						tp[0] = ':';
+						tp++;
+					}
+					tp += snprintf((char*)tp, sizeof(name) - (tp - (uint8_t *) name), "%x", s);
+				} else {
+					if (!have_v6_break) {
+						have_v6_break = 1;
+						in_v6_break = 1;
+						tp[0] = ':';
+						tp++;
+					} else if (!in_v6_break) {
+						tp[0] = ':';
+						tp++;
+						tp[0] = '0';
+						tp++;
+					}
+				}
+			}
+			if (have_v6_break && in_v6_break) {
+				tp[0] = ':';
+				tp++;
+			}
+			tp[0] = '\0';
+			add_assoc_string(subarray, "type", "AAAA");
+			add_assoc_string(subarray, "ipv6", name);
+			break;
+		case DNS_T_A6:
+			p = cp;
+			add_assoc_string(subarray, "type", "A6");
+			CHECKCP(1);
+			n = ((int)cp[0]) & 0xFF;
+			cp++;
+			add_assoc_long(subarray, "masklen", n);
+			tp = (uint8_t*)name;
+			if (n > 15) {
+				have_v6_break = 1;
+				in_v6_break = 1;
+				tp[0] = ':';
+				tp++;
+			}
+			if (n % 16 > 8) {
+				if (cp[0] != 0) {
+					if (tp > (uint8_t *)name) {
+						in_v6_break = 0;
+						tp[0] = ':';
+						tp++;
+					}
+					snprintf((char*)tp, sizeof(name) - (tp - (uint8_t *) name), "%x", cp[0] & 0xFF);
+				} else {
+					if (!have_v6_break) {
+						have_v6_break = 1;
+						in_v6_break = 1;
+						tp[0] = ':';
+						tp++;
+					} else if (!in_v6_break) {
+						tp[0] = ':';
+						tp++;
+						tp[0] = '0';
+						tp++;
+					}
+				}
+				cp++;
+			}
+			for (i = (n + 8) / 16; i < 8; i++) {
+				CHECKCP(2);
+				GETSHORT(s, cp);
+				if (s != 0) {
+					if (tp > (uint8_t *)name) {
+						in_v6_break = 0;
+						tp[0] = ':';
+						tp++;
+					}
+					tp += snprintf((char*)tp, sizeof(name) - (tp - (uint8_t *) name),"%x",s);
+				} else {
+					if (!have_v6_break) {
+						have_v6_break = 1;
+						in_v6_break = 1;
+						tp[0] = ':';
+						tp++;
+					} else if (!in_v6_break) {
+						tp[0] = ':';
+						tp++;
+						tp[0] = '0';
+						tp++;
+					}
+				}
+			}
+			if (have_v6_break && in_v6_break) {
+				tp[0] = ':';
+				tp++;
+			}
+			tp[0] = '\0';
+			add_assoc_string(subarray, "ipv6", name);
+			if (cp < p + dlen) {
+				n = dn_expand(answer->qb2, end, cp, name, (sizeof name) - 2);
+				if (n < 0) {
+					return NULL;
+				}
+				cp += n;
+				add_assoc_string(subarray, "chain", name);
+			}
+			break;
+		case DNS_T_SRV:
+			CHECKCP(3*2);
+			add_assoc_string(subarray, "type", "SRV");
+			GETSHORT(n, cp);
+			add_assoc_long(subarray, "pri", n);
+			GETSHORT(n, cp);
+			add_assoc_long(subarray, "weight", n);
+			GETSHORT(n, cp);
+			add_assoc_long(subarray, "port", n);
+			n = dn_expand(answer->qb2, end, cp, name, (sizeof name) - 2);
+			if (n < 0) {
+				return NULL;
+			}
+			cp += n;
+			add_assoc_string(subarray, "target", name);
+			break;
+		case DNS_T_NAPTR:
+			CHECKCP(2*2);
+			add_assoc_string(subarray, "type", "NAPTR");
+			GETSHORT(n, cp);
+			add_assoc_long(subarray, "order", n);
+			GETSHORT(n, cp);
+			add_assoc_long(subarray, "pref", n);
+			CHECKCP(1);
+			n = (cp[0] & 0xFF);
+			cp++;
+			CHECKCP(n);
+			add_assoc_stringl(subarray, "flags", (char*)cp, n);
+			cp += n;
+			CHECKCP(1);
+			n = (cp[0] & 0xFF);
+			cp++;
+			CHECKCP(n);
+			add_assoc_stringl(subarray, "services", (char*)cp, n);
+			cp += n;
+			CHECKCP(1);
+			n = (cp[0] & 0xFF);
+			cp++;
+			CHECKCP(n);
+			add_assoc_stringl(subarray, "regex", (char*)cp, n);
+			cp += n;
+			n = dn_expand(answer->qb2, end, cp, name, (sizeof name) - 2);
+			if (n < 0) {
+				return NULL;
+			}
+			cp += n;
+			add_assoc_string(subarray, "replacement", name);
+			break;
+		default:
+			zval_ptr_dtor(subarray);
+			ZVAL_UNDEF(subarray);
+			cp += dlen;
+			break;
+	}
+	return cp;
+}
+#undef CHECKCP
+#endif /* HAVE_FULL_DNS_FUNCS */
+
 static void phasync_task_exec(phasync_task *t)
 {
 	switch (t->type) {
@@ -472,6 +947,14 @@ static void phasync_task_exec(phasync_task *t)
 			if (buf && buf != stackbuf) free(buf);
 			break;
 		}
+#ifdef HAVE_FULL_DNS_FUNCS
+		case PHASYNC_OP_DNSQUERY:
+			/* Exactly the resolver calls native makes (php_dns.h picks them from how
+			 * PHP was built): result in t->result, php_dns_errno() in t->err,
+			 * t->hostok = 0 if the resolver state could not even be initialised. */
+			phasync_dns_query_worker(t);
+			break;
+#endif
 		case PHASYNC_OP_NAMEINFO:
 			t->hostok = getnameinfo((struct sockaddr *) &t->sa, t->salen, t->hostresult,
 				sizeof(t->hostresult), NULL, 0, NI_NAMEREQD) == 0;
@@ -1680,6 +2163,319 @@ static ZEND_NAMED_FUNCTION(phasync_gethostbynamel_override)
 	}
 }
 
+#ifdef HAVE_FULL_DNS_FUNCS
+/* dns_check_record() / checkdnsrr() — logic as PHP's (see the DNS section's
+ * notice); the query runs on the pool. Argument errors go to the original so
+ * their (version-specific) messages stay exact. */
+static ZEND_NAMED_FUNCTION(phasync_dns_check_record_override)
+{
+	phasync_querybuf *answer;
+	char *hostname;
+	size_t hostname_len;
+	zend_string *rectype = NULL;
+	int type = DNS_T_MX, i, dns_errno, init_ok;
+
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+		PHASYNC_G(orig_dns_check_record)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	ZEND_PARSE_PARAMETERS_START(1, 2)
+		Z_PARAM_PATH(hostname, hostname_len)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_STR(rectype)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (rectype) {
+		if (zend_string_equals_literal_ci(rectype, "A")) type = DNS_T_A;
+		else if (zend_string_equals_literal_ci(rectype, "NS")) type = DNS_T_NS;
+		else if (zend_string_equals_literal_ci(rectype, "MX")) type = DNS_T_MX;
+		else if (zend_string_equals_literal_ci(rectype, "PTR")) type = DNS_T_PTR;
+		else if (zend_string_equals_literal_ci(rectype, "ANY")) type = DNS_T_ANY;
+		else if (zend_string_equals_literal_ci(rectype, "SOA")) type = DNS_T_SOA;
+		else if (zend_string_equals_literal_ci(rectype, "CAA")) type = DNS_T_CAA;
+		else if (zend_string_equals_literal_ci(rectype, "TXT")) type = DNS_T_TXT;
+		else if (zend_string_equals_literal_ci(rectype, "CNAME")) type = DNS_T_CNAME;
+		else if (zend_string_equals_literal_ci(rectype, "AAAA")) type = DNS_T_AAAA;
+		else if (zend_string_equals_literal_ci(rectype, "SRV")) type = DNS_T_SRV;
+		else if (zend_string_equals_literal_ci(rectype, "NAPTR")) type = DNS_T_NAPTR;
+		else if (zend_string_equals_literal_ci(rectype, "A6")) type = DNS_T_A6;
+		else type = -1;
+	}
+	if (hostname_len == 0 || type == -1) {
+		PHASYNC_G(orig_dns_check_record)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+
+	answer = ecalloc(1, sizeof(*answer));
+	i = phasync_dns_search(hostname, type, answer, &dns_errno, &init_ok);
+	if (EG(exception) || !init_ok || i < 0) {
+		efree(answer);
+		if (!EG(exception)) {
+			RETVAL_FALSE;
+		}
+		return;
+	}
+	RETVAL_BOOL(ntohs(((HEADER *) answer)->ancount) != 0);
+	efree(answer);
+}
+
+/* dns_get_record() — logic as PHP's; each per-type query runs on the pool. */
+static ZEND_NAMED_FUNCTION(phasync_dns_get_record_override)
+{
+	char *hostname;
+	size_t hostname_len;
+	zend_long type_param = PHP_DNS_ANY;
+	zval *authns = NULL, *addtl = NULL;
+	int type_to_fetch;
+	int dns_errno, init_ok;
+	HEADER *hp;
+	phasync_querybuf *answer;
+	uint8_t *cp = NULL, *end = NULL;
+	int n, qd, an, ns = 0, ar = 0;
+	int type, first_query = 1, store_results = 1;
+	bool raw = 0;
+
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+		PHASYNC_G(orig_dns_get_record)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	ZEND_PARSE_PARAMETERS_START(1, 5)
+		Z_PARAM_PATH(hostname, hostname_len)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_LONG(type_param)
+		Z_PARAM_ZVAL(authns)
+		Z_PARAM_ZVAL(addtl)
+		Z_PARAM_BOOL(raw)
+	ZEND_PARSE_PARAMETERS_END();
+
+	/* Invalid types are rejected by the original, with its own message. */
+	if ((!raw && (type_param & ~PHP_DNS_ALL) && type_param != PHP_DNS_ANY)
+	 || (raw && (type_param < 1 || type_param > 0xFFFF))) {
+		PHASYNC_G(orig_dns_get_record)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	if (authns) {
+		authns = zend_try_array_init(authns);
+		if (!authns) {
+			RETURN_THROWS();
+		}
+	}
+	if (addtl) {
+		addtl = zend_try_array_init(addtl);
+		if (!addtl) {
+			RETURN_THROWS();
+		}
+	}
+
+	array_init(return_value);
+	answer = emalloc(sizeof(*answer));
+
+	if (raw) {
+		type = -1;
+	} else if (type_param == PHP_DNS_ANY) {
+		type = PHP_DNS_NUM_TYPES + 1;
+	} else {
+		type = 0;
+	}
+
+	for ( ;
+		type < (addtl ? (PHP_DNS_NUM_TYPES + 2) : PHP_DNS_NUM_TYPES) || first_query;
+		type++
+	) {
+		first_query = 0;
+		switch (type) {
+			case -1:
+				type_to_fetch = type_param;
+				type = PHP_DNS_NUM_TYPES - 1;
+				break;
+			case 0:  type_to_fetch = type_param&PHP_DNS_A     ? DNS_T_A     : 0; break;
+			case 1:  type_to_fetch = type_param&PHP_DNS_NS    ? DNS_T_NS    : 0; break;
+			case 2:  type_to_fetch = type_param&PHP_DNS_CNAME ? DNS_T_CNAME : 0; break;
+			case 3:  type_to_fetch = type_param&PHP_DNS_SOA   ? DNS_T_SOA   : 0; break;
+			case 4:  type_to_fetch = type_param&PHP_DNS_PTR   ? DNS_T_PTR   : 0; break;
+			case 5:  type_to_fetch = type_param&PHP_DNS_HINFO ? DNS_T_HINFO : 0; break;
+			case 6:  type_to_fetch = type_param&PHP_DNS_MX    ? DNS_T_MX    : 0; break;
+			case 7:  type_to_fetch = type_param&PHP_DNS_TXT   ? DNS_T_TXT   : 0; break;
+			case 8:  type_to_fetch = type_param&PHP_DNS_AAAA  ? DNS_T_AAAA  : 0; break;
+			case 9:  type_to_fetch = type_param&PHP_DNS_SRV   ? DNS_T_SRV   : 0; break;
+			case 10: type_to_fetch = type_param&PHP_DNS_NAPTR ? DNS_T_NAPTR : 0; break;
+			case 11: type_to_fetch = type_param&PHP_DNS_A6    ? DNS_T_A6    : 0; break;
+			case 12: type_to_fetch = type_param&PHP_DNS_CAA   ? DNS_T_CAA   : 0; break;
+			case PHP_DNS_NUM_TYPES:
+				store_results = 0;
+				continue;
+			default:
+			case (PHP_DNS_NUM_TYPES + 1):
+				type_to_fetch = DNS_T_ANY;
+				break;
+		}
+
+		if (type_to_fetch) {
+			memset(answer, 0, sizeof(*answer));
+			n = phasync_dns_search(hostname, type_to_fetch, answer, &dns_errno, &init_ok);
+			if (EG(exception)) {
+				efree(answer);
+				return;
+			}
+			if (!init_ok) {
+				efree(answer);
+				zend_array_destroy(Z_ARR_P(return_value));
+				RETURN_FALSE;
+			}
+			if (n < 0) {
+				switch (dns_errno) {
+					case NO_DATA:
+					case HOST_NOT_FOUND:
+						continue;
+					case NO_RECOVERY:
+						php_error_docref(NULL, E_WARNING, "An unexpected server failure occurred.");
+						break;
+					case TRY_AGAIN:
+						php_error_docref(NULL, E_WARNING, "A temporary server error occurred.");
+						break;
+					default:
+						php_error_docref(NULL, E_WARNING, "DNS Query failed");
+				}
+				efree(answer);
+				zend_array_destroy(Z_ARR_P(return_value));
+				RETURN_FALSE;
+			}
+
+			cp = answer->qb2 + HFIXEDSZ;
+			end = answer->qb2 + n;
+			hp = (HEADER *) answer;
+			qd = ntohs(hp->qdcount);
+			an = ntohs(hp->ancount);
+			ns = ntohs(hp->nscount);
+			ar = ntohs(hp->arcount);
+
+			while (qd-- > 0) {
+				n = dn_skipname(cp, end);
+				if (n < 0) {
+					php_error_docref(NULL, E_WARNING, "Unable to parse DNS data received");
+					efree(answer);
+					zend_array_destroy(Z_ARR_P(return_value));
+					RETURN_FALSE;
+				}
+				cp += n + QFIXEDSZ;
+			}
+
+			while (an-- && cp && cp < end) {
+				zval retval;
+				cp = phasync_dns_parserr(cp, end, answer, type_to_fetch, store_results, raw, &retval);
+				if (Z_TYPE(retval) != IS_UNDEF && store_results) {
+					add_next_index_zval(return_value, &retval);
+				}
+			}
+
+			if (authns || addtl) {
+				while (ns-- > 0 && cp && cp < end) {
+					zval retval;
+					cp = phasync_dns_parserr(cp, end, answer, DNS_T_ANY, authns != NULL, raw, &retval);
+					if (Z_TYPE(retval) != IS_UNDEF) {
+						add_next_index_zval(authns, &retval);
+					}
+				}
+			}
+
+			if (addtl) {
+				while (ar-- > 0 && cp && cp < end) {
+					zval retval;
+					cp = phasync_dns_parserr(cp, end, answer, DNS_T_ANY, 1, raw, &retval);
+					if (Z_TYPE(retval) != IS_UNDEF) {
+						add_next_index_zval(addtl, &retval);
+					}
+				}
+			}
+		}
+	}
+	efree(answer);
+}
+
+/* dns_get_mx() / getmxrr() — logic as PHP's; the query runs on the pool. */
+static ZEND_NAMED_FUNCTION(phasync_dns_get_mx_override)
+{
+	char *hostname;
+	size_t hostname_len;
+	zval *mx_list, *weight_list = NULL;
+	int count, qdc, dns_errno, init_ok;
+	u_short type, weight;
+	phasync_querybuf *answer;
+	char buf[PHASYNC_DNS_MAXHOSTNAMELEN] = {0};
+	HEADER *hp;
+	uint8_t *cp, *end;
+	int i;
+
+	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+		PHASYNC_G(orig_dns_get_mx)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	ZEND_PARSE_PARAMETERS_START(2, 3)
+		Z_PARAM_PATH(hostname, hostname_len)
+		Z_PARAM_ZVAL(mx_list)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_ZVAL(weight_list)
+	ZEND_PARSE_PARAMETERS_END();
+
+	mx_list = zend_try_array_init(mx_list);
+	if (!mx_list) {
+		RETURN_THROWS();
+	}
+	if (weight_list) {
+		weight_list = zend_try_array_init(weight_list);
+		if (!weight_list) {
+			RETURN_THROWS();
+		}
+	}
+
+	answer = ecalloc(1, sizeof(*answer));
+	i = phasync_dns_search(hostname, DNS_T_MX, answer, &dns_errno, &init_ok);
+	if (EG(exception) || !init_ok || i < 0) {
+		efree(answer);
+		if (!EG(exception)) {
+			RETVAL_FALSE;
+		}
+		return;
+	}
+	hp = (HEADER *) answer;
+	cp = answer->qb2 + HFIXEDSZ;
+	end = answer->qb2 + i;
+	for (qdc = ntohs((unsigned short)hp->qdcount); qdc--; cp += i + QFIXEDSZ) {
+		if ((i = dn_skipname(cp, end)) < 0 ) {
+			efree(answer);
+			RETURN_FALSE;
+		}
+	}
+	count = ntohs((unsigned short)hp->ancount);
+	while (--count >= 0 && cp < end) {
+		if ((i = dn_skipname(cp, end)) < 0 ) {
+			efree(answer);
+			RETURN_FALSE;
+		}
+		cp += i;
+		GETSHORT(type, cp);
+		cp += INT16SZ + INT32SZ;
+		GETSHORT(i, cp);
+		if (type != DNS_T_MX) {
+			cp += i;
+			continue;
+		}
+		GETSHORT(weight, cp);
+		if ((i = dn_expand(answer->qb2, end, cp, buf, sizeof(buf)-1)) < 0) {
+			efree(answer);
+			RETURN_FALSE;
+		}
+		cp += i;
+		add_next_index_string(mx_list, buf);
+		if (weight_list) {
+			add_next_index_long(weight_list, weight);
+		}
+	}
+	efree(answer);
+	RETURN_BOOL(zend_hash_num_elements(Z_ARRVAL_P(mx_list)) != 0);
+}
+#endif /* HAVE_FULL_DNS_FUNCS */
+
 /* gethostbyaddr(): the reverse lookup (getnameinfo, NI_NAMEREQD) on the pool. */
 static ZEND_NAMED_FUNCTION(phasync_gethostbyaddr_override)
 {
@@ -1886,17 +2682,32 @@ static php_socket_t phasync_select_fd_stream(zval *elem)
 	return fd;
 }
 
-#ifdef PHASYNC_HAVE_SOCKETS
+/* ext/sockets' php_socket, mirrored here so socket_select() support doesn't depend
+ * on its header, which PHP builds (e.g. the official Docker images) often don't
+ * install. The layout is identical from PHP 8.2 to master. */
+typedef struct {
+	int         bsd_socket;
+	int         type;
+	int         error;
+	int         blocking;
+	zval        zstream;
+	zend_object std;
+} phasync_php_socket;
+
 static php_socket_t phasync_select_fd_socket(zval *elem)
 {
+	struct stat st;
+	int fd;
+
 	ZVAL_DEREF(elem);
 	/* Matched by name rather than socket_ce, so ext/sockets stays optional. */
 	if (Z_TYPE_P(elem) != IS_OBJECT || !zend_string_equals_literal(Z_OBJCE_P(elem)->name, "Socket")) {
 		return -1;
 	}
-	return Z_SOCKET_P(elem)->bsd_socket;
+	fd = ((phasync_php_socket *) ((char *) Z_OBJ_P(elem) - XtOffsetOf(phasync_php_socket, std)))->bsd_socket;
+	/* Safety net should a future layout differ: only ever use a real socket fd. */
+	return (fd >= 0 && fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode)) ? fd : -1;
 }
-#endif
 
 /* An epoll fd watching every descriptor in the three sets (read/write/except),
  * or -1 if none could be registered. */
@@ -2067,13 +2878,11 @@ static ZEND_NAMED_FUNCTION(phasync_stream_select_override)
 		PHASYNC_G(orig_stream_select), phasync_select_fd_stream);
 }
 
-#ifdef PHASYNC_HAVE_SOCKETS
 static ZEND_NAMED_FUNCTION(phasync_socket_select_override)
 {
 	phasync_select_common(INTERNAL_FUNCTION_PARAM_PASSTHRU, "socket_select",
 		PHASYNC_G(orig_socket_select), phasync_select_fd_socket);
 }
-#endif
 
 /* ---- enable_hooks / disable_hooks ---------------------------------------- */
 
@@ -2128,12 +2937,10 @@ static void phasync_install_hooks(void)
 		PHASYNC_G(orig_stream_select) = f->handler;
 		f->handler = phasync_stream_select_override;
 	}
-#ifdef PHASYNC_HAVE_SOCKETS
 	if ((f = phasync_find_ifunc("socket_select", sizeof("socket_select") - 1))) {
 		PHASYNC_G(orig_socket_select) = f->handler;
 		f->handler = phasync_socket_select_override;
 	}
-#endif
 	if ((f = phasync_find_ifunc("sleep", sizeof("sleep") - 1))) {
 		PHASYNC_G(orig_sleep) = f->handler;
 		f->handler = phasync_sleep_override;
@@ -2162,6 +2969,25 @@ static void phasync_install_hooks(void)
 		PHASYNC_G(orig_gethostbyaddr) = f->handler;
 		f->handler = phasync_gethostbyaddr_override;
 	}
+#ifdef HAVE_FULL_DNS_FUNCS
+	{
+		/* checkdnsrr/getmxrr are separate function-table entries (aliases). */
+		static const struct { const char *name; int which; } dnsfns[] = {
+			{ "dns_check_record", 0 }, { "checkdnsrr", 0 },
+			{ "dns_get_record", 1 },
+			{ "dns_get_mx", 2 }, { "getmxrr", 2 },
+		};
+		for (size_t k = 0; k < sizeof(dnsfns) / sizeof(dnsfns[0]); k++) {
+			if ((f = phasync_find_ifunc(dnsfns[k].name, strlen(dnsfns[k].name)))) {
+				switch (dnsfns[k].which) {
+					case 0: PHASYNC_G(orig_dns_check_record) = f->handler; f->handler = phasync_dns_check_record_override; break;
+					case 1: PHASYNC_G(orig_dns_get_record)   = f->handler; f->handler = phasync_dns_get_record_override;   break;
+					case 2: PHASYNC_G(orig_dns_get_mx)       = f->handler; f->handler = phasync_dns_get_mx_override;       break;
+				}
+			}
+		}
+	}
+#endif
 	if ((f = phasync_find_ifunc("fopen", sizeof("fopen") - 1))) {
 		PHASYNC_G(orig_fopen) = f->handler;
 		f->handler = phasync_fopen_override;
@@ -2197,11 +3023,9 @@ static void phasync_restore_hooks(void)
 	if (PHASYNC_G(orig_stream_select) && (f = phasync_find_ifunc("stream_select", sizeof("stream_select") - 1))) {
 		f->handler = PHASYNC_G(orig_stream_select);
 	}
-#ifdef PHASYNC_HAVE_SOCKETS
 	if (PHASYNC_G(orig_socket_select) && (f = phasync_find_ifunc("socket_select", sizeof("socket_select") - 1))) {
 		f->handler = PHASYNC_G(orig_socket_select);
 	}
-#endif
 	if (PHASYNC_G(orig_sleep) && (f = phasync_find_ifunc("sleep", sizeof("sleep") - 1))) {
 		f->handler = PHASYNC_G(orig_sleep);
 	}
@@ -2223,6 +3047,18 @@ static void phasync_restore_hooks(void)
 	if (PHASYNC_G(orig_gethostbyaddr) && (f = phasync_find_ifunc("gethostbyaddr", sizeof("gethostbyaddr") - 1))) {
 		f->handler = PHASYNC_G(orig_gethostbyaddr);
 	}
+#ifdef HAVE_FULL_DNS_FUNCS
+	{
+		static const char *names[] = { "dns_check_record", "checkdnsrr", "dns_get_record", "dns_get_mx", "getmxrr" };
+		for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
+			if ((f = phasync_find_ifunc(names[k], strlen(names[k])))) {
+				if (k < 2 && PHASYNC_G(orig_dns_check_record)) f->handler = PHASYNC_G(orig_dns_check_record);
+				else if (k == 2 && PHASYNC_G(orig_dns_get_record)) f->handler = PHASYNC_G(orig_dns_get_record);
+				else if (k > 2 && PHASYNC_G(orig_dns_get_mx)) f->handler = PHASYNC_G(orig_dns_get_mx);
+			}
+		}
+	}
+#endif
 	if (PHASYNC_G(orig_fopen) && (f = phasync_find_ifunc("fopen", sizeof("fopen") - 1))) {
 		f->handler = PHASYNC_G(orig_fopen);
 	}
