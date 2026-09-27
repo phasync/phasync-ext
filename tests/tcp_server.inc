@@ -1,17 +1,17 @@
 <?php
 // Frame helpers shared by the tcp_server tests.
 function frame(string $type, int $id, string $payload = ''): string {
-    return $type . pack('VV', $id, strlen($payload)) . $payload;
+    return $type . pack('PV', $id, strlen($payload)) . $payload;
 }
 /** Parse a buffer that must hold only whole frames. */
 function parse(string $buf): array {
     $out = []; $o = 0;
     while ($o < strlen($buf)) {
-        if (strlen($buf) - $o < 9) throw new Exception('partial header');
-        $h = unpack('atype/Vid/Vlen', $buf, $o);
-        if (strlen($buf) - $o - 9 < $h['len']) throw new Exception('partial payload');
-        $out[] = [$h['type'], $h['id'], substr($buf, $o + 9, $h['len'])];
-        $o += 9 + $h['len'];
+        if (strlen($buf) - $o < 13) throw new Exception('partial header');
+        $h = unpack('atype/Pid/Vlen', $buf, $o);
+        if (strlen($buf) - $o - 13 < $h['len']) throw new Exception('partial payload');
+        $out[] = [$h['type'], $h['id'], substr($buf, $o + 13, $h['len'])];
+        $o += 13 + $h['len'];
     }
     return $out;
 }

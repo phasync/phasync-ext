@@ -237,33 +237,36 @@ stream_set_blocking($fp, false);
 ```
 
 Everything goes through `$fp`: select on it, read frames from it, write frames to
-it, `fclose()` it to close the server and every connection. Each frame is a 9-byte
-header, `type:u8 id:u32 len:u32` little-endian (`unpack('Ctype/Vid/Vlen', $buf,
-$offset)`), then `len` bytes of payload.
+it, `fclose()` it to close the server and every connection. Each frame is a
+13-byte header, `type:u8 id:u64 len:u32` little-endian (`unpack('atype/Pid/Vlen',
+$buf, $offset)`), then `len` bytes of payload.
 
 | Direction | Type | Payload | Meaning |
 |---|---|---|---|
-| server → PHP | `C` | `"peer local"` (as `stream_socket_get_name()`) | New connection |
+| server → PHP | `C` | `"peer\0local"`, each as `stream_socket_get_name()` (`1.2.3.4:5`, `[::1]:5`) | New connection |
 | | `D` | bytes (≤ `read_chunk`) | Data from the client |
 | | `E` | — | The client finished sending; we can still write |
 | | `W` | — | Output buffered past `high_water` has drained |
 | | `X` | errno `u32` (0 = clean) | The connection is gone; always its last frame |
+| | `F` | errno `u32`: 0 = `max_connections`, else e.g. `EMFILE` | (id 0) Accepting stopped; new connections wait in the backlog |
+| | `A` | — | (id 0) Accepting again |
 | PHP → server | `D` | bytes | Send data |
 | | `E` | — | Shut down our sending side |
 | | `X` | — | Flush, then close; answered by an `X` frame |
 | | `P` / `R` | — | Pause / resume reading this connection |
+| | `A` | — | (id 0) Try accepting again (after `F` for `EMFILE`, once fds are freed) |
 
 ```php
 while (true) {
     phasync::readable($fp);                 // or stream_select() on [$fp]
-    $buf = fread($fp, 65536);               // whole frames only
-    for ($o = 0; $o < strlen($buf); $o += 9 + $h['len']) {
-        $h = unpack('atype/Vid/Vlen', $buf, $o);
-        $payload = substr($buf, $o + 9, $h['len']);
+    $buf = fread($fp, 65536);               // whole frames only; '' = nothing to report
+    for ($o = 0; $o < strlen($buf); $o += 13 + $h['len']) {
+        $h = unpack('atype/Pid/Vlen', $buf, $o);
+        $payload = substr($buf, $o + 13, $h['len']);
         switch ($h['type']) {
-            case 'C': $peers[$h['id']] = explode(' ', $payload)[0]; break;
-            case 'D': fwrite($fp, 'D' . pack('VV', $h['id'], strlen($payload)) . $payload); break;  // echo
-            case 'E': fwrite($fp, 'X' . pack('VV', $h['id'], 0)); break;                           // close
+            case 'C': $peers[$h['id']] = explode("\0", $payload)[0]; break;
+            case 'D': fwrite($fp, 'D' . pack('PV', $h['id'], strlen($payload)) . $payload); break;  // echo
+            case 'E': fwrite($fp, 'X' . pack('PV', $h['id'], 0)); break;                           // close
             case 'X': unset($peers[$h['id']]); break;
         }
     }
@@ -274,22 +277,37 @@ while (true) {
   or a client has an event. `fread()` collects those events without blocking;
   `fwrite()` parses the frames and writes to the sockets, buffering what a client
   can't take yet. An eventfd keeps `$fp` readable while frames are queued.
-- **Whole frames.** A read returns only complete frames, unless a single frame is
-  bigger than the read length (then it comes in parts). Frames may be written in
-  any pieces.
+- **Reads.** A read returns only complete frames, unless a single frame is bigger
+  than the read length (then it comes in parts). A non-blocking read returns `''`
+  when there is nothing to report, such as a wake-up that only flushed output;
+  only `feof()` means closed, and it stays false while the server lives. Frames
+  may be written in any pieces.
+- **Fairness.** A new batch of events is collected only once PHP has read the
+  last one, and each reported connection moves behind the others, so every ready
+  connection gets a turn before any gets a second.
 - **Backpressure.** Clients are only read while PHP reads `$fp`. Writes always
   take the whole buffer; a connection whose buffered output passes `high_water`
   gets a `W` frame once it has drained.
-- **Lifecycle.** Connection ids are never reused, and every connection ends with
-  exactly one `X`. When both sides have finished sending (`E` both ways) the
-  connection closes by itself. Frames for a connection that is gone are dropped;
-  an unknown frame type makes `fwrite()` warn and return false.
+- **Pause.** `P` leaves a client's data unread in the socket until `R`, which
+  then delivers it. A paused client leaving is still reported: `X` at once on a
+  reset, `E` at once if nothing is unread, otherwise `E` after that data once
+  resumed.
+- **Full.** At `max_connections`, or when `accept()` fails for lack of resources,
+  accepting stops with `F` (so an application can close idle connections to make
+  room); it resumes with `A` when a connection closes, or when PHP sends `A`.
+- **Lifecycle.** Connection ids (64-bit) are never reused, and every connection
+  ends with exactly one `X`. When both sides have finished sending (`E` both
+  ways) the connection closes by itself. Frames for a connection that is gone
+  are dropped; an unknown frame type makes `fwrite()` warn and return false.
+- **fork().** The stream belongs to the process that created it (its epoll fd is
+  shared after `fork()`): create the server after forking. Reads and writes in
+  another process warn and fail; `fclose()` there leaves the parent's server alone.
 - **Blocking mode** (the default): a read with nothing to return waits, inside
   `manage()` in a fiber through the read handler. `stream_socket_get_name($fp)`
   gives the listening address (useful with port 0).
 - **Options:** `backlog` (4096, capped by the kernel), `reuseport` (false),
-  `nodelay` (false), `max_connections` (0 = no limit; accepting pauses at the
-  limit), `read_chunk` (16384), `high_water` (1048576).
+  `nodelay` (false), `max_connections` (0 = no limit), `read_chunk` (16384),
+  `high_water` (1048576).
 
 ## Status
 

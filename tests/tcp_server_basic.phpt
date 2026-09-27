@@ -14,7 +14,7 @@ var_dump((bool) preg_match('/^127\.0\.0\.1:\d+$/', $name), stream_socket_get_nam
 // C carries "peer local"; D both ways.
 $a = stream_socket_client("tcp://$name");
 [[$t, $id, $p]] = collect($fp, has('C'));
-var_dump($t, $id, $p === stream_socket_get_name($a, false) . ' ' . $name);
+var_dump($t, $id, $p === stream_socket_get_name($a, false) . "\0" . $name);
 fwrite($a, 'hello');
 show(collect($fp, has('D')));
 fwrite($fp, frame('D', 1, 'world'));
@@ -67,7 +67,7 @@ bool(true)
 X 1 "\u0000\u0000\u0000\u0000"
 bye
 X 2 "\u0000\u0000\u0000\u0000"
-int(22)
+int(30)
 %AWarning: fwrite(): Invalid frame type 0x51 in %s on line %d
 bool(false)
 string(0) ""

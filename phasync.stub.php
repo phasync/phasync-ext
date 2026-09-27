@@ -63,30 +63,44 @@ function manage(\Closure $code, \Closure $readHandler, \Closure $writeHandler, \
 /**
  * A TCP server multiplexed into one stream. The extension accepts connections,
  * reads and writes the client sockets, and reports everything as frames on the
- * returned stream: a 9-byte header, type:u8 id:u32 len:u32 (little-endian,
- * unpack('Ctype/Vid/Vlen')), then len bytes of payload.
+ * returned stream: a 13-byte header, type:u8 id:u64 len:u32 (little-endian,
+ * unpack('atype/Pid/Vlen')), then len bytes of payload.
  *
  * Read from the stream (server -> PHP):
- *   C  new connection; payload "peer local", both as stream_socket_get_name()
+ *   C  new connection; payload "peer\0local", each as stream_socket_get_name()
+ *      writes it ("1.2.3.4:5", "[::1]:5")
  *   D  data from the client (at most read_chunk bytes per frame)
  *   E  the client finished sending; it can still be written to
  *   W  output buffered past high_water has drained
  *   X  the connection is gone; payload errno:u32 (0 = clean). Always its last frame.
+ *   F  (id 0) accepting stopped; payload errno:u32: 0 = max_connections reached,
+ *      else why accept() failed (EMFILE...). New connections wait in the backlog.
+ *   A  (id 0) accepting again
  * Write to the stream (PHP -> server):
  *   D  send the payload             E  shut down our sending side
  *   X  flush, then close (answered by an X frame)
- *   P  pause reading                R  resume reading
+ *   P  pause reading                R  resume reading (data that arrived meanwhile follows)
+ *   A  (id 0) try accepting again, e.g. after F with EMFILE once fds were freed;
+ *      accepting also resumes by itself whenever a connection closes
  *
  * The stream is selectable. A read returns only whole frames, unless a frame is
- * bigger than the read length. Blocking reads wait for the next frame (inside
- * manage(), in a fiber, through the read handler); non-blocking reads return ''
- * when there is nothing. Writes always take the whole buffer: output a client
- * can't take yet is buffered. Connection ids are never reused. fclose() closes
- * the server and every connection. stream_socket_get_name() gives the listening
- * address (useful with port 0).
+ * bigger than the read length. A non-blocking read returns '' when there is
+ * nothing to report (e.g. a wake-up that only flushed output); only feof() means
+ * the stream is closed, and it stays false while the server lives. Blocking reads
+ * wait for the next frame (inside manage(), in a fiber, through the read
+ * handler). Every ready connection gets a turn before any gets a second.
+ * Writes always take the whole buffer: output a client can't take yet is
+ * buffered. A paused connection still reports the client leaving: X at once on a
+ * reset, E at once if nothing is unread, else E after that data once resumed.
+ * Connection ids are never reused. fclose() closes the server and every
+ * connection. stream_socket_get_name() gives the listening address (useful with
+ * port 0). The stream belongs to the process that created it: after fork(),
+ * create the server in the child instead (reads and writes in another process
+ * fail with a warning).
  *
- * Options: backlog (default 4096, capped by the kernel), reuseport (false), nodelay (false),
- * max_connections (0 = no limit), read_chunk (16384), high_water (1048576).
+ * Options: backlog (default 4096, capped by the kernel), reuseport (false),
+ * nodelay (false), max_connections (0 = no limit), read_chunk (16384),
+ * high_water (1048576).
  *
  * @return resource|false
  */

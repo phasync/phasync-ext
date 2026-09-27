@@ -42,6 +42,7 @@
 #include <math.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <netinet/tcp.h>
 #ifdef HAVE_ARPA_NAMESER_H
 # include <arpa/nameser.h>
@@ -4195,38 +4196,47 @@ static void phasync_ops_dtor(zval *zv)
  * A TCP server multiplexed into one stream. The extension accepts connections,
  * reads and writes the client sockets, and PHP sees everything as frames on that
  * stream, so a scheduler selects on one fd and parses one big read however many
- * connections there are. Every frame is a 9-byte header, type:u8 id:u32 len:u32
+ * connections there are. Every frame is a 13-byte header, type:u8 id:u64 len:u32
  * (little-endian), then len bytes of payload.
  *
- *   server -> PHP   C  connected: "peer local" addresses, as stream_socket_get_name()
+ *   server -> PHP   C  connected: payload "peer\0local", as stream_socket_get_name()
  *                   D  data from the client
  *                   E  the client finished sending (we can still write)
  *                   W  buffered output past high_water has drained
  *                   X  the connection is gone: errno:u32 (0 = clean); always last
+ *                   F  (id 0) accepting stopped: errno:u32, 0 = max_connections
+ *                   A  (id 0) accepting again
  *   PHP -> server   D  send data            E  shut down our sending side
  *                   X  flush, then close (answered by an X frame)
  *                   P  pause reading        R  resume reading
+ *                   A  (id 0) try accepting again (after F for lack of fds)
  *
  * There is no thread: the stream's fd is an epoll fd, readable whenever the
  * listener or a client socket has an event, and the stream's read op collects
  * those events without blocking; its write op parses PHP's frames and writes to
  * the sockets, buffering what doesn't fit. Clients are only read while PHP reads
- * the stream, so input is bounded by how fast PHP consumes it. An eventfd in the
- * epoll set keeps the stream readable while frames are queued (an X answering a
- * close, or frames that did not fit the last read). A read never splits a frame
- * unless the frame is bigger than the read (D frames are at most read_chunk
- * bytes of payload), and connection ids are never reused. */
+ * the stream, so input is bounded by how fast PHP consumes it, and a new batch of
+ * events is only collected once PHP has consumed the last one: level-triggered
+ * epoll moves each reported connection behind the others, so every ready
+ * connection gets a turn before any gets a second. An eventfd in the epoll set
+ * keeps the stream readable while frames are queued. A read never splits a frame
+ * unless the frame is bigger than the read (D frames carry at most read_chunk
+ * bytes). A non-blocking read returns '' when there is nothing to report (a
+ * wake-up that only flushed output, say); feof() stays false while the server
+ * lives. */
 
-#define PHASYNC_TS_HDR       9
+#define PHASYNC_TS_HDR       13
 #define PHASYNC_TS_LISTENER  0
 #define PHASYNC_TS_EVFD      UINT64_MAX
 
 typedef struct {
-	uint32_t id;
+	uint64_t id;
 	int      fd;
-	uint32_t events;         /* registered epoll interest; 0 = not registered */
+	uint32_t events;         /* registered epoll interest                     */
+	bool     registered;
 	bool     eof_in;         /* the client finished sending (E emitted)       */
 	bool     paused;         /* PHP sent P                                    */
+	bool     peer_done;      /* paused, and the client finished with data unread */
 	bool     shut_pending;   /* PHP sent E: shut down once the output drains  */
 	bool     shut_done;
 	bool     close_pending;  /* PHP sent X: close once the output drains      */
@@ -4237,9 +4247,10 @@ typedef struct {
 
 typedef struct {
 	int       epfd, lfd, evfd;
+	pid_t     pid;           /* the creating process: epoll is shared across fork() */
 	bool      blocking, accepting, armed;
 	HashTable conns;         /* id -> phasync_ts_conn* */
-	uint32_t  next_id;
+	uint64_t  next_id;
 	bool      nodelay;
 	zend_long max_conns, read_chunk, high_water;
 	char     *out;           /* frames for PHP: [outpos, outlen) */
@@ -4248,13 +4259,20 @@ typedef struct {
 	unsigned char hdr[PHASYNC_TS_HDR];   /* parser for PHP's frames */
 	size_t    hdrlen;
 	unsigned char wtype;
-	uint32_t  wid, wleft;
+	uint64_t  wid;
+	uint32_t  wleft;
 	zend_string *name;
 } phasync_ts;
 
 static void phasync_ts_le32(char *p, uint32_t v)
 {
 	p[0] = (char) v; p[1] = (char) (v >> 8); p[2] = (char) (v >> 16); p[3] = (char) (v >> 24);
+}
+
+static void phasync_ts_le64(char *p, uint64_t v)
+{
+	phasync_ts_le32(p, (uint32_t) v);
+	phasync_ts_le32(p + 4, (uint32_t) (v >> 32));
 }
 
 static uint32_t phasync_ts_get32(const unsigned char *p)
@@ -4279,16 +4297,28 @@ static char *phasync_ts_reserve(phasync_ts *s, size_t n)
 	return s->out + s->outlen;
 }
 
-static void phasync_ts_emit(phasync_ts *s, char type, uint32_t id, const char *payload, uint32_t len)
+static void phasync_ts_hdr(char *p, char type, uint64_t id, uint32_t len)
+{
+	p[0] = type;
+	phasync_ts_le64(p + 1, id);
+	phasync_ts_le32(p + 9, len);
+}
+
+static void phasync_ts_emit(phasync_ts *s, char type, uint64_t id, const char *payload, uint32_t len)
 {
 	char *p = phasync_ts_reserve(s, PHASYNC_TS_HDR + len);
-	p[0] = type;
-	phasync_ts_le32(p + 1, id);
-	phasync_ts_le32(p + 5, len);
+	phasync_ts_hdr(p, type, id, len);
 	if (len) {
 		memcpy(p + PHASYNC_TS_HDR, payload, len);
 	}
 	s->outlen += PHASYNC_TS_HDR + len;
+}
+
+static void phasync_ts_emit_errno(phasync_ts *s, char type, uint64_t id, int err)
+{
+	char payload[4];
+	phasync_ts_le32(payload, (uint32_t) err);
+	phasync_ts_emit(s, type, id, payload, 4);
 }
 
 /* An address as stream_socket_get_name() formats it. */
@@ -4305,55 +4335,87 @@ static zend_string *phasync_ts_name(const struct sockaddr_storage *ss)
 	return strpprintf(0, "%s:%d", ip, ntohs(((const struct sockaddr_in *) ss)->sin_port));
 }
 
-static void phasync_ts_listen(phasync_ts *s, bool on)
+/* Stop or resume accepting, and tell PHP: F with the reason (0 = at
+ * max_connections), A when accepting again. Never resumes while full. */
+static void phasync_ts_accepting(phasync_ts *s, bool on, int err)
 {
 	struct epoll_event e = { .events = EPOLLIN, .data.u64 = PHASYNC_TS_LISTENER };
 
-	if (on != s->accepting) {
-		epoll_ctl(s->epfd, on ? EPOLL_CTL_ADD : EPOLL_CTL_DEL, s->lfd, &e);
-		s->accepting = on;
+	if (on == s->accepting
+	 || (on && s->max_conns && zend_hash_num_elements(&s->conns) >= (uint32_t) s->max_conns)) {
+		return;
+	}
+	epoll_ctl(s->epfd, on ? EPOLL_CTL_ADD : EPOLL_CTL_DEL, s->lfd, &e);
+	s->accepting = on;
+	if (on) {
+		phasync_ts_emit(s, 'A', 0, NULL, 0);
+	} else {
+		phasync_ts_emit_errno(s, 'F', 0, err);
 	}
 }
 
-/* Register what the connection currently wants: input unless the client is done,
- * PHP paused it or asked to close it; output while any is buffered. */
+/* Register what the connection currently wants: input unless the client is
+ * done, PHP paused it or asked to close it; output while any is buffered. A
+ * paused connection still listens for the client leaving (EPOLLRDHUP; errors
+ * are always reported). Once a paused client has left with data unread, there is
+ * nothing to hear until R, so it is taken out of the set (unless writing). */
 static void phasync_ts_update(phasync_ts *s, phasync_ts_conn *c)
 {
 	struct epoll_event e;
 	uint32_t ev = 0;
 
-	if (!c->eof_in && !c->paused && !c->close_pending) {
-		ev |= EPOLLIN;
+	if (!c->eof_in && !c->close_pending) {
+		if (!c->paused) {
+			ev |= EPOLLIN;
+		} else if (!c->peer_done) {
+			ev |= EPOLLRDHUP;
+		}
 	}
 	if (c->wlen > c->woff) {
 		ev |= EPOLLOUT;
 	}
-	if (ev == c->events) {
+	if (c->paused && c->peer_done && !(ev & EPOLLOUT)) {
+		if (c->registered) {
+			epoll_ctl(s->epfd, EPOLL_CTL_DEL, c->fd, NULL);
+			c->registered = false;
+		}
+		c->events = 0;
+		return;
+	}
+	if (c->registered && ev == c->events) {
 		return;
 	}
 	e.events = ev;
 	e.data.u64 = c->id;
-	epoll_ctl(s->epfd, !c->events ? EPOLL_CTL_ADD : ev ? EPOLL_CTL_MOD : EPOLL_CTL_DEL, c->fd, &e);
+	epoll_ctl(s->epfd, c->registered ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, c->fd, &e);
+	c->registered = true;
 	c->events = ev;
 }
 
 static void phasync_ts_close(phasync_ts *s, phasync_ts_conn *c, int err)
 {
-	char payload[4];
-
-	if (c->events) {
+	if (c->registered) {
 		epoll_ctl(s->epfd, EPOLL_CTL_DEL, c->fd, NULL);
 	}
 	close(c->fd);
-	phasync_ts_le32(payload, (uint32_t) err);
-	phasync_ts_emit(s, 'X', c->id, payload, 4);
+	phasync_ts_emit_errno(s, 'X', c->id, err);
 	zend_hash_index_del(&s->conns, c->id);
 	if (c->wbuf) {
 		efree(c->wbuf);
 	}
 	efree(c);
-	if (!s->accepting) {
-		phasync_ts_listen(s, true);          /* room again (max_connections, EMFILE) */
+	phasync_ts_accepting(s, true, 0);        /* room again, if it had stopped */
+}
+
+/* The client finished sending: E, and close if our side is done too. */
+static void phasync_ts_eof(phasync_ts *s, phasync_ts_conn *c)
+{
+	c->eof_in = true;
+	phasync_ts_emit(s, 'E', c->id, NULL, 0);
+	if (c->shut_done) {
+		phasync_ts_close(s, c, 0);
+	} else {
+		phasync_ts_update(s, c);
 	}
 }
 
@@ -4442,22 +4504,26 @@ static void phasync_ts_accept(phasync_ts *s)
 		socklen_t plen = sizeof(peer), llen = sizeof(local);
 		zend_string *pn, *ln;
 		phasync_ts_conn *c;
+		size_t len;
 		char *p;
 		int fd, one = 1;
 
 		if (s->max_conns && zend_hash_num_elements(&s->conns) >= (uint32_t) s->max_conns) {
-			phasync_ts_listen(s, false);     /* resumed when a connection closes */
+			phasync_ts_accepting(s, false, 0);   /* the rest wait in the backlog */
 			return;
 		}
 		fd = accept4(s->lfd, (struct sockaddr *) &peer, &plen, SOCK_NONBLOCK | SOCK_CLOEXEC);
 		if (fd < 0) {
-			if (errno == EINTR || errno == ECONNABORTED) {
-				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				return;
 			}
-			if ((errno == EMFILE || errno == ENFILE) && zend_hash_num_elements(&s->conns)) {
-				phasync_ts_listen(s, false); /* else the listener spins readable */
+			if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+				/* Out of resources: stop (else the listener stays readable and
+				 * spins); resumes when a connection closes or PHP sends A. */
+				phasync_ts_accepting(s, false, errno);
+				return;
 			}
-			return;
+			continue;                        /* the connection failed; next */
 		}
 		if (s->nodelay) {
 			setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -4465,21 +4531,17 @@ static void phasync_ts_accept(phasync_ts *s)
 		getsockname(fd, (struct sockaddr *) &local, &llen);
 		c = ecalloc(1, sizeof(*c));
 		c->id = s->next_id++;
-		if (!s->next_id) {
-			s->next_id = 1;
-		}
 		c->fd = fd;
 		zend_hash_index_add_new_ptr(&s->conns, c->id, c);
 		pn = phasync_ts_name(&peer);
 		ln = phasync_ts_name(&local);
-		p = phasync_ts_reserve(s, PHASYNC_TS_HDR + ZSTR_LEN(pn) + 1 + ZSTR_LEN(ln));
-		p[0] = 'C';
-		phasync_ts_le32(p + 1, c->id);
-		phasync_ts_le32(p + 5, (uint32_t) (ZSTR_LEN(pn) + 1 + ZSTR_LEN(ln)));
+		len = ZSTR_LEN(pn) + 1 + ZSTR_LEN(ln);
+		p = phasync_ts_reserve(s, PHASYNC_TS_HDR + len);
+		phasync_ts_hdr(p, 'C', c->id, (uint32_t) len);
 		memcpy(p + PHASYNC_TS_HDR, ZSTR_VAL(pn), ZSTR_LEN(pn));
-		p[PHASYNC_TS_HDR + ZSTR_LEN(pn)] = ' ';
+		p[PHASYNC_TS_HDR + ZSTR_LEN(pn)] = '\0';
 		memcpy(p + PHASYNC_TS_HDR + ZSTR_LEN(pn) + 1, ZSTR_VAL(ln), ZSTR_LEN(ln));
-		s->outlen += PHASYNC_TS_HDR + ZSTR_LEN(pn) + 1 + ZSTR_LEN(ln);
+		s->outlen += PHASYNC_TS_HDR + len;
 		zend_string_release(pn);
 		zend_string_release(ln);
 		phasync_ts_update(s, c);
@@ -4497,18 +4559,10 @@ static void phasync_ts_recv(phasync_ts *s, phasync_ts_conn *c)
 		n = recv(c->fd, p + PHASYNC_TS_HDR, s->read_chunk, 0);
 	} while (n < 0 && errno == EINTR);
 	if (n > 0) {
-		p[0] = 'D';
-		phasync_ts_le32(p + 1, c->id);
-		phasync_ts_le32(p + 5, (uint32_t) n);
+		phasync_ts_hdr(p, 'D', c->id, (uint32_t) n);
 		s->outlen += PHASYNC_TS_HDR + n;
 	} else if (n == 0) {
-		c->eof_in = true;
-		phasync_ts_emit(s, 'E', c->id, NULL, 0);
-		if (c->shut_done) {
-			phasync_ts_close(s, c, 0);       /* both directions done */
-		} else {
-			phasync_ts_update(s, c);
-		}
+		phasync_ts_eof(s, c);
 	} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
 		phasync_ts_close(s, c, errno);
 	}
@@ -4522,6 +4576,7 @@ static void phasync_ts_pump(phasync_ts *s)
 
 	for (int i = 0; i < n; i++) {
 		uint64_t key = ev[i].data.u64;
+		uint32_t got = ev[i].events;
 		phasync_ts_conn *c;
 
 		if (key == PHASYNC_TS_EVFD) {
@@ -4534,12 +4589,31 @@ static void phasync_ts_pump(phasync_ts *s)
 		if ((c = zend_hash_index_find_ptr(&s->conns, key)) == NULL) {
 			continue;
 		}
-		if ((ev[i].events & (EPOLLOUT | EPOLLERR | EPOLLHUP)) && c->wlen > c->woff
-		 && !phasync_ts_flush(s, c)) {
+		if (got & EPOLLERR) {                /* a reset: gone, even when paused */
+			int err = 0;
+			socklen_t elen = sizeof(err);
+			getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+			phasync_ts_close(s, c, err ? err : ECONNRESET);
 			continue;
 		}
-		if ((ev[i].events & (EPOLLIN | EPOLLERR | EPOLLHUP)) && (c->events & EPOLLIN)) {
-			phasync_ts_recv(s, c);
+		if ((got & (EPOLLOUT | EPOLLHUP)) && c->wlen > c->woff && !phasync_ts_flush(s, c)) {
+			continue;
+		}
+		if (c->events & EPOLLIN) {
+			if (got & (EPOLLIN | EPOLLHUP | EPOLLRDHUP)) {
+				phasync_ts_recv(s, c);
+			}
+		} else if (c->paused && !c->eof_in && (got & (EPOLLRDHUP | EPOLLHUP))) {
+			/* A paused client left. With nothing unread, say so now; otherwise E
+			 * follows its data once PHP resumes. */
+			int unread = 0;
+			ioctl(c->fd, FIONREAD, &unread);
+			if (unread == 0) {
+				phasync_ts_eof(s, c);
+			} else {
+				c->peer_done = true;
+				phasync_ts_update(s, c);
+			}
 		}
 	}
 }
@@ -4571,7 +4645,7 @@ static size_t phasync_ts_take(phasync_ts *s, char *buf, size_t count)
 		s->partial -= n;
 	} else {
 		while (s->outpos + n < s->outlen) {
-			size_t flen = PHASYNC_TS_HDR + phasync_ts_get32((unsigned char *) s->out + s->outpos + n + 5);
+			size_t flen = PHASYNC_TS_HDR + phasync_ts_get32((unsigned char *) s->out + s->outpos + n + 9);
 			if (n + flen > count) {
 				if (n == 0) {
 					n = count;
@@ -4590,11 +4664,25 @@ static size_t phasync_ts_take(phasync_ts *s, char *buf, size_t count)
 	return n;
 }
 
+/* epoll is shared across fork(): a child using the parent's server would steal
+ * its events and act on its connections. */
+static bool phasync_ts_forked(phasync_ts *s)
+{
+	if (getpid() == s->pid) {
+		return false;
+	}
+	php_error_docref(NULL, E_WARNING, "The server was created by another process; create it after fork()");
+	return true;
+}
+
 static ssize_t phasync_ts_read(php_stream *stream, char *buf, size_t count)
 {
 	phasync_ts *s = (phasync_ts *) stream->abstract;
 	size_t n;
 
+	if (phasync_ts_forked(s)) {
+		return -1;
+	}
 	for (;;) {
 		if (s->outpos == s->outlen) {
 			phasync_ts_pump(s);
@@ -4626,6 +4714,9 @@ static ssize_t phasync_ts_write(php_stream *stream, const char *buf, size_t coun
 	phasync_ts_conn *c;
 	size_t i = 0, take;
 
+	if (phasync_ts_forked(s)) {
+		return -1;
+	}
 	while (i < count) {
 		if (s->hdrlen < PHASYNC_TS_HDR) {
 			take = MIN(PHASYNC_TS_HDR - s->hdrlen, count - i);
@@ -4636,13 +4727,16 @@ static ssize_t phasync_ts_write(php_stream *stream, const char *buf, size_t coun
 				break;
 			}
 			s->wtype = s->hdr[0];
-			s->wid = phasync_ts_get32(s->hdr + 1);
-			s->wleft = phasync_ts_get32(s->hdr + 5);
-			if (s->wtype != 'D' && s->wtype != 'E' && s->wtype != 'X' && s->wtype != 'P' && s->wtype != 'R') {
+			s->wid = (uint64_t) phasync_ts_get32(s->hdr + 1) | ((uint64_t) phasync_ts_get32(s->hdr + 5) << 32);
+			s->wleft = phasync_ts_get32(s->hdr + 9);
+			if (!memchr("DEXPRA", s->wtype, 6) || !s->wtype) {
 				s->hdrlen = 0;
 				php_error_docref(NULL, E_WARNING, "Invalid frame type 0x%02x", s->wtype);
 				phasync_ts_arm(s);
 				return -1;
+			}
+			if (s->wtype == 'A') {
+				phasync_ts_accepting(s, true, 0);
 			}
 			/* Frames for a connection that is gone (or closing) are dropped. */
 			c = zend_hash_index_find_ptr(&s->conns, s->wid);
@@ -4686,6 +4780,8 @@ static ssize_t phasync_ts_write(php_stream *stream, const char *buf, size_t coun
 	return (ssize_t) count;
 }
 
+/* Also in a forked child: closing its copies of the fds leaves the parent's
+ * server alone (no epoll_ctl here). */
 static int phasync_ts_stream_close(php_stream *stream, int close_handle)
 {
 	phasync_ts *s = (phasync_ts *) stream->abstract;
@@ -4866,6 +4962,7 @@ ZEND_FUNCTION(phasync_ext_tcp_server)
 	s->epfd = epfd;
 	s->lfd = lfd;
 	s->evfd = evfd;
+	s->pid = getpid();
 	s->blocking = true;
 	s->next_id = 1;
 	s->nodelay = nodelay;
@@ -4874,7 +4971,10 @@ ZEND_FUNCTION(phasync_ext_tcp_server)
 	s->high_water = high_water;
 	s->name = phasync_ts_name(&ss);
 	zend_hash_init(&s->conns, 16, NULL, NULL, 0);
-	phasync_ts_listen(s, true);
+	e.events = EPOLLIN;
+	e.data.u64 = PHASYNC_TS_LISTENER;
+	epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &e);
+	s->accepting = true;
 
 	stream = php_stream_alloc(&phasync_ts_ops, s, NULL, "r+");
 	stream->flags |= PHP_STREAM_FLAG_NO_BUFFER | PHP_STREAM_FLAG_NO_SEEK;

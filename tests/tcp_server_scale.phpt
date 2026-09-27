@@ -35,9 +35,12 @@ $fp = \phasync\ext\tcp_server('127.0.0.1', 0, ['max_connections' => 2, 'read_chu
 stream_set_blocking($fp, false);
 $name = stream_socket_get_name($fp, false);
 
-// max_connections: the third client is accepted only once one closes.
+// max_connections: accepting stops (F, reason 0) and the third client waits in
+// the backlog until one closes (A, then its C, and F again: full once more).
 $a = stream_socket_client("tcp://$name"); $b = stream_socket_client("tcp://$name"); $c = stream_socket_client("tcp://$name");
-echo 'accepted: ', count(array_filter(collect($fp, $never, 65536, 0.3), fn($x) => $x[0] === 'C')), "\n";
+$f = collect($fp, $never, 65536, 0.3);
+echo 'accepted: ', count(array_filter($f, fn($x) => $x[0] === 'C')), "\n";
+show(array_values(array_filter($f, fn($x) => $x[0] === 'F')));
 fwrite($fp, frame('X', 2));
 show(collect($fp, has('C', 3)));
 fclose($b);
@@ -74,7 +77,7 @@ show(collect($fp, has('D', 1)));
 fwrite($a, str_repeat('z', 3000));
 usleep(50000);
 $buf = '';
-while (strlen($buf) < 9 + 3000) { $r = [$fp]; $wr = $e = null; stream_select($r, $wr, $e, 1); $buf .= fread($fp, 1000); }
+while (strlen($buf) < 13 + 3000) { $r = [$fp]; $wr = $e = null; stream_select($r, $wr, $e, 1); $buf .= fread($fp, 1000); }
 [[$t, $id, $p]] = parse($buf);
 echo "parts: $t $id ", strlen($p), "\n";
 
@@ -94,10 +97,13 @@ fclose($fp);
 --EXPECTF--
 clients: 300 true
 accepted: 2
+F 0 "\u0000\u0000\u0000\u0000"
 X 2 "\u0000\u0000\u0000\u0000"
-C 3 "127.0.0.1:%d 127.0.0.1:%d"
+A 0 ""
+C 3 "127.0.0.1:%d\u0000127.0.0.1:%d"
+F 0 "\u0000\u0000\u0000\u0000"
 chunks: 25 max 4096 total 100000
-int(16777225)
+int(16777229)
 W early: false
 W after drain: true
 D while paused: 0
