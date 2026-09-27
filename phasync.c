@@ -74,7 +74,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.5.0-alpha5"
+#define PHP_PHASYNC_VERSION "0.5.0-alpha6"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -1938,6 +1938,12 @@ static int phasync_orig_set_option(php_stream *stream, int option, int value, vo
 	if (!orig->set_option) {
 		return PHP_STREAM_OPTION_RETURN_NOTIMPL;
 	}
+	if (saved->read == phasync_wrapped_read_tls) {
+		/* ext/openssl never compares ops pointers, and its connect/accept enable
+		 * crypto through stream->ops: keep ours there, so the handshake cooperates
+		 * and accepted clients inherit the wrapped ops. */
+		return orig->set_option(stream, option, value, ptrparam);
+	}
 	stream->ops = (php_stream_ops *) orig;
 	r = orig->set_option(stream, option, value, ptrparam);
 	stream->ops = saved;
@@ -2207,12 +2213,61 @@ static int phasync_xport_io_cooperative(php_stream *stream, php_stream_xport_par
 	return phasync_orig_set_option(stream, option, value, xp);
 }
 
+static php_stream_ops *phasync_wrapped_ops_for(const php_stream_ops *orig, phasync_mode mode);
+
+/* Enabling crypto (stream_socket_enable_crypto(), and the handshake in tls://
+ * connect and accept) on a blocking stream loops on the handshake, polling the
+ * socket in between. Inside a scope, in a fiber: run it non-blocking, where each
+ * call makes one attempt and returns 0 while it would block, and park between
+ * attempts, as native PHP polls (no timeout, as natively). Which way to wait is
+ * not exposed; a handshake that wants to write finds the socket not writable, so
+ * wait for writable then, else readable. Afterwards the stream's reads and writes
+ * must go through the original (SSL_read/SSL_write), or come off it again. */
+static int phasync_crypto_enable(php_stream *stream, int option, int value, php_stream_xport_crypto_param *cp)
+{
+	const php_stream_ops *orig = PHASYNC_ORIG(stream);
+	phasync_hook_entry *e = phasync_entry_ensure(stream);
+	php_socket_t fd = phasync_stream_fd(stream);
+	int rc;
+
+	if (cp->inputs.activate && e->want_block && fd != -1 && phasync_reading() && EG(active_fiber) != NULL) {
+		orig->set_option(stream, PHP_STREAM_OPTION_BLOCKING, 0, NULL);
+		for (;;) {
+			struct pollfd pfd = { fd, POLLOUT, 0 };
+			rc = orig->set_option(stream, option, value, cp);
+			if (rc != PHP_STREAM_OPTION_RETURN_OK || cp->outputs.returncode != 0) {
+				break;
+			}
+			if (phasync_wait_fd(poll(&pfd, 1, 0) == 0 ? PHASYNC_WRITE : PHASYNC_READ, stream, fd, INFINITY)
+			    != PHASYNC_WAIT_READY) {
+				cp->outputs.returncode = -1;     /* exception pending */
+				break;
+			}
+		}
+		orig->set_option(stream, PHP_STREAM_OPTION_BLOCKING, 1, NULL);
+		e->applied = 0;
+	} else {
+		rc = orig->set_option(stream, option, value, cp);
+	}
+	if (rc == PHP_STREAM_OPTION_RETURN_OK && cp->outputs.returncode == 1 && cp->inputs.activate
+	 && stream->ops->read == phasync_wrapped_read) {
+		stream->ops = phasync_wrapped_ops_for(orig, PHASYNC_MODE_TLS);
+	} else if (!cp->inputs.activate && stream->ops->read == phasync_wrapped_read_tls) {
+		/* crypto is off after a disable (which returns -1 even when it succeeds) */
+		stream->ops = phasync_wrapped_ops_for(orig, PHASYNC_MODE_RAW);
+	}
+	return rc;
+}
+
 static int phasync_wrapped_set_option(php_stream *stream, int option, int value, void *ptrparam)
 {
 	if (option == PHP_STREAM_OPTION_BLOCKING) {
 		phasync_hook_entry *e = phasync_entry_ensure(stream);
 		e->want_block = (value != 0);
 		e->applied    = -1;   /* orig is about to change the fd; re-apply on next I/O */
+	} else if (option == PHP_STREAM_OPTION_CRYPTO_API && ptrparam
+	        && ((php_stream_xport_crypto_param *) ptrparam)->op == STREAM_XPORT_CRYPTO_OP_ENABLE) {
+		return phasync_crypto_enable(stream, option, value, (php_stream_xport_crypto_param *) ptrparam);
 	} else if (option == PHP_STREAM_OPTION_MMAP_API && value == PHP_STREAM_MMAP_SUPPORTED
 	        && stream->ops->read == phasync_wrapped_read_pool
 	        && phasync_reading() && EG(active_fiber) != NULL) {

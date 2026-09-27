@@ -15,7 +15,9 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
    - `tcp://` / `unix://` / `udp://` / `udg://` sockets (incl. `fsockopen`,
      `stream_socket_client/server`), including `tcp://` connect + its DNS lookup,
      `stream_socket_accept()`, and `stream_socket_recvfrom()`/`sendto()`
-   - `ssl://` / `tls://` sockets
+   - `ssl://` / `tls://` sockets, including the TLS handshake (in `tls://` connect
+     and accept, and `stream_socket_enable_crypto()` on a blocking stream, after
+     which the stream's reads and writes go through TLS)
    - `stream_select()` and `socket_select()`
    - ext/sockets: `socket_read()`, `socket_recv()`, `socket_recvfrom()`,
      `socket_write()`, `socket_send()`, `socket_sendto()`, `socket_accept()`,
@@ -243,11 +245,11 @@ the coroutine, the extension `pthread_cancel`s the thread stuck in `open()`
 
 0.5 (alpha): the slot/`poll()` contract. Sockets, TLS, pipes, processes, the
 sleep functions, DNS, files and filesystem calls, flock and stdio are implemented
-and tested. Known TLS limitations: read/write intent is approximated
-(TLS renegotiation wanting the opposite direction could stall — the
-`stream_socket_get_crypto_status()` API on 8.5+ would resolve it), the `ssl://`
-handshake still runs synchronously, and `stream_socket_enable_crypto()` on an
-already-open socket is not yet re-wrapped.
+and tested. Known TLS limitations: read/write intent is approximated (TLS
+renegotiation wanting the opposite direction could stall — the
+`stream_socket_get_crypto_status()` API on 8.5+ would resolve it), and the TCP
+connect and DNS lookup inside a `tls://` connect still run synchronously (ext/openssl
+calls the socket layer directly there); the handshake itself cooperates.
 
 Linux only for now (uses epoll, eventfd, `poll(2)`, `fcntl`, and POSIX threads).
 
