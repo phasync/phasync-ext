@@ -25,7 +25,10 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
      `SO_RCVTIMEO`/`SO_SNDTIMEO` as native timeouts
    - `curl_multi_select()`, so curl-multi loops (Guzzle's multi handler) don't block
      (probed without waiting and slept on between probes, 1ms doubling to 20ms:
-     PHP doesn't expose curl's sockets)
+     PHP doesn't expose curl's sockets), and `curl_exec()`, run on a private
+     curl_multi with native results and errors (callbacks run in the coroutine)
+   - `sem_acquire()` and `msg_receive()` (their non-blocking forms retried from the
+     loop, so a cancelled wait takes nothing)
    - `proc_open()` pipes and `proc_close()`; `popen()`/`pclose()`, `shell_exec()`
      (and backticks), `exec()`, `system()`, `passthru()` — both the output pipe
      and the wait for the child to exit; `pcntl_waitpid()`/`pcntl_wait()`

@@ -74,7 +74,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.5.0-alpha6"
+#define PHP_PHASYNC_VERSION "0.5.0-alpha7"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -199,6 +199,9 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_pcntl_wait)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_socket_connect)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_curl_multi_select)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_sem_acquire)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_curl_exec)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_msg_receive)(INTERNAL_FUNCTION_PARAMETERS);
 	zif_handler orig_sock[8];
 	HashTable sock_hooks;         /* (uintptr_t)zend_function -> index in phasync_sock_funcs */
 	phasync_spawn *spawn;         /* armed by an exec-family call until its pipe is seen */
@@ -4294,6 +4297,218 @@ static ZEND_NAMED_FUNCTION(phasync_curl_multi_select_override)
 	}
 }
 
+/* sem_acquire() and msg_receive() block in the kernel until the semaphore or a
+ * message is there, with nothing to wait on. Inside a scope, in a fiber, their
+ * non-blocking forms are retried from the loop instead (1ms, doubling to 20ms
+ * between tries), so nothing is taken except on PHP's thread and a cancelled
+ * wait takes nothing. The function is called again by name (select_depth > 0:
+ * straight to the original) with the caller's arguments, references included. */
+static bool phasync_call_again(const char *name, zval *retval, uint32_t argc, zval *args)
+{
+	zval fn;
+	bool ok;
+
+	ZVAL_STRING(&fn, name);
+	ZVAL_UNDEF(retval);
+	PHASYNC_G(select_depth)++;
+	ok = call_user_function(NULL, NULL, &fn, retval, argc, args) == SUCCESS && !EG(exception);
+	PHASYNC_G(select_depth)--;
+	zval_ptr_dtor(&fn);
+	return ok;
+}
+
+/* sem_acquire($sem) -> sem_acquire($sem, true) until it succeeds; EAGAIN (taken)
+ * is the only failure that is retried (the native non-blocking form reports it
+ * without a warning); any other failure returns as natively. */
+static ZEND_NAMED_FUNCTION(phasync_sem_acquire_override)
+{
+	uint32_t argc = ZEND_NUM_ARGS();
+	zval args[2], ret;
+	zend_long usec = 1000;
+
+	if (PHASYNC_G(select_depth) || !phasync_reading() || EG(active_fiber) == NULL || argc < 1
+	 || (argc >= 2 && zend_is_true(ZEND_CALL_ARG(execute_data, 2)))) {
+		PHASYNC_G(orig_sem_acquire)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	ZVAL_COPY_VALUE(&args[0], ZEND_CALL_ARG(execute_data, 1));
+	ZVAL_TRUE(&args[1]);
+	for (;;) {
+		errno = 0;
+		if (!phasync_call_again("sem_acquire", &ret, 2, args) || Z_TYPE(ret) != IS_FALSE || errno != EAGAIN) {
+			break;
+		}
+		if (phasync_call_sleep(phasync_sleep_handler(), usec) < 0) {
+			return;                          /* exception pending */
+		}
+		usec = MIN(usec * 2, 20000);
+	}
+	if (!Z_ISUNDEF(ret)) {
+		RETURN_COPY_VALUE(&ret);
+	}
+}
+
+/* msg_receive(...) -> the same with MSG_IPC_NOWAIT until a message comes; "no
+ * message" (ENOMSG in $error_code, no warning) is the only result retried. */
+static ZEND_NAMED_FUNCTION(phasync_msg_receive_override)
+{
+	uint32_t argc = ZEND_NUM_ARGS(), i;
+	zval args[8], ret, errcode, *uflags = argc >= 7 ? ZEND_CALL_ARG(execute_data, 7) : NULL;
+	zend_long usec = 1000;
+	bool own_err = argc < 8;
+
+	if (PHASYNC_G(select_depth) || !phasync_reading() || EG(active_fiber) == NULL || argc < 5
+	 || (uflags && (Z_TYPE_P(uflags) != IS_LONG || (Z_LVAL_P(uflags) & 1 /* MSG_IPC_NOWAIT */)))) {
+		PHASYNC_G(orig_msg_receive)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	for (i = 0; i < argc; i++) {
+		ZVAL_COPY_VALUE(&args[i], ZEND_CALL_ARG(execute_data, i + 1));
+	}
+	if (argc < 6) {
+		ZVAL_TRUE(&args[5]);                 /* $unserialize default */
+	}
+	ZVAL_LONG(&args[6], (uflags ? Z_LVAL_P(uflags) : 0) | 1);
+	if (own_err) {
+		ZVAL_NULL(&errcode);
+		ZVAL_NEW_REF(&args[7], &errcode);
+	}
+	for (;;) {
+		zval *code;
+		if (!phasync_call_again("msg_receive", &ret, 8, args) || Z_TYPE(ret) != IS_FALSE) {
+			break;
+		}
+		code = &args[7];
+		ZVAL_DEREF(code);
+		if (Z_TYPE_P(code) != IS_LONG || Z_LVAL_P(code) != ENOMSG) {
+			break;
+		}
+		if (phasync_call_sleep(phasync_sleep_handler(), usec) < 0) {
+			ZVAL_UNDEF(&ret);
+			break;                           /* exception pending */
+		}
+		usec = MIN(usec * 2, 20000);
+	}
+	if (own_err) {
+		zval_ptr_dtor(&args[7]);
+	}
+	if (!Z_ISUNDEF(ret)) {
+		RETURN_COPY_VALUE(&ret);
+	}
+}
+
+/* Call a PHP function by name (through any override of ours). */
+static bool phasync_call_named(const char *name, zval *retval, uint32_t argc, zval *args)
+{
+	zval fn;
+	bool ok;
+
+	ZVAL_STRING(&fn, name);
+	ZVAL_UNDEF(retval);
+	ok = call_user_function(NULL, NULL, &fn, retval, argc, args) == SUCCESS && !EG(exception);
+	zval_ptr_dtor(&fn);
+	return ok;
+}
+
+/* curl_exec() inside a scope, in a fiber: the same transfer on a private
+ * curl_multi handle, waiting in the cooperative curl_multi_select(), so option
+ * callbacks run on PHP's thread, in the coroutine. The result is native:
+ * curl_multi_info_read() records the transfer's error on the handle (curl_errno,
+ * curl_error), adding the handle resets it as curl_exec() does, and the return is
+ * false on error, the body with CURLOPT_RETURNTRANSFER, else true; FILE* outputs
+ * are flushed, as curl_exec() does. A handle already in a multi (or a multi
+ * error) goes to the original, which reports it natively. A cancellation drops
+ * the transfer and propagates. */
+static ZEND_NAMED_FUNCTION(phasync_curl_exec_override)
+{
+	zval mh, args[2], ret, running, info;
+	zend_long result = 0;
+	bool added = false;
+
+	if (!phasync_reading() || EG(active_fiber) == NULL || ZEND_NUM_ARGS() != 1
+	 || Z_TYPE_P(ZEND_CALL_ARG(execute_data, 1)) != IS_OBJECT
+	 || !phasync_call_named("curl_multi_init", &mh, 0, NULL) || Z_TYPE(mh) != IS_OBJECT) {
+		if (!EG(exception)) {
+			PHASYNC_G(orig_curl_exec)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		}
+		return;
+	}
+	ZVAL_COPY_VALUE(&args[0], &mh);
+	ZVAL_COPY_VALUE(&args[1], ZEND_CALL_ARG(execute_data, 1));
+	if (!phasync_call_named("curl_multi_add_handle", &ret, 2, args) || Z_TYPE(ret) != IS_LONG || Z_LVAL(ret) != 0) {
+		goto native;
+	}
+	added = true;
+	ZVAL_NULL(&running);
+	ZVAL_NEW_REF(&args[1], &running);
+	for (;;) {
+		zval *r;
+		zend_long rc;
+		if (!phasync_call_named("curl_multi_exec", &ret, 2, args)) {
+			goto cancelled;
+		}
+		rc = Z_TYPE(ret) == IS_LONG ? Z_LVAL(ret) : 1;
+		if (rc != 0 && rc != -1 /* CURLM_CALL_MULTI_PERFORM */) {
+			zval_ptr_dtor(&args[1]);
+			ZVAL_COPY_VALUE(&args[1], ZEND_CALL_ARG(execute_data, 1));
+			goto native;
+		}
+		r = Z_REFVAL(args[1]);
+		if (Z_TYPE_P(r) != IS_LONG || Z_LVAL_P(r) == 0) {
+			break;
+		}
+		{
+			zval sel[2];
+			ZVAL_COPY_VALUE(&sel[0], &mh);
+			ZVAL_DOUBLE(&sel[1], 1.0);
+			if (!phasync_call_named("curl_multi_select", &ret, 2, sel)) {
+				goto cancelled;
+			}
+			zval_ptr_dtor(&ret);
+		}
+	}
+	zval_ptr_dtor(&args[1]);
+	ZVAL_COPY_VALUE(&args[1], ZEND_CALL_ARG(execute_data, 1));
+	if (phasync_call_named("curl_multi_info_read", &info, 1, &mh) && Z_TYPE(info) == IS_ARRAY) {
+		zval *res = zend_hash_str_find(Z_ARRVAL(info), "result", sizeof("result") - 1);
+		result = res ? zval_get_long(res) : 0;
+	}
+	zval_ptr_dtor(&info);
+	phasync_call_named("curl_multi_remove_handle", &ret, 2, args);
+	zval_ptr_dtor(&ret);
+	fflush(NULL);                            /* CURLOPT_FILE/WRITEHEADER outputs */
+	if (result != 0) {
+		zval_ptr_dtor(&mh);
+		RETURN_FALSE;
+	}
+	phasync_call_named("curl_multi_getcontent", &ret, 1, &args[1]);
+	zval_ptr_dtor(&mh);
+	if (Z_TYPE(ret) == IS_STRING) {
+		RETURN_COPY_VALUE(&ret);
+	}
+	zval_ptr_dtor(&ret);
+	RETURN_TRUE;
+
+native:
+	zval_ptr_dtor(&ret);
+	if (added) {
+		phasync_call_named("curl_multi_remove_handle", &ret, 2, args);
+		zval_ptr_dtor(&ret);
+	}
+	zval_ptr_dtor(&mh);
+	PHASYNC_G(orig_curl_exec)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	return;
+
+cancelled:
+	zval_ptr_dtor(&args[1]);
+	ZVAL_COPY_VALUE(&args[1], ZEND_CALL_ARG(execute_data, 1));
+	zend_exception_save();                   /* clean up with the exception set aside */
+	phasync_call_named("curl_multi_remove_handle", &ret, 2, args);
+	zval_ptr_dtor(&ret);
+	zend_exception_restore();
+	zval_ptr_dtor(&mh);
+}
+
 /* ---- enable_hooks / disable_hooks ---------------------------------------- */
 
 static zend_internal_function *phasync_find_ifunc(const char *name, size_t len)
@@ -4370,6 +4585,18 @@ static void phasync_install_hooks(void)
 	if ((f = phasync_find_ifunc("proc_close", sizeof("proc_close") - 1))) {
 		PHASYNC_G(orig_proc_close) = f->handler;
 		f->handler = phasync_proc_close_override;
+	}
+	if ((f = phasync_find_ifunc("curl_exec", sizeof("curl_exec") - 1))) {
+		PHASYNC_G(orig_curl_exec) = f->handler;
+		f->handler = phasync_curl_exec_override;
+	}
+	if ((f = phasync_find_ifunc("sem_acquire", sizeof("sem_acquire") - 1))) {
+		PHASYNC_G(orig_sem_acquire) = f->handler;
+		f->handler = phasync_sem_acquire_override;
+	}
+	if ((f = phasync_find_ifunc("msg_receive", sizeof("msg_receive") - 1))) {
+		PHASYNC_G(orig_msg_receive) = f->handler;
+		f->handler = phasync_msg_receive_override;
 	}
 	if ((f = phasync_find_ifunc("curl_multi_select", sizeof("curl_multi_select") - 1))) {
 		PHASYNC_G(orig_curl_multi_select) = f->handler;
@@ -4511,6 +4738,15 @@ static void phasync_restore_hooks(void)
 	}
 	if (PHASYNC_G(orig_proc_close) && (f = phasync_find_ifunc("proc_close", sizeof("proc_close") - 1))) {
 		f->handler = PHASYNC_G(orig_proc_close);
+	}
+	if (PHASYNC_G(orig_curl_exec) && (f = phasync_find_ifunc("curl_exec", sizeof("curl_exec") - 1))) {
+		f->handler = PHASYNC_G(orig_curl_exec);
+	}
+	if (PHASYNC_G(orig_sem_acquire) && (f = phasync_find_ifunc("sem_acquire", sizeof("sem_acquire") - 1))) {
+		f->handler = PHASYNC_G(orig_sem_acquire);
+	}
+	if (PHASYNC_G(orig_msg_receive) && (f = phasync_find_ifunc("msg_receive", sizeof("msg_receive") - 1))) {
+		f->handler = PHASYNC_G(orig_msg_receive);
 	}
 	if (PHASYNC_G(orig_curl_multi_select) && (f = phasync_find_ifunc("curl_multi_select", sizeof("curl_multi_select") - 1))) {
 		f->handler = PHASYNC_G(orig_curl_multi_select);
