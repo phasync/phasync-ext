@@ -89,6 +89,13 @@ $loop->runAll(
     function () { usleep(100000); echo 'loop still fine: ', gethostbyname('localhost'), "\n"; },
 );
 
+// poll(0) skips epoll when nothing is armed, yet still delivers a finished
+// thread task (a loop that only ever polls without waiting).
+$loop = new Loop;
+$loop->spin = true;
+$loop->runAll(fn() => print('spinning loop, pool read: ' . strlen(file_get_contents(__FILE__, false, null, 0, 5)) . " bytes\n"));
+echo 'parked on the pool: ', $loop->parks, "\n";
+
 // Without manage(): a loop can use a Poller on its own (no functions hooked).
 $loop = new Loop;
 $f = $loop->go(function () use ($a, $loop) { $loop->poller->readable($a); echo 'no manage(): ', fread($a, 10), "\n"; });
@@ -138,6 +145,8 @@ regular file parks: 0
 idle poll waited: yes
 pool task: cancelled
 loop still fine: 127.0.0.1
+spinning loop, pool read: 5 bytes
+parked on the pool: 1
 no manage(): plain
 Poller::readable() must be called in a coroutine
 freed Poller: ok

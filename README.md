@@ -148,7 +148,8 @@ of hooked operations (file operations, DNS) started under a `manage()` given thi
 drains. So `poll($maxTime)` replaces the loop's `stream_select()` and idle
 `usleep()`: one `epoll_wait()` for up to `$maxTime` seconds (0 when it has work
 queued, else the time until its next timer), costing work per ready event, never
-a scan of everything registered. A registration lives as long as its stream and is
+a scan of everything registered; `poll(0)` with nothing waited on and no finished
+thread task queued returns without a syscall. A registration lives as long as its stream and is
 removed in the stream's close op; a coroutine waiting on a stream that is closed is
 woken, and its next use of the stream finds it closed.
 

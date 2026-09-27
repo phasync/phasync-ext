@@ -42,6 +42,8 @@ final class Poller
     /**
      * Wait up to $maxTime seconds (0: don't wait) until something waited on is
      * ready, unpark its waiters, and return: the loop's one blocking call.
+     * poll(0) with nothing waited on and no finished thread task queued returns
+     * without a syscall.
      */
     public function poll(float $maxTime): void {}
 

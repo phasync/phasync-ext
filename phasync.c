@@ -73,7 +73,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.5.0-alpha2"
+#define PHP_PHASYNC_VERSION "0.5.0-alpha3"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -381,9 +381,10 @@ typedef struct {
 
 typedef struct phasync_poller {
 	int           epfd;
-	pid_t         pid;        /* epoll and eventfd are shared with a fork()ed child */
+	unsigned      fork_gen;   /* epoll and eventfd are shared with a fork()ed child */
 	phasync_chan *chan;
 	HashTable     regs;       /* fd -> phasync_reg*                              */
+	zend_long     armed;      /* slots parked on a registration (poll(0) skips epoll without) */
 	zval          get_slot, park, unpark;
 	struct phasync_poller *next;   /* the live Pollers (for the close hooks)     */
 	zend_object   std;
@@ -394,6 +395,15 @@ typedef struct phasync_poller {
 static zend_class_entry *phasync_poller_ce;
 static zend_object_handlers phasync_poller_handlers;
 static phasync_poller *phasync_pollers;   /* live Pollers of this process */
+
+/* Bumped in every fork()ed child (pthread_atfork), so a Poller can tell it is
+ * used from a process other than its creator without a getpid() syscall. */
+static unsigned phasync_fork_gen;
+
+static void phasync_fork_child(void)
+{
+	phasync_fork_gen++;
+}
 
 static zend_always_inline phasync_poller *phasync_poller_from(zend_object *obj)
 {
@@ -448,7 +458,7 @@ static void phasync_chan_push(phasync_chan *ch, zend_long slot)
  * and eventfd instances are the parent's. */
 static bool phasync_poller_usable(phasync_poller *p)
 {
-	if (p->pid == getpid()) {
+	if (p->fork_gen == phasync_fork_gen) {
 		return true;
 	}
 	zend_throw_error(NULL, "This Poller belongs to another process; create a new one after fork()");
@@ -529,7 +539,6 @@ static void phasync_reg_drop(phasync_poller *p, phasync_reg *r)
 static void phasync_stream_forget(php_stream *stream)
 {
 	php_socket_t fd = -2;
-	pid_t pid = 0;
 
 	for (phasync_poller *p = phasync_pollers; p; p = p->next) {
 		phasync_reg *r;
@@ -539,15 +548,15 @@ static void phasync_stream_forget(php_stream *stream)
 		}
 		if (fd == -2) {
 			fd = phasync_stream_fd(stream);
-			pid = getpid();
 		}
-		if (fd == -1 || p->pid != pid
+		if (fd == -1 || p->fork_gen != phasync_fork_gen
 		 || (r = zend_hash_index_find_ptr(&p->regs, (zend_ulong) fd)) == NULL || r->stream != stream) {
 			continue;
 		}
 		for (int i = 0; i < 2; i++) {
 			if (r->slot[i] >= 0) {
 				phasync_chan_push(p->chan, r->slot[i]);
+				p->armed--;
 			}
 		}
 		phasync_reg_drop(p, r);
@@ -609,8 +618,10 @@ static int phasync_poller_wait(phasync_poller *p, int dir, php_stream *stream, p
 		goto done;
 	}
 	r->slot[idx] = slot;
+	p->armed++;
 	if (phasync_reg_arm(p, r) != 0) {
 		r->slot[idx] = -1;
+		p->armed--;
 		if (errno == EPERM) {
 			rc = PHASYNC_WAIT_READY;   /* a regular file: always ready, as select() says */
 		} else {
@@ -631,6 +642,7 @@ static int phasync_poller_wait(phasync_poller *p, int dir, php_stream *stream, p
 	if (r && r->slot[idx] == slot) {
 		/* Not unparked: cancelled or timed out. Disarm before the exception goes on. */
 		r->slot[idx] = -1;
+		p->armed--;
 		phasync_reg_arm(p, r);
 	}
 	if (r && r->transient && r->slot[0] < 0 && r->slot[1] < 0) {
@@ -1529,7 +1541,7 @@ static void phasync_pool_run(phasync_task *t)
 	phasync_chan *ch;
 	int rc;
 
-	if (!p || EG(active_fiber) == NULL || PHASYNC_G(no_suspend) || p->pid != getpid()
+	if (!p || EG(active_fiber) == NULL || PHASYNC_G(no_suspend) || p->fork_gen != phasync_fork_gen
 	 || !phasync_pool_ensure() || (t->slot = phasync_get_slot(p)) < 0) {
 		/* No coroutine to park (or no worker, or getSlot() threw): run inline. */
 		phasync_task_exec(t);
@@ -1581,7 +1593,7 @@ static void phasync_pool_run_dedicated(phasync_task *t)
 	pthread_attr_t attr;
 	int rc;
 
-	if (!p || EG(active_fiber) == NULL || p->pid != getpid() || (t->slot = phasync_get_slot(p)) < 0) {
+	if (!p || EG(active_fiber) == NULL || p->fork_gen != phasync_fork_gen || (t->slot = phasync_get_slot(p)) < 0) {
 		phasync_task_exec(t);   /* no coroutine to park: block inline, as fopen() would */
 		return;
 	}
@@ -4156,7 +4168,7 @@ static zend_object *phasync_poller_create(zend_class_entry *ce)
 	object_properties_init(&p->std, ce);
 	p->std.handlers = &phasync_poller_handlers;
 	p->epfd = -1;
-	p->pid = getpid();
+	p->fork_gen = phasync_fork_gen;
 	ZVAL_UNDEF(&p->get_slot);
 	ZVAL_UNDEF(&p->park);
 	ZVAL_UNDEF(&p->unpark);
@@ -4185,7 +4197,7 @@ static void phasync_poller_free(zend_object *obj)
 		close(p->epfd);
 	}
 	if (p->chan) {
-		if (p->pid == getpid()) {
+		if (p->fork_gen == phasync_fork_gen) {
 			phasync_chan_release(p->chan);
 		} else {
 			close(p->chan->evfd);        /* its mutex may be the parent's, held at fork */
@@ -4283,6 +4295,17 @@ ZEND_METHOD(phasync_ext_Poller, poll)
 	if ((p = phasync_this_poller(ZEND_THIS)) == NULL) {
 		RETURN_THROWS();
 	}
+	if (max_time <= 0 && p->armed == 0) {
+		/* The loop polls without waiting on every tick while it has work: with no
+		 * descriptor waited on and no finished thread task queued, skip the syscall. */
+		size_t queued;
+		pthread_mutex_lock(&p->chan->mutex);
+		queued = p->chan->len;
+		pthread_mutex_unlock(&p->chan->mutex);
+		if (queued == 0) {
+			return;
+		}
+	}
 	/* Round up, so a wait shorter than a millisecond doesn't spin. */
 	ms = max_time <= 0 ? 0 : (max_time >= INT_MAX / 1000 ? -1 : (int) ceil(max_time * 1000));
 	n = epoll_wait(p->epfd, ev, sizeof(ev) / sizeof(ev[0]), ms);
@@ -4329,10 +4352,12 @@ ZEND_METHOD(phasync_ext_Poller, poll)
 			if (rd) {
 				wake[nwake++] = r->slot[0];
 				r->slot[0] = -1;
+				p->armed--;
 			}
 			if (wr) {
 				wake[nwake++] = r->slot[1];
 				r->slot[1] = -1;
+				p->armed--;
 			}
 			if (r->slot[0] >= 0 || r->slot[1] >= 0) {
 				phasync_reg_arm(p, r);       /* the other direction still waits */
@@ -4676,6 +4701,7 @@ static PHP_MINIT_FUNCTION(phasync)
 	phasync_poller_handlers.free_obj = phasync_poller_free;
 	phasync_poller_handlers.get_gc = phasync_poller_get_gc;
 	phasync_poller_handlers.clone_obj = NULL;
+	pthread_atfork(NULL, NULL, phasync_fork_child);
 	phasync_stdio_read_orig = php_stream_stdio_ops.read;
 	phasync_stdio_write_orig = php_stream_stdio_ops.write;
 	phasync_stdio_set_option_orig = php_stream_stdio_ops.set_option;

@@ -17,6 +17,7 @@ final class Loop
     public ?string $parkThrows = null; // park() throws this class at once
     public ?Closure $onPark = null;    // fn(int $slot, ?float $timeout): true = return at once (a spurious wake), or throw
     public bool $reverse = false;      // resume what became ready in reverse order
+    public bool $spin = false;         // always poll(0): a loop that busy-polls
     public \phasync\ext\Poller $poller;
 
     private int $nextSlot = 0;
@@ -129,7 +130,7 @@ final class Loop
                 $next = min($next, $t);
             }
             $ready = count($this->ready);
-            $this->poller->poll(max(0, $next - $now));
+            $this->poller->poll($this->spin ? 0 : max(0, $next - $now));
             if ($this->reverse) {
                 $this->ready = array_merge(array_slice($this->ready, 0, $ready), array_reverse(array_slice($this->ready, $ready)));
             }
