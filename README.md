@@ -17,6 +17,13 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
      `stream_socket_accept()`, and `stream_socket_recvfrom()`/`sendto()`
    - `ssl://` / `tls://` sockets
    - `stream_select()` and `socket_select()`
+   - ext/sockets: `socket_read()`, `socket_recv()`, `socket_recvfrom()`,
+     `socket_write()`, `socket_send()`, `socket_sendto()`, `socket_accept()`,
+     `socket_connect()` (numeric addresses and unix paths), honouring
+     `SO_RCVTIMEO`/`SO_SNDTIMEO` as native timeouts
+   - `curl_multi_select()`, so curl-multi loops (Guzzle's multi handler) don't block
+     (probed without waiting and slept on between probes, 1ms doubling to 20ms:
+     PHP doesn't expose curl's sockets)
    - `proc_open()` pipes and `proc_close()`; `popen()`/`pclose()`, `shell_exec()`
      (and backticks), `exec()`, `system()`, `passthru()` — both the output pipe
      and the wait for the child to exit; `pcntl_waitpid()`/`pcntl_wait()`

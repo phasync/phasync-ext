@@ -46,6 +46,7 @@
 #include <math.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/un.h>
 #ifdef HAVE_ARPA_NAMESER_H
 # include <arpa/nameser.h>
 #endif
@@ -73,7 +74,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.5.0-alpha4"
+#define PHP_PHASYNC_VERSION "0.5.0-alpha5"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -196,6 +197,10 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_proc_close)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_pcntl_waitpid)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_pcntl_wait)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_socket_connect)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_curl_multi_select)(INTERNAL_FUNCTION_PARAMETERS);
+	zif_handler orig_sock[8];
+	HashTable sock_hooks;         /* (uintptr_t)zend_function -> index in phasync_sock_funcs */
 	phasync_spawn *spawn;         /* armed by an exec-family call until its pipe is seen */
 	bool ub_writing;              /* a fiber is suspended inside an echo (CLI stdout) */
 	int no_suspend;               /* >0: pool ops run inline (phasync\ext\stream_select) */
@@ -4024,6 +4029,216 @@ static ZEND_NAMED_FUNCTION(phasync_socket_select_override)
 		PHASYNC_G(orig_socket_select), phasync_select_fd_socket);
 }
 
+/* ---- ext/sockets: socket_read() & co. -------------------------------------
+ *
+ * Socket objects are not streams, so their blocking calls are overridden one by
+ * one. Inside a scope, in a fiber, on a socket left blocking: if it is not ready,
+ * park until it is (its SO_RCVTIMEO/SO_SNDTIMEO, if set, as the native timeout),
+ * then let the original do the call, which then doesn't wait; the real call
+ * stays on PHP's thread, so a cancelled wait consumes nothing. When the native
+ * timeout runs out, the original runs once non-blocking, failing with PHP's own
+ * warning and socket error, as the native timeout does. socket_read() in
+ * PHP_NORMAL_READ mode waits cooperatively for the first byte; the rest of the
+ * line is read by the original. */
+
+static const struct { const char *name; int dir; int timeo; } phasync_sock_funcs[] = {
+	{"socket_read", PHASYNC_READ, SO_RCVTIMEO}, {"socket_recv", PHASYNC_READ, SO_RCVTIMEO},
+	{"socket_recvfrom", PHASYNC_READ, SO_RCVTIMEO}, {"socket_accept", PHASYNC_READ, SO_RCVTIMEO},
+	{"socket_write", PHASYNC_WRITE, SO_SNDTIMEO}, {"socket_send", PHASYNC_WRITE, SO_SNDTIMEO},
+	{"socket_sendto", PHASYNC_WRITE, SO_SNDTIMEO},
+};
+#define PHASYNC_SOCK_NFUNCS (sizeof(phasync_sock_funcs) / sizeof(phasync_sock_funcs[0]))
+
+/* The Socket argument's fd if it is a blocking socket we may wait on, else -1. */
+static php_socket_t phasync_socket_arg(zend_execute_data *execute_data, phasync_php_socket **out)
+{
+	zval *z;
+	php_socket_t fd;
+
+	if (ZEND_NUM_ARGS() < 1 || (fd = phasync_select_fd_socket(z = ZEND_CALL_ARG(execute_data, 1))) == -1) {
+		return -1;
+	}
+	ZVAL_DEREF(z);
+	*out = (phasync_php_socket *) ((char *) Z_OBJ_P(z) - XtOffsetOf(phasync_php_socket, std));
+	return (*out)->blocking ? fd : -1;
+}
+
+static ZEND_NAMED_FUNCTION(phasync_socket_io_override)
+{
+	zval *idx = zend_hash_index_find(&PHASYNC_G(sock_hooks), (zend_ulong) (uintptr_t) EX(func));
+	zif_handler orig = PHASYNC_G(orig_sock)[Z_LVAL_P(idx)];
+	int dir = phasync_sock_funcs[Z_LVAL_P(idx)].dir;
+	phasync_php_socket *ps;
+	php_socket_t fd;
+	struct pollfd pfd;
+
+	if (!phasync_reading() || EG(active_fiber) == NULL || (fd = phasync_socket_arg(execute_data, &ps)) == -1) {
+		orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	pfd.fd = fd;
+	pfd.events = dir == PHASYNC_READ ? POLLIN : POLLOUT;
+	if (poll(&pfd, 1, 0) == 0) {
+		struct timeval tv = {0, 0};
+		socklen_t len = sizeof(tv);
+		double timeout = INFINITY, deadline;
+		int w;
+
+		if (getsockopt(fd, SOL_SOCKET, phasync_sock_funcs[Z_LVAL_P(idx)].timeo, &tv, &len) == 0
+		 && (tv.tv_sec || tv.tv_usec)) {
+			timeout = (double) tv.tv_sec + tv.tv_usec / 1e6;
+		}
+		deadline = phasync_now() + timeout;
+		do {
+			w = phasync_wait_fd(dir, NULL, fd, isinf(timeout) ? INFINITY : MAX(deadline - phasync_now(), 0));
+		} while (w == PHASYNC_WAIT_READY && poll(&pfd, 1, 0) == 0);
+		if (w == PHASYNC_WAIT_ERROR) {
+			return;                          /* exception pending */
+		}
+		if (w == PHASYNC_WAIT_TIMEOUT) {
+			int flags = fcntl(fd, F_GETFL, 0);
+			fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+			orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);   /* fails with the native EAGAIN */
+			fcntl(fd, F_SETFL, flags);
+			return;
+		}
+	}
+	orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+/* What ext/sockets' PHP_SOCKET_ERROR() does: the socket's error, the module's
+ * last error (the first field of its globals, the same from 8.2 to master; not
+ * reachable this way in a ZTS build) and the warning. */
+static void phasync_socket_error(phasync_php_socket *ps, const char *msg, int err)
+{
+	ps->error = err;
+#ifndef ZTS
+	{
+		zend_module_entry *m = zend_hash_str_find_ptr(&module_registry, "sockets", sizeof("sockets") - 1);
+		if (m && m->globals_ptr) {
+			*(int *) m->globals_ptr = err;
+		}
+	}
+#endif
+	if (err != EAGAIN && err != EWOULDBLOCK && err != EINPROGRESS) {
+		php_error_docref(NULL, E_WARNING, "%s [%d]: %s", msg, err, strerror(err));
+	}
+}
+
+/* socket_connect() to a numeric IPv4/IPv6 address or a unix path: connect
+ * non-blocking and park until the socket is writable; true on success, false
+ * with ext/sockets' own error reporting otherwise, as the original does. A host
+ * name goes to the original (its lookup is PHP's internal blocking one). */
+static ZEND_NAMED_FUNCTION(phasync_socket_connect_override)
+{
+	uint32_t argc = ZEND_NUM_ARGS();
+	zval *zaddr = argc >= 2 ? ZEND_CALL_ARG(execute_data, 2) : NULL;
+	zval *zport = argc >= 3 ? ZEND_CALL_ARG(execute_data, 3) : NULL;
+	struct sockaddr_storage ss;
+	socklen_t sslen = 0;
+	phasync_php_socket *ps;
+	php_socket_t fd;
+	int flags, rc, err = 0;
+
+	memset(&ss, 0, sizeof(ss));
+	if (!phasync_reading() || EG(active_fiber) == NULL || (fd = phasync_socket_arg(execute_data, &ps)) == -1
+	 || !zaddr || Z_TYPE_P(zaddr) != IS_STRING || (zport && Z_TYPE_P(zport) != IS_LONG && Z_TYPE_P(zport) != IS_NULL)) {
+		PHASYNC_G(orig_socket_connect)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	if (ps->type == AF_INET && zport && Z_TYPE_P(zport) == IS_LONG
+	 && inet_pton(AF_INET, Z_STRVAL_P(zaddr), &((struct sockaddr_in *) &ss)->sin_addr) == 1) {
+		((struct sockaddr_in *) &ss)->sin_family = AF_INET;
+		((struct sockaddr_in *) &ss)->sin_port = htons((unsigned short) Z_LVAL_P(zport));
+		sslen = sizeof(struct sockaddr_in);
+	} else if (ps->type == AF_INET6 && zport && Z_TYPE_P(zport) == IS_LONG
+	        && inet_pton(AF_INET6, Z_STRVAL_P(zaddr), &((struct sockaddr_in6 *) &ss)->sin6_addr) == 1) {
+		((struct sockaddr_in6 *) &ss)->sin6_family = AF_INET6;
+		((struct sockaddr_in6 *) &ss)->sin6_port = htons((unsigned short) Z_LVAL_P(zport));
+		sslen = sizeof(struct sockaddr_in6);
+	} else if (ps->type == AF_UNIX && Z_STRLEN_P(zaddr) < sizeof(((struct sockaddr_un *) &ss)->sun_path)) {
+		((struct sockaddr_un *) &ss)->sun_family = AF_UNIX;
+		memcpy(((struct sockaddr_un *) &ss)->sun_path, Z_STRVAL_P(zaddr), Z_STRLEN_P(zaddr));
+		sslen = (socklen_t) (XtOffsetOf(struct sockaddr_un, sun_path) + Z_STRLEN_P(zaddr));
+	}
+	if (sslen == 0) {
+		PHASYNC_G(orig_socket_connect)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	flags = fcntl(fd, F_GETFL, 0);
+	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	do { rc = connect(fd, (struct sockaddr *) &ss, sslen); } while (rc != 0 && errno == EINTR);
+	err = rc != 0 ? errno : 0;
+	if (rc != 0 && errno == EINPROGRESS) {
+		socklen_t elen = sizeof(err);
+		if (phasync_wait_fd(PHASYNC_WRITE, NULL, fd, INFINITY) != PHASYNC_WAIT_READY) {
+			fcntl(fd, F_SETFL, flags);
+			return;                          /* exception pending */
+		}
+		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0) {
+			err = errno;
+		}
+		rc = err == 0 ? 0 : -1;
+	}
+	fcntl(fd, F_SETFL, flags);
+	if (rc == 0) {
+		RETURN_TRUE;
+	}
+	phasync_socket_error(ps, "unable to connect", err);
+	RETURN_FALSE;
+}
+
+/* curl_multi_select() waits for curl's own sockets, which PHP doesn't expose
+ * (no curl_multi_fdset()). Inside a scope, in a fiber: probe the original with a
+ * zero timeout, and sleep through the loop between probes (1ms, doubling to
+ * 20ms) until activity or the caller's timeout; 0 on timeout, as natively. The
+ * probe calls the function again by name, which (select_depth > 0) goes
+ * straight to the original. */
+static ZEND_NAMED_FUNCTION(phasync_curl_multi_select_override)
+{
+	uint32_t argc = ZEND_NUM_ARGS();
+	zval *zmh = argc >= 1 ? ZEND_CALL_ARG(execute_data, 1) : NULL;
+	zval *zto = argc >= 2 ? ZEND_CALL_ARG(execute_data, 2) : NULL;
+	double timeout = 1.0, deadline;
+	zend_long usec = 1000;
+	zval fn, args[2], ret;
+
+	if (PHASYNC_G(select_depth) || !phasync_reading() || EG(active_fiber) == NULL || !zmh
+	 || (zto && Z_TYPE_P(zto) != IS_DOUBLE && Z_TYPE_P(zto) != IS_LONG)) {
+		PHASYNC_G(orig_curl_multi_select)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	if (zto) {
+		timeout = zval_get_double(zto);
+	}
+	deadline = phasync_now() + timeout;
+	ZVAL_STRING(&fn, "curl_multi_select");
+	ZVAL_COPY(&args[0], zmh);
+	ZVAL_DOUBLE(&args[1], 0.0);
+	for (;;) {
+		double left;
+		ZVAL_UNDEF(&ret);
+		PHASYNC_G(select_depth)++;
+		call_user_function(NULL, NULL, &fn, &ret, 2, args);
+		PHASYNC_G(select_depth)--;
+		if (EG(exception) || Z_TYPE(ret) != IS_LONG || Z_LVAL(ret) != 0
+		 || (left = deadline - phasync_now()) <= 0) {
+			break;                           /* activity, an error (-1), or time up */
+		}
+		zval_ptr_dtor(&ret);
+		if (phasync_call_sleep(phasync_sleep_handler(), MIN(usec, (zend_long) (left * 1e6) + 1)) < 0) {
+			ZVAL_UNDEF(&ret);
+			break;                           /* exception pending */
+		}
+		usec = MIN(usec * 2, 20000);
+	}
+	zval_ptr_dtor(&fn);
+	zval_ptr_dtor(&args[0]);
+	if (!Z_ISUNDEF(ret)) {
+		RETURN_COPY_VALUE(&ret);
+	}
+}
+
 /* ---- enable_hooks / disable_hooks ---------------------------------------- */
 
 static zend_internal_function *phasync_find_ifunc(const char *name, size_t len)
@@ -4100,6 +4315,23 @@ static void phasync_install_hooks(void)
 	if ((f = phasync_find_ifunc("proc_close", sizeof("proc_close") - 1))) {
 		PHASYNC_G(orig_proc_close) = f->handler;
 		f->handler = phasync_proc_close_override;
+	}
+	if ((f = phasync_find_ifunc("curl_multi_select", sizeof("curl_multi_select") - 1))) {
+		PHASYNC_G(orig_curl_multi_select) = f->handler;
+		f->handler = phasync_curl_multi_select_override;
+	}
+	if ((f = phasync_find_ifunc("socket_connect", sizeof("socket_connect") - 1))) {
+		PHASYNC_G(orig_socket_connect) = f->handler;
+		f->handler = phasync_socket_connect_override;
+	}
+	for (zend_long i = 0; i < (zend_long) PHASYNC_SOCK_NFUNCS; i++) {
+		if ((f = phasync_find_ifunc(phasync_sock_funcs[i].name, strlen(phasync_sock_funcs[i].name)))) {
+			zval zi;
+			ZVAL_LONG(&zi, i);
+			PHASYNC_G(orig_sock)[i] = f->handler;
+			f->handler = phasync_socket_io_override;
+			zend_hash_index_update(&PHASYNC_G(sock_hooks), (zend_ulong) (uintptr_t) f, &zi);
+		}
 	}
 	if ((f = phasync_find_ifunc("pcntl_waitpid", sizeof("pcntl_waitpid") - 1))) {
 		PHASYNC_G(orig_pcntl_waitpid) = f->handler;
@@ -4225,6 +4457,18 @@ static void phasync_restore_hooks(void)
 	if (PHASYNC_G(orig_proc_close) && (f = phasync_find_ifunc("proc_close", sizeof("proc_close") - 1))) {
 		f->handler = PHASYNC_G(orig_proc_close);
 	}
+	if (PHASYNC_G(orig_curl_multi_select) && (f = phasync_find_ifunc("curl_multi_select", sizeof("curl_multi_select") - 1))) {
+		f->handler = PHASYNC_G(orig_curl_multi_select);
+	}
+	if (PHASYNC_G(orig_socket_connect) && (f = phasync_find_ifunc("socket_connect", sizeof("socket_connect") - 1))) {
+		f->handler = PHASYNC_G(orig_socket_connect);
+	}
+	for (size_t i = 0; i < PHASYNC_SOCK_NFUNCS; i++) {
+		if (PHASYNC_G(orig_sock)[i] && (f = phasync_find_ifunc(phasync_sock_funcs[i].name, strlen(phasync_sock_funcs[i].name)))) {
+			f->handler = PHASYNC_G(orig_sock)[i];
+		}
+	}
+	zend_hash_clean(&PHASYNC_G(sock_hooks));
 	if (PHASYNC_G(orig_pcntl_waitpid) && (f = phasync_find_ifunc("pcntl_waitpid", sizeof("pcntl_waitpid") - 1))) {
 		f->handler = PHASYNC_G(orig_pcntl_waitpid);
 	}
@@ -4928,6 +5172,7 @@ static PHP_GINIT_FUNCTION(phasync)
 	zend_hash_init(&phasync_globals->hooked, 8, NULL, phasync_hook_entry_dtor, 1);
 	zend_hash_init(&phasync_globals->wrapped_ops_cache, 8, NULL, phasync_ops_dtor, 1);
 	zend_hash_init(&phasync_globals->fs_hooks, 32, NULL, NULL, 1);
+	zend_hash_init(&phasync_globals->sock_hooks, 8, NULL, NULL, 1);
 	phasync_globals->mountinfo_fd = -1;
 }
 
@@ -4936,6 +5181,7 @@ static PHP_GSHUTDOWN_FUNCTION(phasync)
 	zend_hash_destroy(&phasync_globals->hooked);
 	zend_hash_destroy(&phasync_globals->wrapped_ops_cache);
 	zend_hash_destroy(&phasync_globals->fs_hooks);
+	zend_hash_destroy(&phasync_globals->sock_hooks);
 	for (int i = 0; i < phasync_globals->nmounts; i++) {
 		free(phasync_globals->mounts[i].path);
 	}
