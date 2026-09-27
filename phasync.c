@@ -3,26 +3,24 @@
  * phasync\ext\stream_select() — growable, poll(2)-based, no FD_SETSIZE limit.
  *         Accepts stream resources and plain integer file descriptors.
  *
- * phasync\ext\manage($code, $read, $write, $sleep, $timeoutException) — run $code
- *         with transparent async I/O active for its dynamic extent. The tcp/unix/
- *         ssl transports are re-registered, and proc_open()/proc_close()/popen()/
- *         exec()/system()/passthru()/shell_exec()/stream_socket_pair()/
- *         stream_select()/socket_select()/the sleep, DNS and filesystem
- *         functions/fopen() overridden at request start, and every descriptor-backed stream
- *         is wrapped as it is created (plus STDIN/STDOUT/STDERR and any fds
- *         inherited before load). The wrappers are inert outside a scope: a
- *         wrapped stream then behaves exactly like an unwrapped one. Inside a
- *         scope, a would-block on a stream left in blocking mode calls the scope's
- *         handler with the stream RESOURCE and the time the native op would still
- *         wait (null = forever); the handler returns when the stream is ready, or
- *         throws. An exception instanceof $timeoutException is caught and the op
- *         finishes the way native PHP does on a socket timeout; any other
- *         exception propagates out of the hooked function. The C side never
- *         touches the fiber API — the userland callbacks own all suspension; it
- *         works because PHP fibers are stackful. Regular-file and DNS blocking and
- *         the FIFO open() rendezvous run on a worker thread pool (not
- *         readiness-pollable / unsolvable single-threaded), waking the fiber via a
- *         self-pipe.
+ * phasync\ext\manage($task, $getSlot, $park, $unpark, $sleep, $timeoutException)
+ *         — run $task with transparent async I/O active for its dynamic extent.
+ *         The tcp/unix/ssl transports are re-registered, and the process, sleep,
+ *         DNS, file and filesystem functions, stream_select()/socket_select() and
+ *         friends overridden at request start; every descriptor-backed stream is
+ *         wrapped as it is created (plus STDIN/STDOUT/STDERR and any fds inherited
+ *         before load). The wrappers are inert outside a scope: a wrapped stream
+ *         then behaves exactly like an unwrapped one. Inside a scope, in a fiber,
+ *         a would-block parks the coroutine in a fresh slot of the scope's event
+ *         loop, and phasync\ext\poll() — the loop's one blocking call, on epoll —
+ *         unparks it when it may continue: descriptors through one-shot epoll
+ *         registrations, thread-pool tasks through a queue and an eventfd. The
+ *         native timeout of the call goes to park(); park() throwing
+ *         $timeoutException after it ran out finishes the op the way native PHP
+ *         does on a timeout, any other exception propagates. The C side never
+ *         touches the fiber API — the loop owns all suspension; it works because
+ *         PHP fibers are stackful. Regular files, DNS and the FIFO open()
+ *         rendezvous run on worker threads (not readiness-pollable).
  */
 #ifdef HAVE_CONFIG_H
 # include "config.h"
@@ -35,6 +33,9 @@
 #include "php_network.h"
 #include "SAPI.h"
 #include "zend_exceptions.h"
+#include "zend_closures.h"
+#include "ext/spl/spl_exceptions.h"
+#include <float.h>
 #include "phasync_arginfo.h"
 
 #include <poll.h>
@@ -42,8 +43,6 @@
 #include <math.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
-#include <sys/ioctl.h>
-#include <netinet/tcp.h>
 #ifdef HAVE_ARPA_NAMESER_H
 # include <arpa/nameser.h>
 #endif
@@ -71,7 +70,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha21"
+#define PHP_PHASYNC_VERSION "0.5.0-alpha1"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -148,10 +147,11 @@ typedef enum {
  * call and link to the enclosing scope, so nesting is plain LIFO and unwinds
  * automatically. The three handlers are owned copies of the closures. */
 typedef struct phasync_scope {
-	zval read;
-	zval write;
-	zval sleep;
-	zend_class_entry *timeout_ce;   /* handler exceptions instanceof this = a timeout */
+	zval get_slot;                  /* getSlot(): int                               */
+	zval park;                      /* park(int $slot, float $timeout): void        */
+	zval unpark;                    /* unpark(int $slot): bool                      */
+	zval sleep;                     /* sleep(int $microseconds): void               */
+	zend_class_entry *timeout_ce;   /* park() throwing this = the wait's time ran out */
 	struct phasync_scope *prev;
 } phasync_scope;
 
@@ -206,15 +206,19 @@ ZEND_DECLARE_MODULE_GLOBALS(phasync)
 # define PHASYNC_G(v) (phasync_globals.v)
 #endif
 
-/* Active handlers = those of the innermost manage() scope, or NULL when no
- * scope is active (then hooked I/O falls through to the original behaviour). */
-static zend_always_inline zval *phasync_read_handler(void)
+/* Waits go through the innermost manage() scope. Outside one, hooked I/O falls
+ * through to the original behaviour: these return 0, and the wait direction
+ * (PHASYNC_READ / PHASYNC_WRITE) inside one. */
+#define PHASYNC_READ   1
+#define PHASYNC_WRITE  2
+
+static zend_always_inline int phasync_reading(void)
 {
-	return PHASYNC_G(scope_top) ? &PHASYNC_G(scope_top)->read : NULL;
+	return PHASYNC_G(scope_top) ? PHASYNC_READ : 0;
 }
-static zend_always_inline zval *phasync_write_handler(void)
+static zend_always_inline int phasync_writing(void)
 {
-	return PHASYNC_G(scope_top) ? &PHASYNC_G(scope_top)->write : NULL;
+	return PHASYNC_G(scope_top) ? PHASYNC_WRITE : 0;
 }
 static zend_always_inline zval *phasync_sleep_handler(void)
 {
@@ -231,10 +235,10 @@ static php_socket_t phasync_stream_fd(php_stream *stream)
 	return fd;
 }
 
-/* Tri-state result of a read/write wait handler. */
-#define PHASYNC_WAIT_READY    0    /* handler said ready  -> retry the op          */
-#define PHASYNC_WAIT_TIMEOUT  1    /* handler said timed out -> finish like native */
-#define PHASYNC_WAIT_ERROR    (-1) /* handler threw -> exception pending, propagate */
+/* Tri-state result of a wait. */
+#define PHASYNC_WAIT_READY    0    /* ready (or closed/failed) -> retry the op       */
+#define PHASYNC_WAIT_TIMEOUT  1    /* native timeout ran out   -> finish like native */
+#define PHASYNC_WAIT_ERROR    (-1) /* exception pending (a cancellation) -> propagate */
 
 /* Call the sleep handler as handler(int $microseconds). Returns -1 if it threw. */
 static int phasync_call_sleep(zval *handler, zend_long usec)
@@ -247,42 +251,6 @@ static int phasync_call_sleep(zval *handler, zend_long usec)
 	if (call_user_function(NULL, NULL, handler, &retval, 1, &arg) == FAILURE || EG(exception)) {
 		rc = -1;
 	}
-	zval_ptr_dtor(&retval);
-	return rc;
-}
-
-/* Call a read/write wait handler as handler(resource $stream, ?float $timeout).
- * $timeout is how many seconds the native op would still wait (null = forever).
- * The handler's return value is ignored: returning means the stream is ready
- * (PHASYNC_WAIT_READY, retry the op). If it throws an instance of the scope's
- * timeout class, the exception is cleared and the wait counts as timed out
- * (PHASYNC_WAIT_TIMEOUT — finish the op the native timeout way). Any other
- * exception is left pending (PHASYNC_WAIT_ERROR) so it propagates out of the
- * hooked function unchanged. */
-static int phasync_call_wait(zval *handler, zval *arg, double timeout)
-{
-	zval call_args[2], retval;
-	int rc = PHASYNC_WAIT_READY;
-
-	ZVAL_COPY(&call_args[0], arg);        /* +1 ref for the duration of the call */
-	if (isinf(timeout)) {
-		ZVAL_NULL(&call_args[1]);
-	} else {
-		ZVAL_DOUBLE(&call_args[1], timeout);
-	}
-	ZVAL_UNDEF(&retval);
-	if (call_user_function(NULL, NULL, handler, &retval, 2, call_args) == FAILURE) {
-		rc = PHASYNC_WAIT_ERROR;
-	} else if (EG(exception)) {
-		zend_class_entry *tce = PHASYNC_G(scope_top) ? PHASYNC_G(scope_top)->timeout_ce : NULL;
-		if (tce && instanceof_function(EG(exception)->ce, tce)) {
-			zend_clear_exception();
-			rc = PHASYNC_WAIT_TIMEOUT;
-		} else {
-			rc = PHASYNC_WAIT_ERROR;
-		}
-	}
-	zval_ptr_dtor(&call_args[0]);
 	zval_ptr_dtor(&retval);
 	return rc;
 }
@@ -369,43 +337,300 @@ static double phasync_now(void)
 	return (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
 }
 
-/* Wait for the fd via the handler, handing over the stream RESOURCE (so it can go
- * straight into phasync::readable()/writable() or a native stream_select()) and
- * the native timeout. See phasync_call_wait for the tri-state return.
+/* ---- waiting: slots, epoll, poll() -----------------------------------------
  *
- * For a real stream (socket/pipe/TLS) we borrow the stream's own resource. For a
- * bare fd with no stream — the thread pool's self-pipe — we wrap a dup() of the fd
- * in a transient php_stream so the loop still gets a selectable resource, then
- * close it afterwards (the dup keeps the pool's own fd untouched for reuse). */
-static int phasync_wait_fd(zval *handler, php_stream *stream, php_socket_t fd, double timeout)
-{
-	zval arg;
-	int rc;
+ * A coroutine waits by parking in a slot of the event loop (getSlot(), park(),
+ * unpark(), from manage()); the extension resumes it by unparking the slot, and
+ * only ever on PHP's thread, inside poll(). Every wait takes a fresh slot, so a
+ * late wake-up can only find a vacant slot (unpark() returns false).
+ *
+ * Waiting for a descriptor arms a one-shot epoll registration (EPOLLONESHOT):
+ * a level-triggered one with nobody waiting would make every epoll_wait()
+ * return at once while unread data sits in the socket. A registration lives as
+ * long as its stream, which is deregistered in its close op (epoll keeps a
+ * registration while any duplicate of the descriptor lives, so close() alone is
+ * not enough); streams without a close hook, and bare descriptors, get a
+ * registration for the one wait only. Threads never call PHP: they queue the
+ * slot to wake and write to an eventfd in the epoll set, and poll() drains the
+ * queue. */
 
-	if (stream != NULL && stream->res != NULL) {
-		ZVAL_RES(&arg, stream->res);   /* borrow (no ownership transfer) */
-		return phasync_call_wait(handler, &arg, timeout);
+typedef struct {
+	php_socket_t fd;
+	php_stream  *stream;      /* owner; NULL for a bare descriptor               */
+	zend_long    slot[2];     /* parked reader [0] and writer [1]; -1 = nobody   */
+	bool         added;       /* in the epoll set                                */
+	bool         transient;   /* for the current wait only                       */
+} phasync_reg;
+
+#define PHASYNC_EP_COMPLETIONS UINT64_MAX
+
+static int   phasync_epfd = -1;          /* per process (see phasync_ep_ensure) */
+static pid_t phasync_ep_pid;
+static int   phasync_evfd = -1;          /* threads' completion signal          */
+static pid_t phasync_evfd_pid;
+static HashTable phasync_regs;           /* fd -> phasync_reg*                  */
+static bool  phasync_regs_ready;
+
+/* Slots of finished thread tasks, queued by the threads (under the mutex) and
+ * drained by poll(). phasync_cq_cond wakes a coroutine that was cancelled while
+ * its bounded task ran and has to wait for the task before it can go on. */
+static pthread_mutex_t phasync_cq_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  phasync_cq_cond  = PTHREAD_COND_INITIALIZER;
+static zend_long *phasync_cq;
+static size_t     phasync_cq_len, phasync_cq_cap;
+
+static void phasync_reg_dtor(zval *zv)
+{
+	pefree(Z_PTR_P(zv), 1);
+}
+
+/* Queue a slot for poll() to unpark, from any thread. */
+static void phasync_cq_push(zend_long slot)
+{
+	uint64_t one = 1;
+	ssize_t w;
+
+	pthread_mutex_lock(&phasync_cq_mutex);
+	if (phasync_cq_len == phasync_cq_cap) {
+		size_t cap = phasync_cq_cap ? phasync_cq_cap * 2 : 64;
+		zend_long *q = realloc(phasync_cq, cap * sizeof(*q));
+		if (q) {
+			phasync_cq = q;
+			phasync_cq_cap = cap;
+		}
 	}
+	if (phasync_cq_len < phasync_cq_cap) {
+		phasync_cq[phasync_cq_len++] = slot;
+	}
+	pthread_cond_broadcast(&phasync_cq_cond);
+	pthread_mutex_unlock(&phasync_cq_mutex);
+	do { w = write(phasync_evfd, &one, sizeof(one)); } while (w < 0 && errno == EINTR);
+}
+
+/* The epoll set, created on first use. epoll and eventfd instances are shared
+ * with a fork()ed child, where using them would steal the parent's events: a
+ * child makes its own (its copies of the parent's close without touching them). */
+static bool phasync_ep_ensure(void)
+{
+	pid_t pid = getpid();
+	struct epoll_event e;
+
+	if (phasync_epfd >= 0 && phasync_ep_pid == pid) {
+		return true;
+	}
+	if (phasync_epfd >= 0) {
+		close(phasync_epfd);
+		phasync_epfd = -1;
+	}
+	if (!phasync_regs_ready) {
+		zend_hash_init(&phasync_regs, 64, NULL, phasync_reg_dtor, 1);
+		phasync_regs_ready = true;
+	}
+	zend_hash_clean(&phasync_regs);
+	if (phasync_evfd >= 0 && phasync_evfd_pid != pid) {
+		close(phasync_evfd);
+		phasync_evfd = -1;
+		pthread_mutex_lock(&phasync_cq_mutex);
+		phasync_cq_len = 0;
+		pthread_mutex_unlock(&phasync_cq_mutex);
+	}
+	if (phasync_evfd < 0) {
+		phasync_evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+		phasync_evfd_pid = pid;
+	}
+	phasync_epfd = epoll_create1(EPOLL_CLOEXEC);
+	if (phasync_epfd < 0 || phasync_evfd < 0) {
+		return false;
+	}
+	phasync_ep_pid = pid;
+	e.events = EPOLLIN;
+	e.data.u64 = PHASYNC_EP_COMPLETIONS;
+	epoll_ctl(phasync_epfd, EPOLL_CTL_ADD, phasync_evfd, &e);
+	return true;
+}
+
+/* A new slot from the scope's getSlot(); -1 if it threw. */
+static zend_long phasync_get_slot(void)
+{
+	zval retval;
+	zend_long slot = -1;
+
+	ZVAL_UNDEF(&retval);
+	if (call_user_function(NULL, NULL, &PHASYNC_G(scope_top)->get_slot, &retval, 0, NULL) == SUCCESS
+	 && !EG(exception)) {
+		slot = zval_get_long(&retval);
+	}
+	zval_ptr_dtor(&retval);
+	return slot;
+}
+
+/* Park the current coroutine in $slot. READY when unparked. When park() throws
+ * the scope's timeout class after the timeout given (the native timeout the op
+ * would wait) has run out, the exception is cleared: TIMEOUT, finish the op the
+ * way PHP does on a timeout. With native_timeout false (the public readable()
+ * and writable()), or for any other exception (a cancellation), it stays
+ * pending: ERROR. */
+static int phasync_park(zend_long slot, double timeout, bool native_timeout)
+{
+	zval args[2], retval;
+	double deadline = isinf(timeout) ? INFINITY : phasync_now() + timeout;
+	int rc = PHASYNC_WAIT_READY;
+
+	ZVAL_LONG(&args[0], slot);
+	ZVAL_DOUBLE(&args[1], isinf(timeout) ? DBL_MAX : timeout);
+	ZVAL_UNDEF(&retval);
+	if (call_user_function(NULL, NULL, &PHASYNC_G(scope_top)->park, &retval, 2, args) == FAILURE) {
+		rc = PHASYNC_WAIT_ERROR;
+	} else if (EG(exception)) {
+		zend_class_entry *tce = PHASYNC_G(scope_top)->timeout_ce;
+		if (native_timeout && !isinf(deadline) && tce && instanceof_function(EG(exception)->ce, tce)
+		 && phasync_now() + 0.001 >= deadline) {
+			zend_clear_exception();
+			rc = PHASYNC_WAIT_TIMEOUT;
+		} else {
+			rc = PHASYNC_WAIT_ERROR;
+		}
+	}
+	zval_ptr_dtor(&retval);
+	return rc;
+}
+
+/* Arm the registration for whoever is parked on it (one-shot); with nobody,
+ * leave it disarmed. Returns -1 (errno set) if epoll refused the descriptor. */
+static int phasync_reg_arm(phasync_reg *r)
+{
+	struct epoll_event e;
+	uint32_t ev = (r->slot[0] >= 0 ? EPOLLIN | EPOLLRDHUP : 0) | (r->slot[1] >= 0 ? EPOLLOUT : 0);
+
+	e.events = ev | EPOLLONESHOT;
+	e.data.u64 = (uint64_t) r->fd;
+	if (epoll_ctl(phasync_epfd, r->added ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, r->fd, &e) != 0) {
+		return -1;
+	}
+	r->added = true;
+	return 0;
+}
+
+static void phasync_reg_drop(phasync_reg *r)
+{
+	if (r->added) {
+		epoll_ctl(phasync_epfd, EPOLL_CTL_DEL, r->fd, NULL);
+	}
+	zend_hash_index_del(&phasync_regs, (zend_ulong) r->fd);   /* frees r */
+}
+
+/* A stream is closing: deregister it before its descriptor goes away, and wake
+ * whoever is parked on it (through poll(), like any wake-up); their next use of
+ * the stream finds it closed. */
+static void phasync_stream_forget(php_stream *stream)
+{
+	phasync_reg *r;
+	php_socket_t fd;
+
+	if (!phasync_regs_ready || phasync_epfd < 0 || phasync_ep_pid != getpid()
+	 || zend_hash_num_elements(&phasync_regs) == 0 || (fd = phasync_stream_fd(stream)) == -1
+	 || (r = zend_hash_index_find_ptr(&phasync_regs, (zend_ulong) fd)) == NULL || r->stream != stream) {
+		return;
+	}
+	for (int i = 0; i < 2; i++) {
+		if (r->slot[i] >= 0) {
+			phasync_cq_push(r->slot[i]);
+		}
+	}
+	phasync_reg_drop(r);
+}
+
+static bool phasync_has_close_hook(php_stream *stream);
+
+/* Wait (in a fiber, inside a scope) until fd is readable or writable, or closed
+ * or failed. timeout is the native timeout, INFINITY for none. Returns READY,
+ * TIMEOUT or ERROR (exception pending); see phasync_park(). */
+static int phasync_wait_fd_ex(int dir, php_stream *stream, php_socket_t fd, double timeout, bool native_timeout)
+{
+	int idx = dir == PHASYNC_WRITE, rc, dupfd = -1;
+	phasync_reg *r;
+	zend_long slot;
 
 	if (fd == -1) {
+		zend_throw_error(NULL, "The stream has no file descriptor to wait on");
 		return PHASYNC_WAIT_ERROR;
 	}
-	{
-		int dupfd = dup(fd);
-		php_stream *tmp;
-		if (dupfd < 0) {
-			return PHASYNC_WAIT_ERROR;
-		}
-		tmp = php_stream_fopen_from_fd(dupfd, "r", NULL);
-		if (tmp == NULL) {
-			close(dupfd);
-			return PHASYNC_WAIT_ERROR;
-		}
-		php_stream_to_zval(tmp, &arg);   /* register as a resource; arg owns 1 ref */
-		rc = phasync_call_wait(handler, &arg, timeout);
-		zval_ptr_dtor(&arg);             /* drop our ref -> closes tmp (and dupfd) */
-		return rc;
+	if (!phasync_ep_ensure()) {
+		zend_throw_error(NULL, "Unable to create the epoll set: %s", strerror(errno));
+		return PHASYNC_WAIT_ERROR;
 	}
+	r = zend_hash_index_find_ptr(&phasync_regs, (zend_ulong) fd);
+	if (r && stream && r->stream != stream && r->stream) {
+		/* The other stream's close op never deregistered it: a bug in the extension.
+		 * Never re-register quietly. */
+		zend_error_noreturn(E_ERROR, "phasync: descriptor %d is still registered for stream %p, now waited on by stream %p",
+			(int) fd, (void *) r->stream, (void *) stream);
+	}
+	if (r && !stream) {
+		/* A bare-descriptor wait on a descriptor a stream owns (echo to STDOUT):
+		 * wait on a duplicate, which epoll keeps apart. */
+		if ((dupfd = dup(fd)) < 0) {
+			zend_throw_error(NULL, "Unable to wait on descriptor %d: %s", (int) fd, strerror(errno));
+			return PHASYNC_WAIT_ERROR;
+		}
+		fd = dupfd;
+		r = NULL;
+	}
+	if (r == NULL) {
+		r = pecalloc(1, sizeof(*r), 1);
+		r->fd = fd;
+		r->stream = stream;
+		r->slot[0] = r->slot[1] = -1;
+		r->transient = stream == NULL || !phasync_has_close_hook(stream);
+		zend_hash_index_add_new_ptr(&phasync_regs, (zend_ulong) fd, r);
+	}
+	if (r->slot[idx] >= 0) {
+		zend_throw_exception_ex(spl_ce_LogicException, 0, "Another coroutine is already waiting to %s this stream",
+			idx ? "write to" : "read from");
+		rc = PHASYNC_WAIT_ERROR;
+		goto done;
+	}
+	if ((slot = phasync_get_slot()) < 0) {
+		rc = PHASYNC_WAIT_ERROR;
+		goto done;
+	}
+	r->slot[idx] = slot;
+	if (phasync_reg_arm(r) != 0) {
+		r->slot[idx] = -1;
+		if (errno == EPERM) {
+			rc = PHASYNC_WAIT_READY;   /* a regular file: always ready, as select() says */
+		} else {
+			zend_throw_error(NULL, "Unable to wait on descriptor %d: %s", (int) fd, strerror(errno));
+			rc = PHASYNC_WAIT_ERROR;
+		}
+		goto done;
+	}
+
+	rc = phasync_park(slot, timeout, native_timeout);
+
+	/* The stream may have been closed meanwhile (r freed): look it up again. */
+	r = zend_hash_index_find_ptr(&phasync_regs, (zend_ulong) fd);
+	if (r && r->stream != stream) {
+		r = NULL;
+	}
+	if (r && r->slot[idx] == slot) {
+		/* Not unparked: cancelled or timed out. Disarm before the exception goes on. */
+		r->slot[idx] = -1;
+		phasync_reg_arm(r);
+	}
+done:
+	if (r && r->transient && r->slot[0] < 0 && r->slot[1] < 0) {
+		phasync_reg_drop(r);
+	}
+	if (dupfd >= 0) {
+		close(dupfd);
+	}
+	return rc;
+}
+
+static zend_always_inline int phasync_wait_fd(int dir, php_stream *stream, php_socket_t fd, double timeout)
+{
+	return phasync_wait_fd_ex(dir, stream, fd, timeout, true);
 }
 
 #define PHASYNC_COOP_ERROR    0   /* stop: exception pending          */
@@ -418,7 +643,7 @@ static int phasync_wait_fd(zval *handler, php_stream *stream, php_socket_t fd, d
  * *deadline < 0, giving every fill a fresh full timeout, as
  * php_sock_stream_wait_for_data does. On timeout the stream's timed-out flag is
  * set, exactly as the native socket op sets it. */
-static int phasync_cooperate(zval *handler, php_stream *stream, php_socket_t fd, double *deadline)
+static int phasync_cooperate(int dir, php_stream *stream, php_socket_t fd, double *deadline)
 {
 	double timeout = phasync_wait_timeout(stream), wait = INFINITY;
 	int w;
@@ -436,7 +661,7 @@ static int phasync_cooperate(zval *handler, php_stream *stream, php_socket_t fd,
 			return PHASYNC_COOP_TIMEOUT;
 		}
 	}
-	w = phasync_wait_fd(handler, stream, fd, wait);
+	w = phasync_wait_fd(dir, stream, fd, wait);
 	if (w == PHASYNC_WAIT_READY) {
 		return PHASYNC_COOP_RETRY;
 	}
@@ -504,7 +729,8 @@ typedef struct phasync_task {
 	int          omode;       /* OPEN: open(2) mode; FS: mkdir(2) mode          */
 	phasync_fs_op fsop;       /* FS: which operation                           */
 	char         path2[PATH_MAX]; /* FS rename: destination                     */
-	int          write_fd;    /* self-pipe write end */
+	zend_long    slot;        /* the waiter's slot, queued for poll() when done  */
+	int          done;        /* set (under phasync_cq_mutex) once finished      */
 	struct phasync_task *next;
 } phasync_task;
 
@@ -1092,57 +1318,28 @@ static void phasync_task_exec(phasync_task *t)
 	}
 }
 
-/* Self-pipe freelist. Each pool op needs a pipe to wake its fiber; rather than
- * pipe()/close() per op (a real cost for many-small-reads like fgetcsv), we keep
- * a freelist that grows to the high-water mark of concurrent ops and is never
- * shrunk until shutdown. Touched only by the main (fiber) thread — workers write
- * to the fd but never touch the list — so no lock is needed. The fds are
- * FD_CLOEXEC so idle pipes never leak into shell_exec/proc_open children. */
-typedef struct phasync_pipe {
-	int rfd, wfd;
-	struct phasync_pipe *next;
-} phasync_pipe;
-
-static phasync_pipe *phasync_pipe_free;
-
-static phasync_pipe *phasync_pipe_get(void)
-{
-	phasync_pipe *p = phasync_pipe_free;
-	int fds[2];
-
-	if (p) {
-		phasync_pipe_free = p->next;   /* reuse: it was drained before release */
-		return p;
-	}
-	if (pipe(fds) != 0) {
-		return NULL;
-	}
-	fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-	fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-	p = malloc(sizeof(*p));
-	if (!p) {
-		close(fds[0]);
-		close(fds[1]);
-		return NULL;
-	}
-	p->rfd = fds[0];
-	p->wfd = fds[1];
-	return p;
-}
-
-static void phasync_pipe_put(phasync_pipe *p)
-{
-	p->next = phasync_pipe_free;
-	phasync_pipe_free = p;
-}
-
-/* Notify the parked fiber that a task is done (self-pipe: one byte). */
+/* A task is done: queue its slot for poll() and mark it done (the waiter may be
+ * waiting for that after a cancellation). The worker never touches the task
+ * after this: the waiter's frame may be gone. */
 static void phasync_task_signal(phasync_task *t)
 {
-	char c = 1;
-	ssize_t w;
-	do { w = write(t->write_fd, &c, 1); } while (w < 0 && errno == EINTR);
-	(void) w;
+	zend_long slot = t->slot;
+
+	pthread_mutex_lock(&phasync_cq_mutex);
+	t->done = 1;
+	pthread_mutex_unlock(&phasync_cq_mutex);
+	phasync_cq_push(slot);
+}
+
+/* Wait for a task whose waiter stopped waiting (cancelled): it still points into
+ * the waiter's frame. Pool tasks are bounded, so this is short. */
+static void phasync_task_wait(phasync_task *t)
+{
+	pthread_mutex_lock(&phasync_cq_mutex);
+	while (!t->done) {
+		pthread_cond_wait(&phasync_cq_cond, &phasync_cq_mutex);
+	}
+	pthread_mutex_unlock(&phasync_cq_mutex);
 }
 
 /* Block all signals on a helper thread, leaving them to the main thread. */
@@ -1213,16 +1410,9 @@ static void phasync_pool_child_atfork(void)
 	phasync_pool_started = 0;
 	phasync_pool_stop = 0;
 	phasync_pool_n = 0;
-	/* Close inherited self-pipe fds so they don't linger in the child; drop the
-	 * freelist nodes (free() is not async-signal-safe, so we intentionally leak
-	 * the small node structs — the child typically execs or exits shortly). */
-	while (phasync_pipe_free) {
-		phasync_pipe *p = phasync_pipe_free;
-		phasync_pipe_free = p->next;
-		close(p->rfd);
-		close(p->wfd);
-	}
-	phasync_pipe_free = NULL;
+	pthread_mutex_init(&phasync_cq_mutex, NULL);
+	pthread_cond_init(&phasync_cq_cond, NULL);
+	phasync_cq_len = 0;
 }
 
 /* Start the worker pool once. Returns non-zero if at least one worker exists. If
@@ -1275,15 +1465,6 @@ static void phasync_pool_shutdown(void)
 	}
 	phasync_pool_n = 0;
 	phasync_pool_started = 0;
-
-	/* Release the self-pipe freelist (MSHUTDOWN context: free() is fine here). */
-	while (phasync_pipe_free) {
-		phasync_pipe *p = phasync_pipe_free;
-		phasync_pipe_free = p->next;
-		close(p->rfd);
-		close(p->wfd);
-		free(p);
-	}
 }
 
 static void phasync_pool_submit(phasync_task *t)
@@ -1300,65 +1481,34 @@ static void phasync_pool_submit(phasync_task *t)
 	pthread_mutex_unlock(&phasync_pool_mutex);
 }
 
-/* Submit a task, park the fiber on the self-pipe until the worker completes.
- * The task lives on the caller's (fiber) stack, which is preserved across the
- * suspend, so no heap allocation is needed for it. */
-/* Block until the worker's completion byte arrives and consume it. Polls on
- * EAGAIN so it holds even if the read end was made non-blocking (it shares its
- * open file description with the dup() handed to the wait handler). */
-static void phasync_pipe_drain(int rfd)
-{
-	char c;
-	for (;;) {
-		ssize_t r = read(rfd, &c, 1);
-		if (r == 1 || r == 0) {
-			return;
-		}
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			struct pollfd pfd = { .fd = rfd, .events = POLLIN };
-			poll(&pfd, 1, -1);
-		} else if (errno != EINTR) {
-			return;
-		}
-	}
-}
-
+/* Submit a task and park the coroutine until a worker has done it. The task
+ * lives on the caller's (fiber) stack, which is preserved across the suspend, so
+ * no heap allocation is needed for it. */
 static void phasync_pool_run(phasync_task *t)
 {
-	phasync_pipe *p;
+	int rc;
 
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL || PHASYNC_G(no_suspend)
-	 || (p = phasync_pipe_get()) == NULL) {
-		/* No fiber to yield from (or no scheduler / pipe failed): run inline. */
+	if (!phasync_reading() || EG(active_fiber) == NULL || PHASYNC_G(no_suspend)
+	 || !phasync_ep_ensure() || !phasync_pool_ensure() || (t->slot = phasync_get_slot()) < 0) {
+		/* No coroutine to park (or no worker, or getSlot() threw): run inline. */
 		phasync_task_exec(t);
 		return;
 	}
-
-	if (!phasync_pool_ensure()) {
-		phasync_pipe_put(p);
-		phasync_task_exec(t);            /* no worker could be started: run inline */
-		return;
-	}
-	t->write_fd = p->wfd;
+	t->done = 0;
 	phasync_pool_submit(t);
 
-	/* Park until the worker makes the read end readable. The task (and a read's
-	 * buffer) live in the caller's C frame and the worker now holds pointers into
-	 * them, so a fatal error (bailout) raised inside the handler must not unwind
-	 * past this frame before the worker is done: wait for its byte, then re-raise. */
+	/* The task (and a read's buffer) live in this frame and the worker holds
+	 * pointers into them, so neither a cancellation nor a fatal error (bailout)
+	 * may leave this frame before the worker is done. */
 	zend_try {
-		phasync_wait_fd(phasync_read_handler(), NULL, p->rfd, INFINITY);
+		rc = phasync_park(t->slot, INFINITY, false);
 	} zend_catch {
-		phasync_pipe_drain(p->rfd);
-		phasync_pipe_put(p);
+		phasync_task_wait(t);
 		zend_bailout();
 	} zend_end_try();
-
-	/* The worker finishes this bounded op shortly and writes its byte even if the
-	 * fiber was resumed early by an exception, so draining here is safe and leaves
-	 * the pipe empty for reuse. */
-	phasync_pipe_drain(p->rfd);
-	phasync_pipe_put(p);
+	if (rc != PHASYNC_WAIT_READY) {
+		phasync_task_wait(t);
+	}
 }
 
 /* Like phasync_pool_run, but on a dedicated thread rather than the bounded pool.
@@ -1366,41 +1516,33 @@ static void phasync_pool_run(phasync_task *t)
  * pool would deadlock when reader- and writer-opens outnumber the workers. */
 static void phasync_pool_run_dedicated(phasync_task *t)
 {
-	int pipefd[2];
 	pthread_t th;
 	pthread_attr_t attr;
 	int rc;
 
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL
-	 || pipe(pipefd) != 0) {
-		phasync_task_exec(t);   /* no fiber/scheduler: block inline, as fopen() would */
+	if (!phasync_reading() || EG(active_fiber) == NULL || !phasync_ep_ensure()
+	 || (t->slot = phasync_get_slot()) < 0) {
+		phasync_task_exec(t);   /* no coroutine to park: block inline, as fopen() would */
 		return;
 	}
-	fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
-	fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
-
-	t->write_fd = pipefd[1];
+	t->done = 0;
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, PHASYNC_WORKER_STACK);
 	if (pthread_create(&th, &attr, phasync_oneshot, t) != 0) {
 		pthread_attr_destroy(&attr);
-		close(pipefd[0]);
-		close(pipefd[1]);
 		phasync_task_exec(t);
 		return;
 	}
 	pthread_attr_destroy(&attr);
 
-	/* A fatal error (bailout) raised inside the handler must not unwind past this
-	 * frame while the thread still holds a pointer to the stack-resident task:
-	 * cancel and reap it first, drop any fd it opened, then re-raise. */
+	/* A fatal error (bailout) must not unwind past this frame while the thread
+	 * still holds a pointer to the stack-resident task: cancel and reap it first,
+	 * drop any fd it opened, then re-raise. */
 	zend_try {
-		rc = phasync_wait_fd(phasync_read_handler(), NULL, pipefd[0], INFINITY);
+		rc = phasync_park(t->slot, INFINITY, false);
 	} zend_catch {
 		pthread_cancel(th);
 		pthread_join(th, NULL);
-		close(pipefd[0]);
-		close(pipefd[1]);
 		if (t->fd >= 0) {
 			close(t->fd);
 		}
@@ -1408,21 +1550,16 @@ static void phasync_pool_run_dedicated(phasync_task *t)
 		zend_bailout();
 	} zend_end_try();
 
-	/* Always reap the thread, however the fiber came back. If the worker already
-	 * finished, it is past its (only) open() cancellation point with cancellation
-	 * disabled, so the cancel is a no-op and join returns at once. If the fiber
-	 * was resumed early (phasync timeout/cancel, or any other reason) the thread
-	 * is still in open() — the cancel unblocks it there. Either way, no hang and
-	 * no leaked thread; unconditional cancel avoids a blocking pipe read that
-	 * would hang if the fiber were ever resumed without the pipe being ready. */
+	/* Always reap the thread, however the coroutine came back. If the thread
+	 * already finished, it is past its (only) open() cancellation point with
+	 * cancellation disabled, so the cancel is a no-op and join returns at once.
+	 * If the wait was cancelled, the thread is still in open(): the cancel
+	 * unblocks it there, and it never queues its slot. */
 	pthread_cancel(th);
 	pthread_join(th, NULL);
-	close(pipefd[0]);
-	close(pipefd[1]);
 
-	/* The exception state (not the pipe) decides keep-vs-discard: on a pending
-	 * exception, drop any fd the open managed to produce and let it propagate. */
-	if (rc != 0) {
+	/* On a pending exception, drop any fd the open managed to produce. */
+	if (rc != PHASYNC_WAIT_READY) {
 		if (t->fd >= 0) {
 			close(t->fd);
 		}
@@ -1475,7 +1612,7 @@ static ssize_t phasync_wrapped_read_pool(php_stream *stream, char *buf, size_t c
 
 	/* Outside a scope (or not in a fiber) there is nothing to yield to: be the
 	 * native op exactly. */
-	if (fd == -1 || phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+	if (fd == -1 || !phasync_reading() || EG(active_fiber) == NULL) {
 		return PHASYNC_ORIG(stream)->read(stream, buf, count);
 	}
 	return phasync_pool_read_fd(stream, fd, buf, count);
@@ -1485,7 +1622,7 @@ static ssize_t phasync_wrapped_write_pool(php_stream *stream, const char *buf, s
 {
 	php_socket_t fd = phasync_stream_fd(stream);
 
-	if (fd == -1 || phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+	if (fd == -1 || !phasync_reading() || EG(active_fiber) == NULL) {
 		return PHASYNC_ORIG(stream)->write(stream, buf, count);
 	}
 	return phasync_pool_write_fd(fd, buf, count);
@@ -1543,7 +1680,7 @@ static void phasync_apply_mode(php_stream *stream, php_socket_t fd,
 }
 
 /* The wrapped read/write ops emulate the caller's intended semantics:
- *   - outside a manage() scope (handler == NULL) -> exactly the native op;
+ *   - outside a manage() scope                  -> exactly the native op;
  *   - an explicitly non-blocking stream          -> exactly the native op;
  *   - a blocking stream inside a scope           -> cooperate: drive the fd
  *     non-blocking and suspend the fiber on would-block instead of blocking.
@@ -1553,14 +1690,14 @@ static ssize_t phasync_wrapped_read(php_stream *stream, char *buf, size_t count)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
-	zval *handler = phasync_read_handler();
+	int dir = phasync_reading();
 	phasync_hook_entry *e;
 
 	if (fd == -1) {
 		return orig->read(stream, buf, count);
 	}
 	e = phasync_entry_ensure(stream);
-	if (!e->want_block || handler == NULL) {
+	if (!e->want_block || !dir) {
 		phasync_apply_mode(stream, fd, e, !e->want_block, false);
 		return orig->read(stream, buf, count);
 	}
@@ -1585,7 +1722,7 @@ static ssize_t phasync_wrapped_read(php_stream *stream, char *buf, size_t count)
 		if (phasync_read_dont_wait(stream)) {
 			return 0;                    /* native MSG_DONTWAIT short read */
 		}
-		if (phasync_cooperate(handler, stream, fd, &deadline) != PHASYNC_COOP_RETRY) {
+		if (phasync_cooperate(dir, stream, fd, &deadline) != PHASYNC_COOP_RETRY) {
 			return -1;                   /* timed out (flag set) or exception pending */
 		}
 	}
@@ -1595,14 +1732,14 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
-	zval *handler = phasync_write_handler();
+	int dir = phasync_writing();
 	phasync_hook_entry *e;
 
 	if (fd == -1) {
 		return orig->write(stream, buf, count);
 	}
 	e = phasync_entry_ensure(stream);
-	if (!e->want_block || handler == NULL) {
+	if (!e->want_block || !dir) {
 		phasync_apply_mode(stream, fd, e, !e->want_block, false);
 		return orig->write(stream, buf, count);
 	}
@@ -1621,7 +1758,7 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 			return -1;
 		}
 		err = errno;
-		c = phasync_cooperate(handler, stream, fd, &deadline);
+		c = phasync_cooperate(dir, stream, fd, &deadline);
 		if (c == PHASYNC_COOP_RETRY) {
 			continue;
 		}
@@ -1642,10 +1779,10 @@ static ssize_t phasync_wrapped_read_tls(php_stream *stream, char *buf, size_t co
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
-	zval *handler = phasync_read_handler();
+	int dir = phasync_reading();
 	phasync_hook_entry *e = phasync_entry_ensure(stream);
 
-	if (!e->want_block || handler == NULL) {
+	if (!e->want_block || !dir) {
 		phasync_apply_mode(stream, fd, e, !e->want_block, true);
 		return orig->read(stream, buf, count);
 	}
@@ -1660,7 +1797,7 @@ static ssize_t phasync_wrapped_read_tls(php_stream *stream, char *buf, size_t co
 			return n;                    /* error or real EOF */
 		}
 		fd = phasync_stream_fd(stream);  /* n == 0, not eof -> would block */
-		if (fd == -1 || phasync_cooperate(handler, stream, fd, &deadline) != PHASYNC_COOP_RETRY) {
+		if (fd == -1 || phasync_cooperate(dir, stream, fd, &deadline) != PHASYNC_COOP_RETRY) {
 			return -1;
 		}
 	}
@@ -1670,10 +1807,10 @@ static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, si
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
-	zval *handler = phasync_write_handler();
+	int dir = phasync_writing();
 	phasync_hook_entry *e = phasync_entry_ensure(stream);
 
-	if (!e->want_block || handler == NULL) {
+	if (!e->want_block || !dir) {
 		phasync_apply_mode(stream, fd, e, !e->want_block, true);
 		return orig->write(stream, buf, count);
 	}
@@ -1688,7 +1825,7 @@ static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, si
 			return n;
 		}
 		fd = phasync_stream_fd(stream);  /* 0 -> would block */
-		if (fd == -1 || phasync_cooperate(handler, stream, fd, &deadline) != PHASYNC_COOP_RETRY) {
+		if (fd == -1 || phasync_cooperate(dir, stream, fd, &deadline) != PHASYNC_COOP_RETRY) {
 			return -1;
 		}
 	}
@@ -1732,7 +1869,7 @@ static int phasync_accept_cooperative(php_stream *stream, php_stream_xport_param
 	for (;;) {
 		double remaining = tv ? deadline - phasync_now() : INFINITY;
 		int w = remaining > 0
-			? phasync_wait_fd(phasync_read_handler(), stream, fd, remaining)
+			? phasync_wait_fd(PHASYNC_READ, stream, fd, remaining)
 			: PHASYNC_WAIT_TIMEOUT;
 		int r;
 
@@ -1897,7 +2034,7 @@ static int phasync_connect_cooperative(php_stream *stream, php_stream_xport_para
 			 * connecting (mysqlnd_fixup_regular_list), which would leave a handler's
 			 * references dangling (heap corruption). */
 			int w = remaining > 0
-				? phasync_wait_fd(phasync_write_handler(), NULL, sock->socket, remaining)
+				? phasync_wait_fd(PHASYNC_WRITE, NULL, sock->socket, remaining)
 				: PHASYNC_WAIT_TIMEOUT;
 			if (w == PHASYNC_WAIT_ERROR) {
 				close(sock->socket);
@@ -1961,19 +2098,19 @@ static int phasync_wrapped_set_option(php_stream *stream, int option, int value,
 		e->applied    = -1;   /* orig is about to change the fd; re-apply on next I/O */
 	} else if (option == PHP_STREAM_OPTION_MMAP_API && value == PHP_STREAM_MMAP_SUPPORTED
 	        && stream->ops->read == phasync_wrapped_read_pool
-	        && phasync_read_handler() != NULL && EG(active_fiber) != NULL) {
+	        && phasync_reading() && EG(active_fiber) != NULL) {
 		/* mmap()ed reads (readfile(), fpassthru(), stream_copy_to_stream()) fault
 		 * pages in synchronously: report mmap unsupported so they use the pooled
 		 * read op instead. */
 		return PHP_STREAM_OPTION_RETURN_NOTIMPL;
 	} else if (option == PHP_STREAM_OPTION_XPORT_API && ptrparam
 	        && ((php_stream_xport_param *) ptrparam)->op == STREAM_XPORT_OP_ACCEPT
-	        && phasync_read_handler() != NULL && EG(active_fiber) != NULL) {
+	        && phasync_reading() && EG(active_fiber) != NULL) {
 		return phasync_accept_cooperative(stream, (php_stream_xport_param *) ptrparam);
 	} else if (option == PHP_STREAM_OPTION_XPORT_API && ptrparam
 	        && ((php_stream_xport_param *) ptrparam)->op == STREAM_XPORT_OP_CONNECT
 	        && stream->ops->read == phasync_wrapped_read       /* not tls://: crypto follows */
-	        && phasync_write_handler() != NULL && EG(active_fiber) != NULL
+	        && phasync_writing() && EG(active_fiber) != NULL
 	        && (strcmp(PHASYNC_ORIG(stream)->label, "tcp_socket") == 0
 	            || strcmp(PHASYNC_ORIG(stream)->label, "tcp_socket/ssl") == 0)) {
 		return phasync_connect_cooperative(stream, (php_stream_xport_param *) ptrparam);
@@ -1986,6 +2123,8 @@ static int phasync_wrapped_close(php_stream *stream, int close_handle)
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	phasync_hook_entry *e = phasync_entry(stream);
 
+	phasync_stream_forget(stream);
+
 	if (e) {
 		if (e->pidfd != -1) {
 			/* A process pipe: pclose() below waits for the child. Inside a scope,
@@ -1994,13 +2133,13 @@ static int phasync_wrapped_close(php_stream *stream, int close_handle)
 			 * once with the native status. Like pclose(), first close our end, by
 			 * duping /dev/null over it (the fd stays valid for fclose()), so a
 			 * child still using the pipe gets EOF/EPIPE instead of blocking. */
-			zval *handler = phasync_read_handler();
+			int dir = phasync_reading();
 			php_socket_t fd = phasync_stream_fd(stream);
 			int devnull;
-			if (close_handle && handler && EG(active_fiber) && fd != -1
+			if (close_handle && dir && EG(active_fiber) && fd != -1
 			 && (devnull = open("/dev/null", O_RDWR | O_CLOEXEC)) >= 0) {
 				if (dup2(devnull, fd) >= 0) {
-					phasync_wait_fd(handler, NULL, e->pidfd, INFINITY);
+					phasync_wait_fd(dir, NULL, e->pidfd, INFINITY);
 				}
 				close(devnull);
 			}
@@ -2266,7 +2405,7 @@ static ZEND_NAMED_FUNCTION(phasync_gethostbyname_override)
 	phasync_task t;
 	char ip[INET_ADDRSTRLEN];
 
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+	if (!phasync_reading() || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_gethostbyname)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -2297,7 +2436,7 @@ static ZEND_NAMED_FUNCTION(phasync_gethostbynamel_override)
 	phasync_task t;
 	char ip[INET_ADDRSTRLEN];
 
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+	if (!phasync_reading() || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_gethostbynamel)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -2339,7 +2478,7 @@ static ZEND_NAMED_FUNCTION(phasync_dns_check_record_override)
 	zend_string *rectype = NULL;
 	int type = DNS_T_MX, i, dns_errno, init_ok;
 
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+	if (!phasync_reading() || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_dns_check_record)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -2399,7 +2538,7 @@ static ZEND_NAMED_FUNCTION(phasync_dns_get_record_override)
 	int type, first_query = 1, store_results = 1;
 	bool raw = 0;
 
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+	if (!phasync_reading() || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_dns_get_record)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -2570,7 +2709,7 @@ static ZEND_NAMED_FUNCTION(phasync_dns_get_mx_override)
 	uint8_t *cp, *end;
 	int i;
 
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+	if (!phasync_reading() || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_dns_get_mx)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -2647,7 +2786,7 @@ static ZEND_NAMED_FUNCTION(phasync_gethostbyaddr_override)
 	size_t addrlen;
 	phasync_task t;
 
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+	if (!phasync_reading() || EG(active_fiber) == NULL) {
 		PHASYNC_G(orig_gethostbyaddr)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -2715,7 +2854,7 @@ static ZEND_NAMED_FUNCTION(phasync_fopen_override)
 	php_stream *stream;
 	struct stat st;
 
-	if (phasync_read_handler() == NULL) {
+	if (!phasync_reading()) {
 		PHASYNC_G(orig_fopen)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -2756,7 +2895,7 @@ static ZEND_NAMED_FUNCTION(phasync_fopen_override)
 	}
 
 	/* On a network/FUSE mount even the stat() below can stall: warm it on the pool. */
-	if (phasync_read_handler() && EG(active_fiber)) {
+	if (phasync_reading() && EG(active_fiber)) {
 		phasync_task w;
 		zval z;
 		ZVAL_STR(&z, filename);
@@ -2871,6 +3010,23 @@ static int phasync_new_child_pidfd(const phasync_spawn *sp)
 }
 
 static ssize_t (*phasync_stdio_read_orig)(php_stream *stream, char *buf, size_t count);
+static int (*phasync_stdio_close_orig)(php_stream *stream, int close_handle);
+
+/* Streams whose close op deregisters them (phasync_stream_forget()): stdio
+ * streams and every wrapped stream. */
+static bool phasync_has_close_hook(php_stream *stream)
+{
+	return stream->ops == &php_stream_stdio_ops
+		|| stream->ops->read == phasync_wrapped_read
+		|| stream->ops->read == phasync_wrapped_read_tls
+		|| stream->ops->read == phasync_wrapped_read_pool;
+}
+
+static int phasync_stdio_close(php_stream *stream, int close_handle)
+{
+	phasync_stream_forget(stream);
+	return phasync_stdio_close_orig(stream, close_handle);
+}
 static ssize_t (*phasync_stdio_write_orig)(php_stream *stream, const char *buf, size_t count);
 static int (*phasync_stdio_set_option_orig)(php_stream *stream, int option, int value, void *ptrparam);
 
@@ -2890,7 +3046,7 @@ static php_socket_t phasync_stdio_poolable(php_stream *stream)
 	php_socket_t fd;
 	struct stat st;
 
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL
+	if (!phasync_reading() || EG(active_fiber) == NULL
 	 || stream->ops != &php_stream_stdio_ops
 	 || ((stream->flags & PHP_STREAM_FLAG_NO_BUFFER) && stream->__exposed)
 	 || ex == NULL || ex->func == NULL || ZEND_USER_CODE(ex->func->type)
@@ -2968,7 +3124,7 @@ static void phasync_exec_family(INTERNAL_FUNCTION_PARAMETERS, void (*orig)(INTER
 {
 	phasync_spawn sp;
 
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+	if (!phasync_reading() || EG(active_fiber) == NULL) {
 		orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -3023,13 +3179,14 @@ typedef struct {
 
 static ZEND_NAMED_FUNCTION(phasync_proc_close_override)
 {
-	zval *handler = phasync_read_handler(), *zproc;
+	int dir = phasync_reading();
+	zval *zproc;
 	const char *type;
 	phasync_proc_handle *proc;
 	siginfo_t si;
 	int pidfd, i, w;
 
-	if (handler == NULL || EG(active_fiber) == NULL || ZEND_NUM_ARGS() != 1
+	if (!dir || EG(active_fiber) == NULL || ZEND_NUM_ARGS() != 1
 	 || Z_TYPE_P(zproc = ZEND_CALL_ARG(execute_data, 1)) != IS_RESOURCE
 	 || (type = zend_rsrc_list_get_rsrc_type(Z_RES_P(zproc))) == NULL || strcmp(type, "process") != 0) {
 		PHASYNC_G(orig_proc_close)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
@@ -3051,7 +3208,7 @@ static ZEND_NAMED_FUNCTION(phasync_proc_close_override)
 	pidfd = (int) syscall(SYS_pidfd_open, proc->child, 0);
 	if (pidfd >= 0) {
 		w = waitid(P_PID, proc->child, &si, WEXITED | WNOHANG | WNOWAIT) == 0
-			? phasync_wait_fd(handler, NULL, pidfd, INFINITY) : PHASYNC_WAIT_READY;
+			? phasync_wait_fd(dir, NULL, pidfd, INFINITY) : PHASYNC_WAIT_READY;
 		close(pidfd);
 		if (w == PHASYNC_WAIT_ERROR) {
 			return;                      /* exception pending: propagate */
@@ -3245,7 +3402,7 @@ static ZEND_NAMED_FUNCTION(phasync_fs_override)
 	char *p;
 
 	t.fsop = phasync_fs_funcs[Z_LVAL_P(idx)].op;
-	if (phasync_read_handler() == NULL || EG(active_fiber) == NULL || argc < 1) {
+	if (!phasync_reading() || EG(active_fiber) == NULL || argc < 1) {
 		orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -3340,10 +3497,10 @@ static size_t (*phasync_ub_write_orig)(const char *str, size_t len);
 
 static size_t phasync_ub_write(const char *str, size_t len)
 {
-	zval *handler = phasync_write_handler();
+	int dir = phasync_writing();
 	size_t done = 0, n;
 
-	if (handler == NULL || EG(active_fiber) == NULL) {
+	if (!dir || EG(active_fiber) == NULL) {
 		return phasync_ub_write_orig(str, len);
 	}
 	while (PHASYNC_G(ub_writing)) {
@@ -3355,7 +3512,7 @@ static size_t phasync_ub_write(const char *str, size_t len)
 	while (done < len) {
 		struct pollfd pfd = { STDOUT_FILENO, POLLOUT, 0 };
 		if (poll(&pfd, 1, 0) == 0) {
-			if (phasync_wait_fd(handler, NULL, STDOUT_FILENO, INFINITY) != PHASYNC_WAIT_READY) {
+			if (phasync_wait_fd(dir, NULL, STDOUT_FILENO, INFINITY) != PHASYNC_WAIT_READY) {
 				break;
 			}
 			continue;
@@ -3503,7 +3660,7 @@ static void phasync_select_common(INTERNAL_FUNCTION_PARAMETERS, const char *fnam
 	double deadline = 0;
 	int i;
 
-	if (PHASYNC_G(select_depth) || phasync_read_handler() == NULL || EG(active_fiber) == NULL) {
+	if (PHASYNC_G(select_depth) || !phasync_reading() || EG(active_fiber) == NULL) {
 		orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
 	}
@@ -3587,7 +3744,7 @@ static void phasync_select_common(INTERNAL_FUNCTION_PARAMETERS, const char *fnam
 				orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 				return;
 			}
-			w = phasync_wait_fd(phasync_read_handler(), NULL, epfd, remaining);
+			w = phasync_wait_fd(PHASYNC_READ, NULL, epfd, remaining);
 			close(epfd);
 		}
 		if (w == PHASYNC_WAIT_TIMEOUT) {
@@ -3865,34 +4022,36 @@ static void phasync_wrap_existing_streams(bool include_files);
 
 ZEND_FUNCTION(phasync_ext_manage)
 {
-	zval *code, *rh, *wh, *sh;
+	zval *code, *get_slot, *park, *unpark, *sleep;
 	zend_string *timeout_name;
 	zend_class_entry *timeout_ce;
 	phasync_scope frame;
 	zval retval;
 
-	ZEND_PARSE_PARAMETERS_START(5, 5)
-		Z_PARAM_ZVAL(code)
-		Z_PARAM_ZVAL(rh)
-		Z_PARAM_ZVAL(wh)
-		Z_PARAM_ZVAL(sh)
+	ZEND_PARSE_PARAMETERS_START(6, 6)
+		Z_PARAM_OBJECT_OF_CLASS(code, zend_ce_closure)
+		Z_PARAM_OBJECT_OF_CLASS(get_slot, zend_ce_closure)
+		Z_PARAM_OBJECT_OF_CLASS(park, zend_ce_closure)
+		Z_PARAM_OBJECT_OF_CLASS(unpark, zend_ce_closure)
+		Z_PARAM_OBJECT_OF_CLASS(sleep, zend_ce_closure)
 		Z_PARAM_STR(timeout_name)
 	ZEND_PARSE_PARAMETERS_END();
 
-	/* Resolved once per scope; a handler exception instanceof this class (subclasses
-	 * included) is the handler's way of saying "the wait's time ran out". */
+	/* park() throwing an instance of this class (subclasses included) after the
+	 * native timeout ran out ends the wait the way a native timeout does. */
 	timeout_ce = zend_lookup_class(timeout_name);
 	if (timeout_ce == NULL || !instanceof_function(timeout_ce, zend_ce_throwable)) {
 		if (!EG(exception)) {
-			zend_argument_value_error(5, "must be the name of an existing Throwable class");
+			zend_argument_value_error(6, "must be the name of an existing Throwable class");
 		}
 		RETURN_THROWS();
 	}
 
-	/* Push this scope's handlers (owned copies) and link to the enclosing one. */
-	ZVAL_COPY(&frame.read,  rh);
-	ZVAL_COPY(&frame.write, wh);
-	ZVAL_COPY(&frame.sleep, sh);
+	/* Push this scope (owned copies of the closures), linked to the enclosing one. */
+	ZVAL_COPY(&frame.get_slot, get_slot);
+	ZVAL_COPY(&frame.park, park);
+	ZVAL_COPY(&frame.unpark, unpark);
+	ZVAL_COPY(&frame.sleep, sleep);
 	frame.timeout_ce = timeout_ce;
 	frame.prev = PHASYNC_G(scope_top);
 	PHASYNC_G(scope_top) = &frame;
@@ -3914,21 +4073,148 @@ ZEND_FUNCTION(phasync_ext_manage)
 		call_user_function(NULL, NULL, code, &retval, 0, NULL);
 	} zend_catch {
 		PHASYNC_G(scope_top) = frame.prev;
-		zval_ptr_dtor(&frame.read);
-		zval_ptr_dtor(&frame.write);
+		zval_ptr_dtor(&frame.get_slot);
+		zval_ptr_dtor(&frame.park);
+		zval_ptr_dtor(&frame.unpark);
 		zval_ptr_dtor(&frame.sleep);
 		zend_bailout();
 	} zend_end_try();
 
 	PHASYNC_G(scope_top) = frame.prev;
-	zval_ptr_dtor(&frame.read);
-	zval_ptr_dtor(&frame.write);
+	zval_ptr_dtor(&frame.get_slot);
+	zval_ptr_dtor(&frame.park);
+	zval_ptr_dtor(&frame.unpark);
 	zval_ptr_dtor(&frame.sleep);
 
 	if (Z_ISUNDEF(retval)) {
 		RETURN_NULL();   /* $code threw (exception pending) or returned nothing */
 	}
 	RETURN_COPY_VALUE(&retval);
+}
+
+/* ---- poll(), readable(), writable() -------------------------------------- */
+
+/* The event loop's one blocking call: wait up to $maxTime seconds (0: don't
+ * wait) in one epoll_wait(), then unpark the waiters of what became ready and of
+ * the finished thread tasks. Costs per ready event, never a scan of everything
+ * registered. */
+ZEND_FUNCTION(phasync_ext_poll)
+{
+	double max_time;
+	struct epoll_event ev[256];
+	zend_long wake_stack[512], *wake = wake_stack;
+	size_t nwake = 0, cap = sizeof(wake_stack) / sizeof(wake_stack[0]);
+	int ms, n;
+
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_DOUBLE(max_time)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (PHASYNC_G(scope_top) == NULL) {
+		zend_throw_error(NULL, "phasync\\ext\\poll() must be called inside manage()");
+		RETURN_THROWS();
+	}
+	if (!phasync_ep_ensure()) {
+		zend_throw_error(NULL, "Unable to create the epoll set: %s", strerror(errno));
+		RETURN_THROWS();
+	}
+	/* Round up, so a wait shorter than a millisecond doesn't spin. */
+	ms = max_time <= 0 ? 0 : (max_time >= INT_MAX / 1000 ? -1 : (int) ceil(max_time * 1000));
+	n = epoll_wait(phasync_epfd, ev, sizeof(ev) / sizeof(ev[0]), ms);
+	if (n < 0) {
+		if (errno == EINTR) {
+			return;                          /* a signal: its handler has run */
+		}
+		zend_throw_error(NULL, "epoll_wait() failed: %s", strerror(errno));
+		RETURN_THROWS();
+	}
+
+	/* Settle every registration first, then call unpark() (PHP) for each. */
+	for (int i = 0; i < n; i++) {
+		if (ev[i].data.u64 == PHASYNC_EP_COMPLETIONS) {
+			uint64_t count;
+			(void) !read(phasync_evfd, &count, sizeof(count));
+			pthread_mutex_lock(&phasync_cq_mutex);
+			if (nwake + phasync_cq_len > cap) {
+				cap = nwake + phasync_cq_len;
+				wake = wake == wake_stack ? memcpy(emalloc(cap * sizeof(*wake)), wake_stack, nwake * sizeof(*wake))
+				                          : erealloc(wake, cap * sizeof(*wake));
+			}
+			memcpy(wake + nwake, phasync_cq, phasync_cq_len * sizeof(*wake));
+			nwake += phasync_cq_len;
+			phasync_cq_len = 0;
+			pthread_mutex_unlock(&phasync_cq_mutex);
+		} else {
+			phasync_reg *r = zend_hash_index_find_ptr(&phasync_regs, (zend_ulong) ev[i].data.u64);
+			uint32_t got = ev[i].events;
+			bool rd, wr;
+
+			if (r == NULL) {
+				continue;
+			}
+			/* Ready also when closed or failed: the op then reports it as PHP does. */
+			rd = r->slot[0] >= 0 && (got & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR));
+			wr = r->slot[1] >= 0 && (got & (EPOLLOUT | EPOLLHUP | EPOLLERR));
+			if (nwake + 2 > cap) {
+				cap *= 2;
+				wake = wake == wake_stack ? memcpy(emalloc(cap * sizeof(*wake)), wake_stack, nwake * sizeof(*wake))
+				                          : erealloc(wake, cap * sizeof(*wake));
+			}
+			if (rd) {
+				wake[nwake++] = r->slot[0];
+				r->slot[0] = -1;
+			}
+			if (wr) {
+				wake[nwake++] = r->slot[1];
+				r->slot[1] = -1;
+			}
+			if (r->slot[0] >= 0 || r->slot[1] >= 0) {
+				phasync_reg_arm(r);          /* the other direction still waits */
+			}
+		}
+	}
+	for (size_t i = 0; i < nwake && !EG(exception); i++) {
+		zval arg, retval;
+		ZVAL_LONG(&arg, wake[i]);
+		ZVAL_UNDEF(&retval);
+		call_user_function(NULL, NULL, &PHASYNC_G(scope_top)->unpark, &retval, 1, &arg);
+		zval_ptr_dtor(&retval);
+	}
+	if (wake != wake_stack) {
+		efree(wake);
+	}
+}
+
+static void phasync_wait_public(INTERNAL_FUNCTION_PARAMETERS, int dir)
+{
+	zval *zstream;
+	double timeout = 0;
+	bool timeout_null = true;
+	php_stream *stream;
+
+	ZEND_PARSE_PARAMETERS_START(1, 2)
+		Z_PARAM_RESOURCE(zstream)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_DOUBLE_OR_NULL(timeout, timeout_null)
+	ZEND_PARSE_PARAMETERS_END();
+
+	php_stream_from_zval(stream, zstream);
+	if (PHASYNC_G(scope_top) == NULL || EG(active_fiber) == NULL) {
+		zend_throw_error(NULL, "%s() must be called in a coroutine inside manage()", get_active_function_name());
+		RETURN_THROWS();
+	}
+	/* The loop's exceptions (TimeoutException, cancellation) reach the caller as they are. */
+	phasync_wait_fd_ex(dir, stream, phasync_stream_fd(stream), timeout_null ? INFINITY : timeout, false);
+}
+
+ZEND_FUNCTION(phasync_ext_readable)
+{
+	phasync_wait_public(INTERNAL_FUNCTION_PARAM_PASSTHRU, PHASYNC_READ);
+}
+
+ZEND_FUNCTION(phasync_ext_writable)
+{
+	phasync_wait_public(INTERNAL_FUNCTION_PARAM_PASSTHRU, PHASYNC_WRITE);
 }
 
 /* ---- phasync\stream_select (Tier 1) -------------------------------------- */
@@ -4191,798 +4477,6 @@ static void phasync_ops_dtor(zval *zv)
 }
 
 
-/* ---- phasync\ext\tcp_server() ----------------------------------------------
- *
- * A TCP server multiplexed into one stream. The extension accepts connections,
- * reads and writes the client sockets, and PHP sees everything as frames on that
- * stream, so a scheduler selects on one fd and parses one big read however many
- * connections there are. Every frame is a 13-byte header, type:u8 id:u64 len:u32
- * (little-endian), then len bytes of payload.
- *
- *   server -> PHP   C  connected: payload "peer\0local", as stream_socket_get_name()
- *                   D  data from the client
- *                   E  the client finished sending (we can still write)
- *                   B  buffered output passed high_water (the client is slow)
- *                   W  ...and has drained since
- *                   X  the connection is gone: errno:u32 (0 = clean); always last
- *                   F  (id 0) accepting stopped: errno:u32, 0 = max_connections
- *                   A  (id 0) accepting again
- *   PHP -> server   D  send data            E  shut down our sending side
- *                   X  flush, then close (answered by an X frame)
- *                   P  pause reading        R  resume reading
- *                   A  (id 0) try accepting again (after F for lack of fds)
- *
- * There is no thread: the stream's fd is an epoll fd, readable whenever the
- * listener or a client socket has an event, and the stream's read op collects
- * those events without blocking; its write op parses PHP's frames and writes to
- * the sockets, buffering what doesn't fit. Clients are only read while PHP reads
- * the stream, so input is bounded by how fast PHP consumes it, and a new batch of
- * events is only collected once PHP has consumed the last one: level-triggered
- * epoll moves each reported connection behind the others, so every ready
- * connection gets a turn before any gets a second. An eventfd in the epoll set
- * keeps the stream readable while frames are queued. A read never splits a frame
- * unless the frame is bigger than the read (D frames carry at most read_chunk
- * bytes). A non-blocking read returns '' when there is nothing to report (a
- * wake-up that only flushed output, say); feof() stays false while the server
- * lives. */
-
-#define PHASYNC_TS_HDR       13
-#define PHASYNC_TS_LISTENER  0
-#define PHASYNC_TS_EVFD      UINT64_MAX
-
-typedef struct {
-	uint64_t id;
-	int      fd;
-	uint32_t events;         /* registered epoll interest                     */
-	bool     registered;
-	bool     eof_in;         /* the client finished sending (E emitted)       */
-	bool     paused;         /* PHP sent P                                    */
-	bool     peer_done;      /* paused, and the client finished with data unread */
-	bool     shut_pending;   /* PHP sent E: shut down once the output drains  */
-	bool     shut_done;
-	bool     close_pending;  /* PHP sent X: close once the output drains      */
-	bool     over;           /* output passed high_water (B sent): W when drained */
-	char    *wbuf;
-	size_t   woff, wlen, wcap;
-} phasync_ts_conn;
-
-typedef struct {
-	int       epfd, lfd, evfd;
-	pid_t     pid;           /* the creating process: epoll is shared across fork() */
-	bool      blocking, accepting, armed;
-	HashTable conns;         /* id -> phasync_ts_conn* */
-	uint64_t  next_id;
-	bool      nodelay;
-	zend_long max_conns, read_chunk, high_water;
-	char     *out;           /* frames for PHP: [outpos, outlen) */
-	size_t    outpos, outlen, outcap;
-	size_t    partial;       /* bytes left of a frame handed out in part */
-	unsigned char hdr[PHASYNC_TS_HDR];   /* parser for PHP's frames */
-	size_t    hdrlen;
-	unsigned char wtype;
-	uint64_t  wid;
-	uint32_t  wleft;
-	zend_string *name;
-} phasync_ts;
-
-static void phasync_ts_le32(char *p, uint32_t v)
-{
-	p[0] = (char) v; p[1] = (char) (v >> 8); p[2] = (char) (v >> 16); p[3] = (char) (v >> 24);
-}
-
-static void phasync_ts_le64(char *p, uint64_t v)
-{
-	phasync_ts_le32(p, (uint32_t) v);
-	phasync_ts_le32(p + 4, (uint32_t) (v >> 32));
-}
-
-static uint32_t phasync_ts_get32(const unsigned char *p)
-{
-	return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
-}
-
-/* Room for n more bytes at the end of the frame queue. */
-static char *phasync_ts_reserve(phasync_ts *s, size_t n)
-{
-	if (s->outlen + n > s->outcap) {
-		if (s->outpos) {
-			memmove(s->out, s->out + s->outpos, s->outlen - s->outpos);
-			s->outlen -= s->outpos;
-			s->outpos = 0;
-		}
-		if (s->outlen + n > s->outcap) {
-			s->outcap = MAX(s->outcap * 2, s->outlen + n);
-			s->out = erealloc(s->out, s->outcap);
-		}
-	}
-	return s->out + s->outlen;
-}
-
-static void phasync_ts_hdr(char *p, char type, uint64_t id, uint32_t len)
-{
-	p[0] = type;
-	phasync_ts_le64(p + 1, id);
-	phasync_ts_le32(p + 9, len);
-}
-
-static void phasync_ts_emit(phasync_ts *s, char type, uint64_t id, const char *payload, uint32_t len)
-{
-	char *p = phasync_ts_reserve(s, PHASYNC_TS_HDR + len);
-	phasync_ts_hdr(p, type, id, len);
-	if (len) {
-		memcpy(p + PHASYNC_TS_HDR, payload, len);
-	}
-	s->outlen += PHASYNC_TS_HDR + len;
-}
-
-static void phasync_ts_emit_errno(phasync_ts *s, char type, uint64_t id, int err)
-{
-	char payload[4];
-	phasync_ts_le32(payload, (uint32_t) err);
-	phasync_ts_emit(s, type, id, payload, 4);
-}
-
-/* An address as stream_socket_get_name() formats it. */
-static zend_string *phasync_ts_name(const struct sockaddr_storage *ss)
-{
-	char ip[INET6_ADDRSTRLEN] = "";
-
-	if (ss->ss_family == AF_INET6) {
-		const struct sockaddr_in6 *a = (const struct sockaddr_in6 *) ss;
-		inet_ntop(AF_INET6, &a->sin6_addr, ip, sizeof(ip));
-		return strpprintf(0, "[%s]:%d", ip, ntohs(a->sin6_port));
-	}
-	inet_ntop(AF_INET, &((const struct sockaddr_in *) ss)->sin_addr, ip, sizeof(ip));
-	return strpprintf(0, "%s:%d", ip, ntohs(((const struct sockaddr_in *) ss)->sin_port));
-}
-
-/* Stop or resume accepting, and tell PHP: F with the reason (0 = at
- * max_connections), A when accepting again. Never resumes while full. */
-static void phasync_ts_accepting(phasync_ts *s, bool on, int err)
-{
-	struct epoll_event e = { .events = EPOLLIN, .data.u64 = PHASYNC_TS_LISTENER };
-
-	if (on == s->accepting
-	 || (on && s->max_conns && zend_hash_num_elements(&s->conns) >= (uint32_t) s->max_conns)) {
-		return;
-	}
-	epoll_ctl(s->epfd, on ? EPOLL_CTL_ADD : EPOLL_CTL_DEL, s->lfd, &e);
-	s->accepting = on;
-	if (on) {
-		phasync_ts_emit(s, 'A', 0, NULL, 0);
-	} else {
-		phasync_ts_emit_errno(s, 'F', 0, err);
-	}
-}
-
-/* Register what the connection currently wants: input unless the client is
- * done, PHP paused it or asked to close it; output while any is buffered. A
- * paused connection still listens for the client leaving (EPOLLRDHUP; errors
- * are always reported). Once a paused client has left with data unread, there is
- * nothing to hear until R, so it is taken out of the set (unless writing). */
-static void phasync_ts_update(phasync_ts *s, phasync_ts_conn *c)
-{
-	struct epoll_event e;
-	uint32_t ev = 0;
-
-	if (!c->eof_in && !c->close_pending) {
-		if (!c->paused) {
-			ev |= EPOLLIN;
-		} else if (!c->peer_done) {
-			ev |= EPOLLRDHUP;
-		}
-	}
-	if (c->wlen > c->woff) {
-		ev |= EPOLLOUT;
-	}
-	if (c->paused && c->peer_done && !(ev & EPOLLOUT)) {
-		if (c->registered) {
-			epoll_ctl(s->epfd, EPOLL_CTL_DEL, c->fd, NULL);
-			c->registered = false;
-		}
-		c->events = 0;
-		return;
-	}
-	if (c->registered && ev == c->events) {
-		return;
-	}
-	e.events = ev;
-	e.data.u64 = c->id;
-	epoll_ctl(s->epfd, c->registered ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, c->fd, &e);
-	c->registered = true;
-	c->events = ev;
-}
-
-static void phasync_ts_close(phasync_ts *s, phasync_ts_conn *c, int err)
-{
-	if (c->registered) {
-		epoll_ctl(s->epfd, EPOLL_CTL_DEL, c->fd, NULL);
-	}
-	close(c->fd);
-	phasync_ts_emit_errno(s, 'X', c->id, err);
-	zend_hash_index_del(&s->conns, c->id);
-	if (c->wbuf) {
-		efree(c->wbuf);
-	}
-	efree(c);
-	phasync_ts_accepting(s, true, 0);        /* room again, if it had stopped */
-}
-
-/* The client finished sending: E, and close if our side is done too. */
-static void phasync_ts_eof(phasync_ts *s, phasync_ts_conn *c)
-{
-	c->eof_in = true;
-	phasync_ts_emit(s, 'E', c->id, NULL, 0);
-	if (c->shut_done) {
-		phasync_ts_close(s, c, 0);
-	} else {
-		phasync_ts_update(s, c);
-	}
-}
-
-/* Send buffered output; once drained, report W and carry out a pending shutdown
- * or close. Returns false if the connection is gone. */
-static bool phasync_ts_flush(phasync_ts *s, phasync_ts_conn *c)
-{
-	while (c->woff < c->wlen) {
-		ssize_t n = send(c->fd, c->wbuf + c->woff, c->wlen - c->woff, MSG_NOSIGNAL);
-		if (n < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				break;
-			}
-			phasync_ts_close(s, c, errno);
-			return false;
-		}
-		c->woff += n;
-	}
-	if (c->woff == c->wlen) {
-		c->woff = c->wlen = 0;
-		if (c->over) {
-			c->over = false;
-			phasync_ts_emit(s, 'W', c->id, NULL, 0);
-		}
-		if (c->close_pending) {
-			phasync_ts_close(s, c, 0);
-			return false;
-		}
-		if (c->shut_pending && !c->shut_done) {
-			shutdown(c->fd, SHUT_WR);
-			c->shut_done = true;
-			if (c->eof_in) {                 /* both directions done */
-				phasync_ts_close(s, c, 0);
-				return false;
-			}
-		}
-	}
-	phasync_ts_update(s, c);
-	return true;
-}
-
-static void phasync_ts_send(phasync_ts *s, phasync_ts_conn *c, const char *buf, size_t len)
-{
-	while (c->woff == c->wlen && len) {      /* nothing queued: straight to the socket */
-		ssize_t n = send(c->fd, buf, len, MSG_NOSIGNAL);
-		if (n < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				break;
-			}
-			phasync_ts_close(s, c, errno);
-			return;
-		}
-		buf += n;
-		len -= n;
-	}
-	if (!len) {
-		return;
-	}
-	if (c->woff && c->wlen + len > c->wcap) {
-		memmove(c->wbuf, c->wbuf + c->woff, c->wlen - c->woff);
-		c->wlen -= c->woff;
-		c->woff = 0;
-	}
-	if (c->wlen + len > c->wcap) {
-		c->wcap = MAX(c->wcap * 2, c->wlen + len);
-		c->wbuf = erealloc(c->wbuf, c->wcap);
-	}
-	memcpy(c->wbuf + c->wlen, buf, len);
-	c->wlen += len;
-	if (!c->over && c->wlen - c->woff > (size_t) s->high_water) {
-		c->over = true;
-		phasync_ts_emit(s, 'B', c->id, NULL, 0);   /* W follows once it drains */
-	}
-	phasync_ts_update(s, c);
-}
-
-static void phasync_ts_accept(phasync_ts *s)
-{
-	for (int i = 0; i < 256; i++) {
-		struct sockaddr_storage peer, local;
-		socklen_t plen = sizeof(peer), llen = sizeof(local);
-		zend_string *pn, *ln;
-		phasync_ts_conn *c;
-		size_t len;
-		char *p;
-		int fd, one = 1;
-
-		if (s->max_conns && zend_hash_num_elements(&s->conns) >= (uint32_t) s->max_conns) {
-			phasync_ts_accepting(s, false, 0);   /* the rest wait in the backlog */
-			return;
-		}
-		fd = accept4(s->lfd, (struct sockaddr *) &peer, &plen, SOCK_NONBLOCK | SOCK_CLOEXEC);
-		if (fd < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				return;
-			}
-			if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
-				/* Out of resources: stop (else the listener stays readable and
-				 * spins); resumes when a connection closes or PHP sends A. */
-				phasync_ts_accepting(s, false, errno);
-				return;
-			}
-			continue;                        /* the connection failed; next */
-		}
-		if (s->nodelay) {
-			setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-		}
-		getsockname(fd, (struct sockaddr *) &local, &llen);
-		c = ecalloc(1, sizeof(*c));
-		c->id = s->next_id++;
-		c->fd = fd;
-		zend_hash_index_add_new_ptr(&s->conns, c->id, c);
-		pn = phasync_ts_name(&peer);
-		ln = phasync_ts_name(&local);
-		len = ZSTR_LEN(pn) + 1 + ZSTR_LEN(ln);
-		p = phasync_ts_reserve(s, PHASYNC_TS_HDR + len);
-		phasync_ts_hdr(p, 'C', c->id, (uint32_t) len);
-		memcpy(p + PHASYNC_TS_HDR, ZSTR_VAL(pn), ZSTR_LEN(pn));
-		p[PHASYNC_TS_HDR + ZSTR_LEN(pn)] = '\0';
-		memcpy(p + PHASYNC_TS_HDR + ZSTR_LEN(pn) + 1, ZSTR_VAL(ln), ZSTR_LEN(ln));
-		s->outlen += PHASYNC_TS_HDR + len;
-		zend_string_release(pn);
-		zend_string_release(ln);
-		phasync_ts_update(s, c);
-	}
-}
-
-/* At most read_chunk bytes per connection per round, so one busy client can't
- * crowd out the rest. */
-static void phasync_ts_recv(phasync_ts *s, phasync_ts_conn *c)
-{
-	char *p = phasync_ts_reserve(s, PHASYNC_TS_HDR + s->read_chunk);
-	ssize_t n;
-
-	do {
-		n = recv(c->fd, p + PHASYNC_TS_HDR, s->read_chunk, 0);
-	} while (n < 0 && errno == EINTR);
-	if (n > 0) {
-		phasync_ts_hdr(p, 'D', c->id, (uint32_t) n);
-		s->outlen += PHASYNC_TS_HDR + n;
-	} else if (n == 0) {
-		phasync_ts_eof(s, c);
-	} else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-		phasync_ts_close(s, c, errno);
-	}
-}
-
-/* Collect whatever is ready right now into the frame queue. */
-static void phasync_ts_pump(phasync_ts *s)
-{
-	struct epoll_event ev[64];
-	int n = epoll_wait(s->epfd, ev, 64, 0);
-
-	for (int i = 0; i < n; i++) {
-		uint64_t key = ev[i].data.u64;
-		uint32_t got = ev[i].events;
-		phasync_ts_conn *c;
-
-		if (key == PHASYNC_TS_EVFD) {
-			continue;
-		}
-		if (key == PHASYNC_TS_LISTENER) {
-			phasync_ts_accept(s);
-			continue;
-		}
-		if ((c = zend_hash_index_find_ptr(&s->conns, key)) == NULL) {
-			continue;
-		}
-		if (got & EPOLLERR) {                /* a reset: gone, even when paused */
-			int err = 0;
-			socklen_t elen = sizeof(err);
-			getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &elen);
-			phasync_ts_close(s, c, err ? err : ECONNRESET);
-			continue;
-		}
-		if ((got & (EPOLLOUT | EPOLLHUP)) && c->wlen > c->woff && !phasync_ts_flush(s, c)) {
-			continue;
-		}
-		if (c->events & EPOLLIN) {
-			if (got & (EPOLLIN | EPOLLHUP | EPOLLRDHUP)) {
-				phasync_ts_recv(s, c);
-			}
-		} else if (c->paused && !c->eof_in && (got & (EPOLLRDHUP | EPOLLHUP))) {
-			/* A paused client left. With nothing unread, say so now; otherwise E
-			 * follows its data once PHP resumes. */
-			int unread = 0;
-			ioctl(c->fd, FIONREAD, &unread);
-			if (unread == 0) {
-				phasync_ts_eof(s, c);
-			} else {
-				c->peer_done = true;
-				phasync_ts_update(s, c);
-			}
-		}
-	}
-}
-
-/* Keep the eventfd readable exactly while frames are queued. */
-static void phasync_ts_arm(phasync_ts *s)
-{
-	bool want = s->outpos < s->outlen;
-	uint64_t v = 1;
-
-	if (want != s->armed) {
-		if (want) {
-			(void) !write(s->evfd, &v, sizeof(v));
-		} else {
-			(void) !read(s->evfd, &v, sizeof(v));
-		}
-		s->armed = want;
-	}
-}
-
-/* Hand out whole frames that fit in count bytes; a frame bigger than the read
- * is handed out in parts. */
-static size_t phasync_ts_take(phasync_ts *s, char *buf, size_t count)
-{
-	size_t n = 0;
-
-	if (s->partial) {
-		n = MIN(count, s->partial);
-		s->partial -= n;
-	} else {
-		while (s->outpos + n < s->outlen) {
-			size_t flen = PHASYNC_TS_HDR + phasync_ts_get32((unsigned char *) s->out + s->outpos + n + 9);
-			if (n + flen > count) {
-				if (n == 0) {
-					n = count;
-					s->partial = flen - count;
-				}
-				break;
-			}
-			n += flen;
-		}
-	}
-	memcpy(buf, s->out + s->outpos, n);
-	s->outpos += n;
-	if (s->outpos == s->outlen) {
-		s->outpos = s->outlen = 0;
-	}
-	return n;
-}
-
-/* epoll is shared across fork(): a child using the parent's server would steal
- * its events and act on its connections. */
-static bool phasync_ts_forked(phasync_ts *s)
-{
-	if (getpid() == s->pid) {
-		return false;
-	}
-	php_error_docref(NULL, E_WARNING, "The server was created by another process; create it after fork()");
-	return true;
-}
-
-static ssize_t phasync_ts_read(php_stream *stream, char *buf, size_t count)
-{
-	phasync_ts *s = (phasync_ts *) stream->abstract;
-	size_t n;
-
-	if (phasync_ts_forked(s)) {
-		return -1;
-	}
-	for (;;) {
-		if (s->outpos == s->outlen) {
-			phasync_ts_pump(s);
-		}
-		if (s->outpos < s->outlen || !s->blocking) {
-			break;
-		}
-		/* Blocking and nothing yet: wait for the epoll fd, cooperatively inside
-		 * a scope, in a fiber. */
-		if (phasync_read_handler() && EG(active_fiber)) {
-			int w = phasync_wait_fd(phasync_read_handler(), stream, s->epfd, INFINITY);
-			if (w != PHASYNC_WAIT_READY) {
-				phasync_ts_arm(s);
-				return w == PHASYNC_WAIT_TIMEOUT ? 0 : -1;
-			}
-		} else {
-			struct pollfd pfd = { s->epfd, POLLIN, 0 };
-			poll(&pfd, 1, -1);
-		}
-	}
-	n = phasync_ts_take(s, buf, count);
-	phasync_ts_arm(s);
-	return (ssize_t) n;
-}
-
-static ssize_t phasync_ts_write(php_stream *stream, const char *buf, size_t count)
-{
-	phasync_ts *s = (phasync_ts *) stream->abstract;
-	phasync_ts_conn *c;
-	size_t i = 0, take;
-
-	if (phasync_ts_forked(s)) {
-		return -1;
-	}
-	while (i < count) {
-		if (s->hdrlen < PHASYNC_TS_HDR) {
-			take = MIN(PHASYNC_TS_HDR - s->hdrlen, count - i);
-			memcpy(s->hdr + s->hdrlen, buf + i, take);
-			s->hdrlen += take;
-			i += take;
-			if (s->hdrlen < PHASYNC_TS_HDR) {
-				break;
-			}
-			s->wtype = s->hdr[0];
-			s->wid = (uint64_t) phasync_ts_get32(s->hdr + 1) | ((uint64_t) phasync_ts_get32(s->hdr + 5) << 32);
-			s->wleft = phasync_ts_get32(s->hdr + 9);
-			if (!memchr("DEXPRA", s->wtype, 6) || !s->wtype) {
-				s->hdrlen = 0;
-				php_error_docref(NULL, E_WARNING, "Invalid frame type 0x%02x", s->wtype);
-				phasync_ts_arm(s);
-				return -1;
-			}
-			if (s->wtype == 'A') {
-				phasync_ts_accepting(s, true, 0);
-			}
-			/* Frames for a connection that is gone (or closing) are dropped. */
-			c = zend_hash_index_find_ptr(&s->conns, s->wid);
-			if (c && !c->close_pending) {
-				switch (s->wtype) {
-					case 'E':
-						c->shut_pending = true;
-						phasync_ts_flush(s, c);
-						break;
-					case 'X':
-						c->close_pending = true;
-						phasync_ts_flush(s, c);
-						break;
-					case 'P':
-						c->paused = true;
-						phasync_ts_update(s, c);
-						break;
-					case 'R':
-						c->paused = false;
-						phasync_ts_update(s, c);
-						break;
-				}
-			}
-			if (!s->wleft) {
-				s->hdrlen = 0;
-			}
-			continue;
-		}
-		take = MIN(s->wleft, count - i);
-		if (s->wtype == 'D' && (c = zend_hash_index_find_ptr(&s->conns, s->wid)) != NULL
-		 && !c->close_pending && !c->shut_pending) {
-			phasync_ts_send(s, c, buf + i, take);
-		}
-		i += take;
-		s->wleft -= take;
-		if (!s->wleft) {
-			s->hdrlen = 0;
-		}
-	}
-	phasync_ts_arm(s);
-	return (ssize_t) count;
-}
-
-/* Also in a forked child: closing its copies of the fds leaves the parent's
- * server alone (no epoll_ctl here). */
-static int phasync_ts_stream_close(php_stream *stream, int close_handle)
-{
-	phasync_ts *s = (phasync_ts *) stream->abstract;
-	phasync_ts_conn *c;
-
-	ZEND_HASH_FOREACH_PTR(&s->conns, c) {
-		close(c->fd);
-		if (c->wbuf) {
-			efree(c->wbuf);
-		}
-		efree(c);
-	} ZEND_HASH_FOREACH_END();
-	zend_hash_destroy(&s->conns);
-	close(s->lfd);
-	close(s->evfd);
-	close(s->epfd);
-	if (s->out) {
-		efree(s->out);
-	}
-	zend_string_release(s->name);
-	efree(s);
-	return 0;
-}
-
-static int phasync_ts_cast(php_stream *stream, int castas, void **ret)
-{
-	phasync_ts *s = (phasync_ts *) stream->abstract;
-
-	if (castas != PHP_STREAM_AS_FD && castas != PHP_STREAM_AS_FD_FOR_SELECT) {
-		return FAILURE;
-	}
-	if (ret) {
-		*(php_socket_t *) ret = s->epfd;
-	}
-	return SUCCESS;
-}
-
-static int phasync_ts_set_option(php_stream *stream, int option, int value, void *ptrparam)
-{
-	phasync_ts *s = (phasync_ts *) stream->abstract;
-
-	if (option == PHP_STREAM_OPTION_BLOCKING) {
-		int old = s->blocking;
-		s->blocking = value != 0;
-		return old;
-	}
-	if (option == PHP_STREAM_OPTION_XPORT_API) {
-		php_stream_xport_param *xp = (php_stream_xport_param *) ptrparam;
-		if (xp->op != STREAM_XPORT_OP_GET_NAME) {
-			return PHP_STREAM_OPTION_RETURN_ERR;
-		}
-		if (xp->want_textaddr) {
-			xp->outputs.textaddr = zend_string_copy(s->name);
-		}
-		xp->outputs.returncode = 0;
-		return PHP_STREAM_OPTION_RETURN_OK;
-	}
-	return PHP_STREAM_OPTION_RETURN_NOTIMPL;
-}
-
-static const php_stream_ops phasync_ts_ops = {
-	phasync_ts_write, phasync_ts_read, phasync_ts_stream_close, NULL,
-	"phasync-tcp-server",
-	NULL, phasync_ts_cast, NULL, phasync_ts_set_option
-};
-
-ZEND_FUNCTION(phasync_ext_tcp_server)
-{
-	zend_string *address, *key;
-	zend_long port, backlog = 4096, max_conns = 0, read_chunk = 16384, high_water = 1048576;
-	bool reuseport = false, nodelay = false;
-	HashTable *options = NULL;
-	struct addrinfo hints, *ai = NULL;
-	struct sockaddr_storage ss;
-	socklen_t sslen = sizeof(ss);
-	char portstr[8];
-	int lfd, epfd, evfd, rc, one = 1;
-	zval *v;
-	phasync_ts *s;
-	php_stream *stream;
-	struct epoll_event e;
-
-	ZEND_PARSE_PARAMETERS_START(2, 3)
-		Z_PARAM_STR(address)
-		Z_PARAM_LONG(port)
-		Z_PARAM_OPTIONAL
-		Z_PARAM_ARRAY_HT(options)
-	ZEND_PARSE_PARAMETERS_END();
-
-	if (port < 0 || port > 65535) {
-		zend_argument_value_error(2, "must be between 0 and 65535");
-		RETURN_THROWS();
-	}
-	if (options) {
-		ZEND_HASH_FOREACH_STR_KEY_VAL(options, key, v) {
-			zend_long *target = NULL;
-			zend_long min = 0;
-			if (key == NULL) {
-				zend_argument_value_error(3, "must only have string keys");
-				RETURN_THROWS();
-			}
-			if (zend_string_equals_literal(key, "reuseport")) {
-				reuseport = zend_is_true(v);
-				continue;
-			} else if (zend_string_equals_literal(key, "nodelay")) {
-				nodelay = zend_is_true(v);
-				continue;
-			} else if (zend_string_equals_literal(key, "backlog")) {
-				target = &backlog; min = 1;
-			} else if (zend_string_equals_literal(key, "max_connections")) {
-				target = &max_conns;
-			} else if (zend_string_equals_literal(key, "read_chunk")) {
-				target = &read_chunk; min = 1;
-			} else if (zend_string_equals_literal(key, "high_water")) {
-				target = &high_water;
-			} else {
-				zend_argument_value_error(3, "has an unknown option \"%s\"", ZSTR_VAL(key));
-				RETURN_THROWS();
-			}
-			if (Z_TYPE_P(v) != IS_LONG || Z_LVAL_P(v) < min || Z_LVAL_P(v) > INT32_MAX
-			 || (target == &read_chunk && Z_LVAL_P(v) > 16 * 1024 * 1024)) {
-				zend_argument_value_error(3, "option \"%s\" must be an int in range", ZSTR_VAL(key));
-				RETURN_THROWS();
-			}
-			*target = Z_LVAL_P(v);
-		} ZEND_HASH_FOREACH_END();
-	}
-
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
-	snprintf(portstr, sizeof(portstr), ZEND_LONG_FMT, port);
-	if ((rc = getaddrinfo(ZSTR_LEN(address) ? ZSTR_VAL(address) : NULL, portstr, &hints, &ai)) != 0) {
-		php_error_docref(NULL, E_WARNING, "Unable to listen on %s:" ZEND_LONG_FMT " (%s)",
-			ZSTR_VAL(address), port, gai_strerror(rc));
-		RETURN_FALSE;
-	}
-	lfd = socket(ai->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-	if (lfd >= 0) {
-		setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));   /* as stream_socket_server() */
-#ifdef SO_REUSEPORT
-		if (reuseport) {
-			setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-		}
-#endif
-	}
-	/* The kernel caps backlog at net.core.somaxconn; the default asks for plenty,
-	 * as a burst of connections is what this server is for (musl's SOMAXCONN is 128). */
-	if (lfd < 0 || bind(lfd, ai->ai_addr, ai->ai_addrlen) != 0 || listen(lfd, (int) backlog) != 0
-	 || getsockname(lfd, (struct sockaddr *) &ss, &sslen) != 0) {
-		int err = errno;
-		if (lfd >= 0) {
-			close(lfd);
-		}
-		freeaddrinfo(ai);
-		php_error_docref(NULL, E_WARNING, "Unable to listen on %s:" ZEND_LONG_FMT " (%s)",
-			ZSTR_VAL(address), port, strerror(err));
-		RETURN_FALSE;
-	}
-	freeaddrinfo(ai);
-
-	epfd = epoll_create1(EPOLL_CLOEXEC);
-	evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-	if (epfd < 0 || evfd < 0) {
-		int err = errno;
-		close(lfd);
-		if (epfd >= 0) close(epfd);
-		if (evfd >= 0) close(evfd);
-		php_error_docref(NULL, E_WARNING, "Unable to create the server (%s)", strerror(err));
-		RETURN_FALSE;
-	}
-	e.events = EPOLLIN;
-	e.data.u64 = PHASYNC_TS_EVFD;
-	epoll_ctl(epfd, EPOLL_CTL_ADD, evfd, &e);
-
-	s = ecalloc(1, sizeof(*s));
-	s->epfd = epfd;
-	s->lfd = lfd;
-	s->evfd = evfd;
-	s->pid = getpid();
-	s->blocking = true;
-	s->next_id = 1;
-	s->nodelay = nodelay;
-	s->max_conns = max_conns;
-	s->read_chunk = read_chunk;
-	s->high_water = high_water;
-	s->name = phasync_ts_name(&ss);
-	zend_hash_init(&s->conns, 16, NULL, NULL, 0);
-	e.events = EPOLLIN;
-	e.data.u64 = PHASYNC_TS_LISTENER;
-	epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &e);
-	s->accepting = true;
-
-	stream = php_stream_alloc(&phasync_ts_ops, s, NULL, "r+");
-	stream->flags |= PHP_STREAM_FLAG_NO_BUFFER | PHP_STREAM_FLAG_NO_SEEK;
-	php_stream_to_zval(stream, return_value);
-}
-
 static ZEND_INI_MH(phasync_update_fs_offload)
 {
 	if (zend_string_equals_literal_ci(new_value, "network")) {
@@ -5009,6 +4503,8 @@ static PHP_MINIT_FUNCTION(phasync)
 	phasync_stdio_read_orig = php_stream_stdio_ops.read;
 	phasync_stdio_write_orig = php_stream_stdio_ops.write;
 	phasync_stdio_set_option_orig = php_stream_stdio_ops.set_option;
+	phasync_stdio_close_orig = php_stream_stdio_ops.close;
+	php_stream_stdio_ops.close = phasync_stdio_close;
 	php_stream_stdio_ops.read = phasync_stdio_read;
 	php_stream_stdio_ops.write = phasync_stdio_write;
 	php_stream_stdio_ops.set_option = phasync_stdio_set_option;
@@ -5060,6 +4556,7 @@ static PHP_MSHUTDOWN_FUNCTION(phasync)
 	php_stream_stdio_ops.read = phasync_stdio_read_orig;
 	php_stream_stdio_ops.write = phasync_stdio_write_orig;
 	php_stream_stdio_ops.set_option = phasync_stdio_set_option_orig;
+	php_stream_stdio_ops.close = phasync_stdio_close_orig;
 	if (phasync_ub_write_orig) {
 		sapi_module.ub_write = phasync_ub_write_orig;
 	}
@@ -5127,6 +4624,17 @@ static PHP_RINIT_FUNCTION(phasync)
 
 static PHP_RSHUTDOWN_FUNCTION(phasync)
 {
+	/* The request's registrations go with it (closing the epoll set drops them). */
+	if (phasync_epfd >= 0 && phasync_ep_pid == getpid()) {
+		close(phasync_epfd);
+		phasync_epfd = -1;
+	}
+	if (phasync_regs_ready) {
+		zend_hash_clean(&phasync_regs);
+	}
+	pthread_mutex_lock(&phasync_cq_mutex);
+	phasync_cq_len = 0;
+	pthread_mutex_unlock(&phasync_cq_mutex);
 	phasync_restore_hooks();
 	/* Any manage() scopes have unwound already (their frames live on the C
 	 * stack); nothing to free here. Leave the hooked table intact: streams may

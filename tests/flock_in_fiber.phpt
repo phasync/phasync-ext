@@ -8,38 +8,22 @@ if (!class_exists('Fiber')) die('skip requires Fibers');
 ?>
 --FILE--
 <?php
-final class TestTimeout extends Exception {}
-function run(array $fibers): void {
-    $wait = [];
-    foreach ($fibers as $k => $f) $wait[$k] = $f->start();
-    while ($wait = array_filter($wait)) {
-        $r = $w = []; $e = null; $to = 1.0; $now = microtime(true);
-        foreach ($wait as $k => [$type, $x]) { if ($type === 'r') $r[$k] = $x; elseif ($type === 'w') $w[$k] = $x; else $to = min($to, max(0, $x - $now)); }
-        if ($r || $w) \phasync\ext\stream_select($r, $w, $e, 0, (int) ($to * 1e6)); else usleep((int) ($to * 1e6));
-        $now = microtime(true);
-        foreach ($wait as $k => [$type, $x]) if (($type === 'r' && isset($r[$k])) || ($type === 'w' && isset($w[$k])) || ($type === 't' && $x <= $now)) $wait[$k] = $fibers[$k]->resume();
-    }
-}
-$h = [fn($s, $t) => Fiber::suspend(['r', $s]), fn($s, $t) => Fiber::suspend(['w', $s]),
-      fn($us) => Fiber::suspend(['t', microtime(true) + $us / 1e6]), TestTimeout::class];
+require __DIR__ . '/loop.inc';
 
 $file = tempnam(sys_get_temp_dir(), 'phasync_lock_');
 // Each fopen() is its own open file description, so flocks on two of them conflict
 // even within this process. The holder releases after 200ms; the waiter must not
 // block the ticker meanwhile.
 function contend(string $name, Closure $wait): void {
-    global $file, $h;
+    global $file;
     $holder = fopen($file, 'r+');
     flock($holder, LOCK_EX);
     $res = null; $ticks = 0; $done = false;
-    $code = function () use ($wait, $holder, &$res, &$ticks, &$done) {
-        run([
-            'W' => new Fiber(function () use ($wait, &$res, &$done) { $res = $wait(); $done = true; }),
-            'R' => new Fiber(function () use ($holder) { usleep(200000); flock($holder, LOCK_UN); }),
-            'T' => new Fiber(function () use (&$ticks, &$done) { while (!$done) { usleep(20000); $ticks++; } }),
-        ]);
-    };
-    \phasync\ext\manage($code, ...$h);
+    (new Loop)->runAll(
+        function () use ($wait, &$res, &$done) { $res = $wait(); $done = true; },
+        function () use ($holder) { usleep(200000); flock($holder, LOCK_UN); },
+        function () use (&$ticks, &$done) { while (!$done) { usleep(20000); $ticks++; } },
+    );
     fclose($holder);
     printf("%-26s %s %s\n", $name, json_encode($res), $ticks >= 5 ? 'cooperative' : "BLOCKED (ticks=$ticks)");
 }
@@ -56,17 +40,21 @@ $code = function () use ($file, &$out) {
     $out = [flock($fp, LOCK_EX | LOCK_NB, $wb), $wb];
 };
 $out = null;
-(new Fiber(fn() => \phasync\ext\manage($code, ...$h)))->start();
+(new Loop)->runAll($code);
 var_dump($out);
 flock($holder, LOCK_UN); fclose($holder);
 
-// A handler exception while waiting propagates, and the lock is not taken.
+// Cancelling the waiter propagates the cancellation, and the lock is not taken.
 $holder = fopen($file, 'r+'); flock($holder, LOCK_EX);
 $fp = fopen($file, 'r+');
-$code = function () use ($fp) {
-    try { flock($fp, LOCK_EX); echo "acquired?!\n"; } catch (RuntimeException $e) { echo 'caught: ', $e->getMessage(), "\n"; }
-};
-(new Fiber(fn() => \phasync\ext\manage($code, $h[0], $h[1], fn($us) => throw new RuntimeException('cancelled'), TestTimeout::class)))->start();
+$loop = new Loop;
+$loop->runAll(
+    function () use ($fp, $loop) {
+        $GLOBALS['waiter'] = Fiber::getCurrent();
+        try { flock($fp, LOCK_EX); echo "acquired?!\n"; } catch (LoopCancelled $e) { echo 'caught: ', $e->getMessage(), "\n"; }
+    },
+    function () use ($loop) { usleep(100000); $loop->cancel($GLOBALS['waiter']); },
+);
 flock($holder, LOCK_UN); fclose($holder);
 $probe = fopen($file, 'r+');
 var_dump(flock($probe, LOCK_EX | LOCK_NB));   // free: $fp never got it

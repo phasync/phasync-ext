@@ -13,30 +13,17 @@ if (PHP_SAPI !== 'cli') die('skip CLI only');
 // The child's stdout is a pipe the parent leaves unread for 300ms, so both
 // fibers' 300 KB echoes fill it; the ticker must keep running meanwhile.
 $child = tempnam(sys_get_temp_dir(), 'phasync_echo_') . '.php';
-file_put_contents($child, <<<'PHP'
-<?php
-final class T extends Exception {}
-function run(array $fibers): void {
-    $wait = [];
-    foreach ($fibers as $k => $f) $wait[$k] = $f->start();
-    while ($wait = array_filter($wait)) {
-        $r = $w = []; $e = null; $to = 1.0; $now = microtime(true);
-        foreach ($wait as $k => [$type, $x]) { if ($type === 'r') $r[$k] = $x; elseif ($type === 'w') $w[$k] = $x; else $to = min($to, max(0, $x - $now)); }
-        if ($r || $w) \phasync\ext\stream_select($r, $w, $e, 0, (int) ($to * 1e6)); else usleep((int) ($to * 1e6));
-        $now = microtime(true);
-        // resume in reverse start order: B gets the first turn when the pipe drains
-        foreach (array_reverse($wait, true) as $k => [$type, $x]) if (($type === 'r' && isset($r[$k])) || ($type === 'w' && isset($w[$k])) || ($type === 't' && $x <= $now)) $wait[$k] = $fibers[$k]->resume();
-    }
-}
+file_put_contents($child, '<?php require ' . var_export(__DIR__ . '/loop.inc', true) . ';' . <<<'PHP'
+
+// resume ready coroutines in reverse start order: B gets the first turn when the pipe drains
 $ticks = 0; $left = 2;
-\phasync\ext\manage(function () use (&$ticks, &$left) {
-    run([
-        'A' => new Fiber(function () use (&$left) { echo str_repeat('a', 300000); print str_repeat('A', 1000); $left--; }),
-        'B' => new Fiber(function () use (&$left) { echo str_repeat('b', 300000); $left--; }),
-        'T' => new Fiber(function () use (&$ticks, &$left) { while ($left) { usleep(20000); $ticks++; } }),
-    ]);
-}, fn($s, $t) => Fiber::suspend(['r', $s]), fn($s, $t) => Fiber::suspend(['w', $s]),
-   fn($us) => Fiber::suspend(['t', microtime(true) + $us / 1e6]), T::class);
+$loop = new Loop;
+$loop->reverse = true;
+$loop->runAll(
+    function () use (&$left) { echo str_repeat('a', 300000); print str_repeat('A', 1000); $left--; },
+    function () use (&$left) { echo str_repeat('b', 300000); $left--; },
+    function () use (&$ticks, &$left) { while ($left) { usleep(20000); $ticks++; } },
+);
 fwrite(STDERR, $ticks >= 5 ? "cooperative\n" : "BLOCKED (ticks=$ticks)\n");
 PHP);
 $cmd = [PHP_BINARY, '-n', '-d', 'extension_dir=' . ini_get('extension_dir'), '-d', 'extension=phasync', $child];

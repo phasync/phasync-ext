@@ -11,13 +11,8 @@ if (PHP_OS_FAMILY !== 'Linux') die('skip Linux only');
 phasync.fs_offload=all
 --FILE--
 <?php
-final class TestTimeout extends Exception {}
-$pooled = 0;
-$wait = function ($s, $t) use (&$pooled) {
-    $pooled++;
-    $r = [$s]; $w = $e = null;
-    \phasync\ext\stream_select($r, $w, $e, 5);
-};
+require __DIR__ . '/loop.inc';
+$loop = new Loop;
 
 // Two identical fixture trees; each case runs in one of them, natively or in a
 // fiber inside a scope, with paths relative to the tree (so warnings compare).
@@ -46,16 +41,16 @@ function call(Closure $f): string {
     return json_encode($r) . ($w !== '' ? " + $w" : '');
 }
 function check(string $name, Closure $f, bool $quiet = false): void {
-    global $wait, $pooled;
+    global $loop;
     $a = fixture(); $b = fixture();
     chdir($a); $native = call($f);
-    chdir($b); $before = $pooled; $ext = null;
+    chdir($b); $before = $loop->parks; $ext = null;
     $code = function () use ($f, &$ext) { $ext = call($f); };   // not inside fn(): &$ext
-    (new Fiber(fn() => \phasync\ext\manage($code, $wait, $wait, fn($us) => null, TestTimeout::class)))->start();
+    $loop->runAll($code);
     chdir('/');
     rmtree($a); rmtree($b);
     $line = sprintf("%-26s %s %s\n", $name, $native === $ext ? 'same' : "DIFF native=$native ext=$ext",
-        $pooled > $before ? 'pooled' : 'NOT POOLED');
+        $loop->parks > $before ? 'pooled' : 'NOT POOLED');
     if (!$quiet || !str_ends_with($line, " same pooled\n")) echo $line;   // quiet: failures only
 }
 
@@ -96,17 +91,17 @@ check('rename(missing)',        fn() => rename('missing', 'h'));
 check('rename dir over file',   fn() => rename('d', 'f'));
 
 // Outside a fiber everything is native (and not pooled).
-$before = $pooled;
-\phasync\ext\manage(fn() => file_exists(__FILE__), $wait, $wait, fn($us) => null, TestTimeout::class);
-var_dump($pooled === $before);
+$before = $loop->parks;
+$loop->manage(fn() => file_exists(__FILE__));
+var_dump($loop->parks === $before);
 
 // The default policy (network) leaves a local path alone.
 ini_set('phasync.fs_offload', 'network');
 $root = fixture();
-(new Fiber(fn() => \phasync\ext\manage(function () use ($root) {
+$loop->runAll(function () use ($root) {
     stat("$root/f"); scandir($root); unlink("$root/g");
-}, $wait, $wait, fn($us) => null, TestTimeout::class)))->start();
-var_dump($pooled === $before);
+});
+var_dump($loop->parks === $before);
 rmtree($root);
 var_dump(ini_set('phasync.fs_offload', 'bogus'), ini_get('phasync.fs_offload'));
 ?>

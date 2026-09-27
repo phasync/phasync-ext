@@ -13,50 +13,21 @@ if (!function_exists('proc_open')) die('skip requires proc_open');
 error_reporting=E_ALL & ~E_DEPRECATED
 --FILE--
 <?php
-final class TestTimeout extends Exception {}
-
-// Minimal scheduler: handlers suspend with what they wait on; the loop waits with
-// phasync\ext\stream_select() (not overridden) and resumes whoever is ready.
-function run(array $fibers): void {
-    $wait = [];
-    foreach ($fibers as $k => $f) $wait[$k] = $f->start();
-    while ($wait = array_filter($wait)) {
-        $r = $w = []; $e = null; $to = 1.0; $now = microtime(true);
-        foreach ($wait as $k => [$type, $x]) {
-            if ($type === 'r') $r[$k] = $x; elseif ($type === 'w') $w[$k] = $x; else $to = min($to, max(0, $x - $now));
-        }
-        if ($r || $w) \phasync\ext\stream_select($r, $w, $e, 0, (int) ($to * 1e6)); else usleep((int) ($to * 1e6));
-        $now = microtime(true);
-        foreach ($wait as $k => [$type, $x]) {
-            if (($type === 'r' && isset($r[$k])) || ($type === 'w' && isset($w[$k])) || ($type === 't' && $x <= $now)) {
-                $wait[$k] = $fibers[$k]->resume();
-            }
-        }
-    }
-}
-$h = [
-    fn($s, $t) => Fiber::suspend(['r', $s]),
-    fn($s, $t) => Fiber::suspend(['w', $s]),
-    fn($us) => Fiber::suspend(['t', microtime(true) + $us / 1e6]),
-    TestTimeout::class,
-];
+require __DIR__ . '/loop.inc';
 
 // Run $f natively, then in a scope beside a fiber ticking every 20ms: the results
 // must match, and the ticker must have kept running while the child did.
 function check(string $name, Closure $f): void {
-    global $h;
     ob_start(); $native = $f(); $native = [$native, ob_get_clean()];
     $ext = null; $ticks = 0; $done = false;
-    \phasync\ext\manage(function () use ($f, &$ext, &$ticks, &$done) {
-        run([
-            'P' => new Fiber(function () use ($f, &$ext, &$done) {
-                ob_start(); $r = $f(); $ext = [$r, ob_get_clean()]; $done = true;
-            }),
-            'T' => new Fiber(function () use (&$ticks, &$done) {
-                while (!$done) { usleep(20000); $ticks++; }
-            }),
-        ]);
-    }, ...$h);
+    (new Loop)->runAll(
+        function () use ($f, &$ext, &$done) {
+            ob_start(); $r = $f(); $ext = [$r, ob_get_clean()]; $done = true;
+        },
+        function () use (&$ticks, &$done) {
+            while (!$done) { usleep(20000); $ticks++; }
+        },
+    );
     printf("%-22s %s %s\n", $name, $native === $ext ? 'same' : 'DIFF ' . json_encode([$native, $ext]),
         $ticks >= 5 ? 'cooperative' : "BLOCKED (ticks=$ticks)");
 }

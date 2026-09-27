@@ -10,13 +10,8 @@ if (!@checkdnsrr('php.net', 'A')) die('skip requires working DNS');
 ?>
 --FILE--
 <?php
-final class TestTimeout extends Exception {}
-$waits = 0;
-$rd = function ($s, $t) use (&$waits) {                        // waits like phasync does
-    $waits++;
-    $r = [$s]; $w = $e = null;
-    if (\phasync\ext\stream_select($r, $w, $e, 10) < 1) throw new TestTimeout();
-};
+require __DIR__ . '/loop.inc';
+$loop = new Loop;
 // Two live queries can differ in TTL and round-robin order: zero TTLs, sort.
 function norm($v) {
     if (!is_array($v)) return $v;
@@ -57,10 +52,10 @@ foreach ($cases as $name => $f) {
     $native = run($f);
     $ext = null;
     $body = function () use ($f, &$ext) { $ext = run($f); };    // outside the arrow fn
-    (new Fiber(fn() => \phasync\ext\manage($body, $rd, $rd, fn($us) => null, TestTimeout::class)))->start();
+    $loop->runAll($body);
     printf("%-20s %s\n", $name, $native === $ext ? 'same' : "DIFF\n  native=$native\n  ext   =$ext");
 }
-var_dump($waits >= 12);                  // the queries went through the pool
+var_dump($loop->parks >= 12);            // the queries went through the pool
 ?>
 --EXPECT--
 A php.net            same

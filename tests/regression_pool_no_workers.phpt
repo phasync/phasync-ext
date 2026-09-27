@@ -19,15 +19,14 @@ $path  = tempnam(sys_get_temp_dir(), 'phasync_nw_');
 $child = tempnam(sys_get_temp_dir(), 'phasync_nw_') . '.php';
 file_put_contents($path, 'inline-ok');
 file_put_contents($child, '<?php
-final class TestTimeout extends Exception {}
-$called = false;
-(new Fiber(fn() => \phasync\ext\manage(function () {
+require ' . var_export(__DIR__ . '/loop.inc', true) . ';
+$loop = new Loop;
+$loop->runAll(function () {
     $fp = fopen(' . var_export($path, true) . ', "r");
     var_dump(fread($fp, 100));
     fclose($fp);
-}, function ($s, $t) use (&$called) { $called = true; }, fn($s, $t) => null,
-   fn($us) => null, TestTimeout::class)))->start();
-var_dump($called);
+});
+var_dump($loop->parks > 0);
 ');
 
 $cmd = 'ulimit -u 1 || exit 3; exec ' . escapeshellarg(PHP_BINARY) . ' -n'

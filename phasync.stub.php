@@ -15,95 +15,62 @@ namespace phasync\ext;
 function stream_select(?array &$read, ?array &$write, ?array &$except, ?int $seconds, ?int $microseconds = null): int|false {}
 
 /**
- * Run $code with transparent fiber-async I/O active for its dynamic extent.
+ * Run $task with transparent fiber-async I/O active for its dynamic extent.
  *
- * While $code runs, blocking I/O that would otherwise stall the process instead
- * calls one of the three handlers, which are responsible only for *waiting*
- * (typically Fiber::suspend into a scheduler); the extension performs the real
- * I/O afterwards:
- *   - $readHandler(resource $stream, ?float $timeout)  — wait until readable;
- *   - $writeHandler(resource $stream, ?float $timeout) — wait until writable;
- *   - $sleepHandler(int $us)                           — wait $us µs (a timer).
+ * While $task runs, blocking I/O inside a coroutine (fiber) parks it in the
+ * event loop instead of blocking the process, and the extension does the real
+ * I/O once it may continue. The event loop supplies the waiting:
+ *   - $getSlot(): int                        — a slot number no one else uses;
+ *   - $park(int $slot, float $timeout): void — suspend the current coroutine in
+ *     the slot until unpark(), or until $timeout seconds pass (then it throws
+ *     $timeoutException) or it is cancelled (then it throws that);
+ *   - $unpark(int $slot): bool               — resume the coroutine parked in
+ *     the slot; false if the slot is vacant (its wait was cancelled or timed out);
+ *   - $sleep(int $microseconds): void        — wait that long (a timer).
  *
- * The read/write handlers receive a real PHP stream resource — the socket/pipe
- * being read, or, for thread-pool ops (gethostbyname/file/FIFO), a wrapper around
- * the worker's completion pipe — so they can be phasync::readable()/writable()
- * (or feed a native stream_select()) directly, riding the loop's single select.
+ * The extension takes a fresh slot for every wait and unparks only on PHP's
+ * thread, inside poll(): I/O readiness and finished thread-pool tasks both wake
+ * their waiters there, so poll() is the loop's one blocking call.
  *
- * $timeout is how many seconds the *native* op would still wait: a socket's
- * stream_set_timeout()/default_socket_timeout, counted per low-level wait as PHP
- * does (a retry within the same wait gets only the remaining time), or null where
- * PHP would wait forever (pipes, files, FIFOs, pool operations).
- *
- * Handler return values are ignored: returning means "ready", and the op is
- * retried. To report that the time ran out, a handler throws an instance of
- * $timeoutException (subclasses included); the extension catches and clears it
- * and finishes the op exactly as native PHP does on a socket timeout — partial
- * data or false, stream_get_meta_data()['timed_out'] set, and the notice PHP emits
- * for a timed-out send. Any other exception (e.g. a coroutine cancellation)
+ * When PHP's own call has a timeout (a socket's stream_set_timeout() or
+ * default_socket_timeout), the extension passes it to park(); if park() throws
+ * $timeoutException once it has run out, the call finishes exactly as native PHP
+ * does on a timeout (partial data or false, stream_get_meta_data()['timed_out'],
+ * the notice for a timed-out send). Any other exception (a cancellation)
  * propagates out of the hooked function unchanged.
  *
- * Covers tcp/unix/ssl/tls sockets, stream_socket_pair(), proc_open() pipes,
- * STDIN/STDOUT/STDERR, sleep()/usleep()/time_nanosleep()/time_sleep_until(),
- * gethostbyname(), and fopen() (regular files and FIFO open() go through the
- * worker thread pool). A stream the caller made non-blocking is never waited on:
- * it behaves natively.
+ * Covers tcp/unix/ssl/tls sockets, stream_socket_pair(), proc_open()/popen()
+ * pipes and process waits, STDIN/STDOUT/STDERR and echo in the CLI,
+ * stream_select()/socket_select(), the sleep functions, DNS, file and
+ * filesystem calls (through a worker thread pool) and flock(). A stream the
+ * caller made non-blocking is never waited on: it behaves natively.
  *
- * Handlers are active only for the duration of this call and are removed
- * automatically when $code returns or throws — there is no separate on/off
- * step. Calls nest: an inner manage() shadows the outer handlers and timeout
- * class (LIFO) and the outer set is restored when it returns. Sleep and pool
- * handlers only take effect inside a fiber; outside one, the underlying call runs
- * normally (a real blocking op).
- *
- * Returns whatever $code returns.
+ * Calls nest: an inner manage() shadows the outer event loop until it returns.
+ * Outside a coroutine, calls behave natively. Returns what $task returns.
  */
-function manage(\Closure $code, \Closure $readHandler, \Closure $writeHandler, \Closure $sleepHandler, string $timeoutException): mixed {}
+function manage(\Closure $task, \Closure $getSlot, \Closure $park, \Closure $unpark, \Closure $sleep, string $timeoutException): mixed {}
 
 /**
- * A TCP server multiplexed into one stream. The extension accepts connections,
- * reads and writes the client sockets, and reports everything as frames on the
- * returned stream: a 13-byte header, type:u8 id:u64 len:u32 (little-endian,
- * unpack('atype/Pid/Vlen')), then len bytes of payload.
- *
- * Read from the stream (server -> PHP):
- *   C  new connection; payload "peer\0local", each as stream_socket_get_name()
- *      writes it ("1.2.3.4:5", "[::1]:5")
- *   D  data from the client (at most read_chunk bytes per frame)
- *   E  the client finished sending; it can still be written to
- *   B  output buffered for this client passed high_water: stop producing for it
- *   W  that output has drained since (always follows a B)
- *   X  the connection is gone; payload errno:u32 (0 = clean). Always its last frame.
- *   F  (id 0) accepting stopped; payload errno:u32: 0 = max_connections reached,
- *      else why accept() failed (EMFILE...). New connections wait in the backlog.
- *   A  (id 0) accepting again
- * Write to the stream (PHP -> server):
- *   D  send the payload             E  shut down our sending side
- *   X  flush, then close (answered by an X frame)
- *   P  pause reading                R  resume reading (data that arrived meanwhile follows)
- *   A  (id 0) try accepting again, e.g. after F with EMFILE once fds were freed;
- *      accepting also resumes by itself whenever a connection closes
- *
- * The stream is selectable. A read returns only whole frames, unless a frame is
- * bigger than the read length. A non-blocking read returns '' when there is
- * nothing to report (e.g. a wake-up that only flushed output); only feof() means
- * the stream is closed, and it stays false while the server lives. Blocking reads
- * wait for the next frame (inside manage(), in a fiber, through the read
- * handler). Every ready connection gets a turn before any gets a second.
- * Writes always take the whole buffer: output a client can't take yet is
- * buffered; B and W bracket the time a connection holds more than high_water
- * bytes of it. A paused connection still reports the client leaving: X at once on a
- * reset, E at once if nothing is unread, else E after that data once resumed.
- * Connection ids are never reused. fclose() closes the server and every
- * connection. stream_socket_get_name() gives the listening address (useful with
- * port 0). The stream belongs to the process that created it: after fork(),
- * create the server in the child instead (reads and writes in another process
- * fail with a warning).
- *
- * Options: backlog (default 4096, capped by the kernel), reuseport (false),
- * nodelay (false), max_connections (0 = no limit), read_chunk (16384),
- * high_water (1048576).
- *
- * @return resource|false
+ * The event loop's one blocking call: wait up to $maxTime seconds (0: don't wait)
+ * for anything waited on to become ready, unpark those waiters and the waiters of
+ * finished thread-pool tasks, and return. Must be called inside manage().
  */
-function tcp_server(string $address, int $port, array $options = []) {}
+function poll(float $maxTime): void {}
+
+/**
+ * Park the current coroutine until $stream is readable, or at its end, or
+ * failed (the next read then reports it the way PHP does). The event loop's
+ * exceptions (a timeout after $timeout seconds, a cancellation) propagate as
+ * they are. One coroutine at a time may wait to read a stream (LogicException).
+ *
+ * @param resource $stream
+ */
+function readable($stream, ?float $timeout = null): void {}
+
+/**
+ * Park the current coroutine until $stream is writable, or closed, or failed,
+ * as readable() does.
+ *
+ * @param resource $stream
+ */
+function writable($stream, ?float $timeout = null): void {}

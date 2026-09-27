@@ -1,5 +1,5 @@
 --TEST--
-Transparent async over TLS: fread on a hooked tls:// socket suspends a fiber
+Transparent async over TLS: fread on a hooked tls:// socket parks the coroutine
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -10,7 +10,7 @@ if (!function_exists('proc_open')) die('skip requires proc_open');
 ?>
 --FILE--
 <?php
-final class TestTimeout extends Exception {}
+require __DIR__ . '/loop.inc';
 // self-signed cert, generated in-process
 $pk = openssl_pkey_new(['private_key_bits'=>2048, 'private_key_type'=>OPENSSL_KEYTYPE_RSA]);
 $csr = openssl_csr_new(['commonName'=>'localhost'], $pk);
@@ -36,28 +36,12 @@ while (($line = fgets($pipes[1])) !== false) {
 
 $ctx = stream_context_create(['ssl'=>['verify_peer'=>false,'verify_peer_name'=>false]]);
 
-$suspended = \phasync\ext\manage(function () use ($port, $ctx) {
-    $fiber = new Fiber(function() use ($port,$ctx){
-        $c = @stream_socket_client("tls://127.0.0.1:$port",$e,$es,5,STREAM_CLIENT_CONNECT,$ctx);
-        echo "tls fiber read: " . fread($c, 100) . "\n";
-    });
-    $sig = $fiber->start();
-    $suspended = ($sig !== null);
-    while (!$fiber->isTerminated()) {
-        [$type,$res] = $sig;
-        $r=$w=$ex=null;
-        if ($type==='read') $r=[$res]; else $w=[$res];
-        \phasync\ext\stream_select($r,$w,$ex,5);
-        $sig = $fiber->resume();
-    }
-    return $suspended;
-},
-fn($res) => Fiber::suspend(['read',$res]),
-fn($res) => Fiber::suspend(['write',$res]),
-fn($us)=>Fiber::suspend(['sleep',$us]),
-TestTimeout::class);
-
-var_dump($suspended);   // proves it went async, not blocking
+$loop = new Loop;
+$loop->runAll(function () use ($port, $ctx) {
+    $c = @stream_socket_client("tls://127.0.0.1:$port",$e,$es,5,STREAM_CLIENT_CONNECT,$ctx);
+    echo "tls fiber read: " . fread($c, 100) . "\n";
+});
+var_dump($loop->parks > 0);   // proves it went async, not blocking
 foreach ($pipes as $pp) @fclose($pp);
 proc_close($p);
 @unlink($pemFile);

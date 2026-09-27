@@ -6,13 +6,8 @@ phasync
 <?php if (!class_exists('Fiber')) die('skip requires Fibers'); ?>
 --FILE--
 <?php
-final class TestTimeout extends Exception {}
-$waits = 0;
-$rd = function ($s, $t) use (&$waits) {                       // waits like phasync does
-    $waits++;
-    $r = [$s]; $w = $e = null;
-    if (\phasync\ext\stream_select($r, $w, $e, 5) < 1) throw new TestTimeout();
-};
+require __DIR__ . '/loop.inc';
+$loop = new Loop;
 function call(callable $fn, string $arg): string {
     error_clear_last();
     $v = @$fn($arg);
@@ -29,10 +24,10 @@ foreach ($cases as [$fn, $arg]) {
     $native = call($fn, $arg);
     $ext = null;
     $body = function () use ($fn, $arg, &$ext) { $ext = call($fn, $arg); };   // outside the arrow fn
-    (new Fiber(fn() => \phasync\ext\manage($body, $rd, $rd, fn($us) => null, TestTimeout::class)))->start();
+    $loop->runAll($body);
     printf("%-15s %-24s %s\n", $fn, strlen($arg) > 24 ? 'a*' . strlen($arg) : $arg, $native === $ext ? 'same' : "DIFF native=$native ext=$ext");
 }
-var_dump($waits >= 6);            // the lookups went through the pool (read handler)
+var_dump($loop->parks >= 6);      // the lookups went through the pool
 ?>
 --EXPECT--
 gethostbyname   localhost                same

@@ -3,7 +3,7 @@
 [![CI](https://github.com/phasync/phasync-ext/actions/workflows/ci.yml/badge.svg)](https://github.com/phasync/phasync-ext/actions/workflows/ci.yml)
 
 A PHP extension that gives [phasync](https://github.com/phasync/phasync) — and any
-fiber-based async code — three things on **PHP 8.2+**, without patching PHP:
+fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
 
 1. **`phasync\ext\stream_select()`** — a drop-in `stream_select()` that uses
    `poll(2)` internally, so it is **not bounded by `FD_SETSIZE`** (the ~1024
@@ -24,7 +24,7 @@ fiber-based async code — three things on **PHP 8.2+**, without patching PHP:
      would block (each echo stays contiguous, as natively)
    - `sleep()`, `usleep()`, `time_nanosleep()`, `time_sleep_until()`
    - `flock()`, `file_put_contents(..., LOCK_EX)`, `SplFileObject::flock()` on a
-     held lock (retried without blocking, sleeping via the sleep handler between
+     held lock (retried without blocking, sleeping via the loop's sleep between
      tries: 1ms, doubling to 20ms — there is no descriptor to wait on)
    - DNS: `gethostbyname()`, `gethostbynamel()`, `gethostbyaddr()`,
      `dns_get_record()`, `checkdnsrr()`/`dns_check_record()`, `getmxrr()`/`dns_get_mx()`
@@ -41,16 +41,12 @@ fiber-based async code — three things on **PHP 8.2+**, without patching PHP:
      `opendir()`/`dir()`, `unlink()`, `rename()`, `mkdir()`, `rmdir()`
      (via a thread pool; see below)
 
-   The extension performs the real I/O; on a would-block it invokes one of the
-   handlers you pass to `manage()`, which decides how to wait (typically
-   `Fiber::suspend()` into a scheduler). The C side never touches the Fiber API —
-   your callback owns all suspension. This works because PHP fibers are stackful,
-   so a suspend from inside `fread()`/`SSL_read()` unwinds and resumes correctly.
-
-3. **`phasync\ext\tcp_server()`** — a TCP server multiplexed into a single
-   stream: the extension accepts connections and reads/writes the client sockets
-   (epoll), and PHP sees connects, data and disconnects as frames on that stream.
-   One select and one read cover any number of connections. See below.
+   The extension performs the real I/O; on a would-block it parks the coroutine
+   in the event loop you pass to `manage()` (`getSlot()`/`park()`/`unpark()`),
+   and `phasync\ext\poll()` — the loop's one blocking call, on epoll — unparks it
+   when it may continue. The C side never touches the Fiber API: the loop owns all
+   suspension. This works because PHP fibers are stackful, so a suspend from
+   inside `fread()`/`SSL_read()` unwinds and resumes correctly.
 
 ## Why
 
@@ -123,46 +119,51 @@ function stream_select(?array &$read, ?array &$write, ?array &$except,
                        ?int $seconds, ?int $microseconds = null): int|false;
 
 function manage(
-    \Closure $code,           // run with async I/O active; its return value is returned
-    \Closure $readHandler,    // (resource $stream, ?float $timeout) — wait until readable
-    \Closure $writeHandler,   // (resource $stream, ?float $timeout) — wait until writable
-    \Closure $sleepHandler,   // (int $microseconds) — wait that long (a scheduler timer)
-    string   $timeoutException, // class a handler throws when the wait's time ran out
+    \Closure $task,             // run with async I/O active; its return value is returned
+    \Closure $getSlot,          // (): int — a slot number no one else uses
+    \Closure $park,             // (int $slot, float $timeout) — suspend the coroutine in the slot
+    \Closure $unpark,           // (int $slot): bool — resume it; false if the slot is vacant
+    \Closure $sleep,            // (int $microseconds) — wait that long (a timer)
+    string   $timeoutException, // what park() throws when its $timeout ran out
 ): mixed;
+
+function poll(float $maxTime): void;            // the loop's one blocking call
+function readable($stream, ?float $timeout = null): void;
+function writable($stream, ?float $timeout = null): void;
 ```
 
-The read/write handlers receive a real **PHP stream resource** — the socket/pipe
-being read, or, for thread-pool ops (DNS/file/FIFO), a wrapper around the
-worker's completion pipe, and for the wait for a child process (`pclose()`,
-`proc_close()`, the end of `exec()` & co.) a wrapper around a pidfd that turns
-readable when the child exits — so they can be handed straight to
-`phasync::readable()`/`writable()` (or a native `stream_select()`) and ride the
-event loop's single select. The handlers are responsible only for *waiting*; the
-extension performs the actual I/O afterwards. A handler called outside an event
-loop can just do a small blocking `phasync\ext\stream_select()` to satisfy the
-contract. The sleep handler receives a µs duration.
+**Waiting.** A coroutine waits by parking in a slot of the event loop: the
+extension takes a fresh `getSlot()` for every wait and calls `park($slot,
+$timeout)`; the loop suspends the coroutine and resumes it when `unpark($slot)`
+is called. The extension unparks **only on PHP's thread, inside `poll()`**:
+waiting for a descriptor arms a one-shot epoll registration (a level-triggered one
+with nobody waiting would make every `epoll_wait()` return at once while unread
+data sits in a socket), and worker threads never call PHP — they queue the slot
+and write to an eventfd in the epoll set, which `poll()` drains. So `poll($maxTime)`
+replaces the loop's `stream_select()` and idle `usleep()`: one `epoll_wait()` for
+up to `$maxTime` seconds (0 when it has work queued, else the time until its next
+timer), costing work per ready event, never a scan of everything registered. A
+registration lives as long as its stream and is removed in the stream's close op;
+a coroutine waiting on a stream that is closed is woken, and its next use of the
+stream finds it closed.
 
-The second handler argument is how long the **native** op would still wait, in
-seconds: a socket's `stream_set_timeout()`/`default_socket_timeout`, counted per
-low-level wait exactly as PHP counts it (a retry within the same wait gets only the
-remaining time), or `null` where PHP would wait forever (pipes, files, FIFOs,
-thread-pool operations). Handler return values are ignored: **returning means
-"ready"**, and the op is retried. To report that the time ran out, the handler
-**throws an instance of `$timeoutException`** (subclasses included). The extension
-catches and clears it and finishes the op exactly as native PHP does on a socket
-timeout — partial data or `false`, `stream_get_meta_data()['timed_out']` set, and
-the notice PHP emits for a timed-out send — so no exception escapes. Any *other*
-exception (such as a coroutine cancellation) propagates out of the I/O call
-unchanged. This keeps `fgets()`/`fread()`/`fwrite()`/`stream_get_contents()`
-identical to native PHP, including timeout behaviour, whether or not the extension
-is loaded. phasync passes `phasync\TimeoutException::class` and its own
-`phasync::readable()`/`writable()` as the handlers.
+**Timeouts and cancellation are the loop's.** When PHP's own call has a timeout
+(a socket's `stream_set_timeout()` or `default_socket_timeout`, counted per
+low-level wait as PHP counts it — a retry gets only the remaining time), the
+extension passes it to `park()`; where PHP would wait forever (pipes, files,
+FIFOs, pool operations) it passes none (`PHP_FLOAT_MAX`). If `park()` throws
+`$timeoutException` once that time has run out, the extension finishes the call
+exactly as native PHP does on a timeout — partial data or `false`,
+`stream_get_meta_data()['timed_out']`, the notice for a timed-out send — so no
+exception escapes. Any other exception (a cancellation) propagates out of the I/O
+call unchanged, after the extension has disarmed the wait. `readable()` and
+`writable()` pass the loop's exceptions through as they are. phasync passes its
+loop's `getSlot`/`park`/`unpark`, its sleep, and `phasync\TimeoutException::class`.
 
-`manage()` scopes are **automatic and stacking**: the handlers apply only while
-`$code` runs and are removed when it returns or throws (no separate enable/disable
-step), and a nested `manage()` shadows the outer handlers and timeout class (LIFO),
-restoring them on return. Sleep and the thread-pool ops only take effect inside a fiber; outside
-one they run as the ordinary blocking call.
+`manage()` scopes are **automatic and stacking**: they apply only while `$task`
+runs, and a nested `manage()` shadows the outer loop until it returns. Waits only
+happen inside a coroutine (fiber); outside one, calls run as the ordinary
+blocking call.
 
 Descriptor-backed streams are **wrapped as soon as they are created**: sockets
 from the tcp/unix/ssl transports (`stream_socket_client/server`, `fsockopen`),
@@ -175,35 +176,20 @@ entered. A wrapped stream is
 **indistinguishable from a raw one outside a `manage()` scope**: it blocks,
 returns `EAGAIN`, and honours `stream_set_blocking()` exactly as an unwrapped
 stream would. Only inside a scope, and only for a stream left in blocking mode,
-does a would-block suspend the fiber instead of blocking the process.
+does a would-block park the coroutine instead of blocking the process.
 
-Two coroutines waiting on the same stream in the same direction is the caller's
-data race, as in Go or Rust; the extension does not serialise them (phasync refuses
-a second waiter loudly).
+One coroutine at a time may wait on a stream in each direction: a second waiter
+gets a `LogicException`, as with phasync's own pollers.
 
-```php
-use function phasync\ext\manage;
-
-manage(
-    function () {
-        // start fibers, drive them with phasync\ext\stream_select(); blocking
-        // fread()/fwrite()/gethostbyname()/sleep() inside a fiber yield here.
-    },
-    // readable/writable: return once ready; throw MyTimeout if $timeout ran out
-    fn($stream, ?float $timeout) => \Fiber::suspend($stream),
-    fn($stream, ?float $timeout) => \Fiber::suspend($stream),
-    fn(int $us) => \Fiber::suspend($us),      // timer
-    MyTimeout::class,
-);
-```
+A minimal loop on this contract is in [`tests/loop.inc`](tests/loop.inc).
 
 ### Filesystem and DNS (thread pool)
 
 Regular files and DNS lookups cannot be made non-blocking with readiness polling
 (a disk fd is always "ready"; `getaddrinfo()` blocks). Like libuv/Node, these are
 offloaded to a small worker thread pool: the worker runs only the raw syscall
-(never the Zend engine, so it is safe in a non-ZTS build) and wakes the parked
-fiber through a self-pipe that reuses the scope's read handler. Workers are pooled;
+(never the Zend engine, so it is safe in a non-ZTS build) and queues the parked
+coroutine's slot for `poll()` to unpark. Workers are pooled;
 the pool size is the `phasync.thread_pool_size` INI (default 8; idle workers cost
 only a lazily-paged stack, so a larger pool is cheap).
 
@@ -229,98 +215,17 @@ its reads/writes use the ordinary readiness path. If phasync times out or cancel
 the coroutine, the extension `pthread_cancel`s the thread stuck in `open()`
 (cancellation is scoped to that one syscall) and reaps it, so nothing leaks.
 
-## `phasync\ext\tcp_server()`
-
-```php
-$fp = phasync\ext\tcp_server('0.0.0.0', 8080, ['nodelay' => true]);
-stream_set_blocking($fp, false);
-```
-
-Everything goes through `$fp`: select on it, read frames from it, write frames to
-it, `fclose()` it to close the server and every connection. Each frame is a
-13-byte header, `type:u8 id:u64 len:u32` little-endian (`unpack('atype/Pid/Vlen',
-$buf, $offset)`), then `len` bytes of payload.
-
-| Direction | Type | Payload | Meaning |
-|---|---|---|---|
-| server → PHP | `C` | `"peer\0local"`, each as `stream_socket_get_name()` (`1.2.3.4:5`, `[::1]:5`) | New connection |
-| | `D` | bytes (≤ `read_chunk`) | Data from the client |
-| | `E` | — | The client finished sending; we can still write |
-| | `B` | — | Output buffered for this client passed `high_water`: stop producing for it |
-| | `W` | — | That output has drained since (always follows a `B`) |
-| | `X` | errno `u32` (0 = clean) | The connection is gone; always its last frame |
-| | `F` | errno `u32`: 0 = `max_connections`, else e.g. `EMFILE` | (id 0) Accepting stopped; new connections wait in the backlog |
-| | `A` | — | (id 0) Accepting again |
-| PHP → server | `D` | bytes | Send data |
-| | `E` | — | Shut down our sending side |
-| | `X` | — | Flush, then close; answered by an `X` frame |
-| | `P` / `R` | — | Pause / resume reading this connection |
-| | `A` | — | (id 0) Try accepting again (after `F` for `EMFILE`, once fds are freed) |
-
-```php
-while (true) {
-    phasync::readable($fp);                 // or stream_select() on [$fp]
-    $buf = fread($fp, 65536);               // whole frames only; '' = nothing to report
-    for ($o = 0; $o < strlen($buf); $o += 13 + $h['len']) {
-        $h = unpack('atype/Pid/Vlen', $buf, $o);
-        $payload = substr($buf, $o + 13, $h['len']);
-        switch ($h['type']) {
-            case 'C': $peers[$h['id']] = explode("\0", $payload)[0]; break;
-            case 'D': fwrite($fp, 'D' . pack('PV', $h['id'], strlen($payload)) . $payload); break;  // echo
-            case 'E': fwrite($fp, 'X' . pack('PV', $h['id'], 0)); break;                           // close
-            case 'X': unset($peers[$h['id']]); break;
-        }
-    }
-}
-```
-
-- **No thread.** `$fp` is backed by an epoll fd: selectable whenever the listener
-  or a client has an event. `fread()` collects those events without blocking;
-  `fwrite()` parses the frames and writes to the sockets, buffering what a client
-  can't take yet. An eventfd keeps `$fp` readable while frames are queued.
-- **Reads.** A read returns only complete frames, unless a single frame is bigger
-  than the read length (then it comes in parts). A non-blocking read returns `''`
-  when there is nothing to report, such as a wake-up that only flushed output;
-  only `feof()` means closed, and it stays false while the server lives. Frames
-  may be written in any pieces.
-- **Fairness.** A new batch of events is collected only once PHP has read the
-  last one, and each reported connection moves behind the others, so every ready
-  connection gets a turn before any gets a second.
-- **Backpressure.** Clients are only read while PHP reads `$fp`. Writes always
-  take the whole buffer; when a connection's buffered output passes `high_water`
-  a `B` frame says so, and a `W` frame follows once it has drained, so an
-  application can stop producing for a slow client in between.
-- **Pause.** `P` leaves a client's data unread in the socket until `R`, which
-  then delivers it. A paused client leaving is still reported: `X` at once on a
-  reset, `E` at once if nothing is unread, otherwise `E` after that data once
-  resumed.
-- **Full.** At `max_connections`, or when `accept()` fails for lack of resources,
-  accepting stops with `F` (so an application can close idle connections to make
-  room); it resumes with `A` when a connection closes, or when PHP sends `A`.
-- **Lifecycle.** Connection ids (64-bit) are never reused, and every connection
-  ends with exactly one `X`. When both sides have finished sending (`E` both
-  ways) the connection closes by itself. Frames for a connection that is gone
-  are dropped; an unknown frame type makes `fwrite()` warn and return false.
-- **fork().** The stream belongs to the process that created it (its epoll fd is
-  shared after `fork()`): create the server after forking. Reads and writes in
-  another process warn and fail; `fclose()` there leaves the parent's server alone.
-- **Blocking mode** (the default): a read with nothing to return waits, inside
-  `manage()` in a fiber through the read handler. `stream_socket_get_name($fp)`
-  gives the listening address (useful with port 0).
-- **Options:** `backlog` (4096, capped by the kernel), `reuseport` (false),
-  `nodelay` (false), `max_connections` (0 = no limit), `read_chunk` (16384),
-  `high_water` (1048576).
-
 ## Status
 
-v1. Sockets, TLS, pipes, the sleep functions, DNS and filesystem/FIFO I/O are
-implemented and tested. Known TLS limitations: read/write intent is approximated
+0.5 (alpha): the slot/`poll()` contract. Sockets, TLS, pipes, processes, the
+sleep functions, DNS, files and filesystem calls, flock and stdio are implemented
+and tested. Known TLS limitations: read/write intent is approximated
 (TLS renegotiation wanting the opposite direction could stall — the
 `stream_socket_get_crypto_status()` API on 8.5+ would resolve it), the `ssl://`
 handshake still runs synchronously, and `stream_socket_enable_crypto()` on an
 already-open socket is not yet re-wrapped.
 
-Linux only for now (uses `poll(2)`, `fcntl`, and POSIX threads).
+Linux only for now (uses epoll, eventfd, `poll(2)`, `fcntl`, and POSIX threads).
 
 ## License
 

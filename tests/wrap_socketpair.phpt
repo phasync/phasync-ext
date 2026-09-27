@@ -9,25 +9,17 @@ if (!function_exists('stream_socket_pair')) die('skip requires stream_socket_pai
 ?>
 --FILE--
 <?php
-final class TestTimeout extends Exception {}
+require __DIR__ . '/loop.inc';
+$loop = new Loop;
 [$a, $b] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
-
-\phasync\ext\manage(function () use ($a, $b) {
-    // Functional proof: a blocking fread on the empty pair suspends the fiber,
-    // then resumes with the data once the other end is written.
-    $reader = new Fiber(function () use ($a) {
-        echo "read: " . fread($a, 100) . "\n";   // no data yet -> suspends
-    });
-    $sig = $reader->start();
-    var_dump($sig === $a);                 // bool(true): suspended waiting on $a itself
-    fwrite($b, 'ping');                     // make $a readable
-    $r = [$sig]; $w = $e = null;
-    \phasync\ext\stream_select($r, $w, $e, 2);
-    $reader->resume();
-}, fn($res) => Fiber::suspend($res), fn($res) => Fiber::suspend($res), fn($us) => Fiber::suspend($us), TestTimeout::class);
-
+// A blocking fread on the empty pair parks the coroutine until the other end is written.
+$loop->runAll(
+    function () use ($a) { echo "read: " . fread($a, 100) . "\n"; },
+    function () use ($b) { usleep(50000); fwrite($b, 'ping'); },
+);
+var_dump($loop->parks > 0);
 fclose($a); fclose($b);
 ?>
 --EXPECT--
-bool(true)
 read: ping
+bool(true)

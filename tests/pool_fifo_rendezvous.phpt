@@ -1,5 +1,5 @@
 --TEST--
-FIFO open() rendezvous across two fibers via the dedicated-thread pool (resource handlers)
+FIFO open() rendezvous across two coroutines via dedicated threads
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -12,55 +12,32 @@ if (!function_exists('posix_mkfifo')) {
 ?>
 --FILE--
 <?php
-final class TestTimeout extends Exception {}
+require __DIR__ . '/loop.inc';
 $fifo = sys_get_temp_dir() . '/phasync_fifo_' . getmypid();
 @unlink($fifo);
 if (function_exists('posix_mkfifo')) { posix_mkfifo($fifo, 0600); }
 else { exec('mkfifo ' . escapeshellarg($fifo)); }
 
-$result = new stdClass();
-$result->data = null;
-
-\phasync\ext\manage(function () use ($fifo, $result) {
-    $reader = new Fiber(function () use ($fifo, $result) {
-        $fh = fopen($fifo, 'r');           // blocks until a writer opens -> own thread
-        $result->data = fread($fh, 100);
+// Each open() blocks until the other end opens: on its own thread, so both
+// coroutines can reach the rendezvous.
+$data = null;
+$loop = new Loop;
+$loop->runAll(
+    function () use ($fifo, &$data) {
+        $fh = fopen($fifo, 'r');
+        $data = fread($fh, 100);
         fclose($fh);
-    });
-    $writer = new Fiber(function () use ($fifo) {
-        $fh = fopen($fifo, 'w');           // blocks until a reader opens -> own thread
+    },
+    function () use ($fifo) {
+        $fh = fopen($fifo, 'w');
         fwrite($fh, "ping");
         fclose($fh);
-    });
-
-    // Each fiber parks by suspending a resource; drive them together with one
-    // stream_select over all pending resources, until both finish.
-    $pending = [];                          // resource-id => [Fiber, resource]
-    foreach ([$reader, $writer] as $f) {
-        $res = $f->start();
-        if (!$f->isTerminated()) { $pending[(int)$res] = [$f, $res]; }
-    }
-    while ($pending) {
-        $r = array_map(fn($p) => $p[1], $pending); $w = $e = null;
-        \phasync\ext\stream_select($r, $w, $e, 5);
-        if (!$r) { echo "timeout\n"; break; }
-        foreach ($r as $res) {
-            [$f] = $pending[(int)$res];
-            unset($pending[(int)$res]);
-            $nres = $f->resume();
-            if (!$f->isTerminated()) { $pending[(int)$nres] = [$f, $nres]; }
-        }
-    }
-},
-fn($res) => Fiber::suspend($res),
-fn($res) => Fiber::suspend($res),
-fn($us) => Fiber::suspend($us),
-TestTimeout::class);
-
+    },
+);
 @unlink($fifo);
-echo "got: {$result->data}\n";
-echo "done\n";
+echo "got: $data\n";
+var_dump($loop->parks >= 2);
 ?>
 --EXPECT--
 got: ping
-done
+bool(true)

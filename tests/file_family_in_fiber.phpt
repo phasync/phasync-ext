@@ -8,13 +8,8 @@ if (!class_exists('Fiber')) die('skip requires Fibers');
 ?>
 --FILE--
 <?php
-final class TestTimeout extends Exception {}
-$pooled = 0;
-$wait = function ($s, $t) use (&$pooled) {
-    $pooled++;
-    $r = [$s]; $w = $e = null;
-    \phasync\ext\stream_select($r, $w, $e, 5);
-};
+require __DIR__ . '/loop.inc';
+$loop = new Loop;
 $dir = sys_get_temp_dir() . '/phasync_ff_' . bin2hex(random_bytes(4));
 mkdir($dir);
 $data = str_repeat("line of text\n", 50000);   // 650 KB
@@ -23,12 +18,12 @@ file_put_contents("$dir/src", $data);
 // Native first, then the same inside a scope, in a fiber: identical results, and
 // the handler (the pool's completion wait) was called.
 function check(string $name, Closure $f): void {
-    global $wait, $pooled;
+    global $loop;
     ob_start(); $native = [$f(), ob_get_clean()];
-    $before = $pooled; $ext = null;
+    $before = $loop->parks; $ext = null;
     $code = function () use ($f, &$ext) { ob_start(); $ext = [$f(), ob_get_clean()]; };
-    (new Fiber(fn() => \phasync\ext\manage($code, $wait, $wait, fn($us) => null, TestTimeout::class)))->start();
-    printf("%-24s %s %s\n", $name, $native === $ext ? 'same' : 'DIFF', $pooled > $before ? 'pooled' : 'NOT POOLED');
+    $loop->runAll($code);
+    printf("%-24s %s %s\n", $name, $native === $ext ? 'same' : 'DIFF', $loop->parks > $before ? 'pooled' : 'NOT POOLED');
 }
 
 check('file_get_contents',       fn() => md5(file_get_contents("$dir/src")));
@@ -52,18 +47,18 @@ check('stream_copy_to_stream',   function () use ($dir) { $a = fopen("$dir/src",
 file_put_contents("$dir/inc.php", '<?php return 42;');
 file_put_contents("$dir/Cls.php", '<?php class Cls { const V = 7; }');
 spl_autoload_register(function ($c) use ($dir) { require "$dir/$c.php"; });
-$before = $pooled; $res = null;
+$before = $loop->parks; $res = null;
 $code = function () use ($dir, &$res) {
     ob_start(); highlight_file("$dir/inc.php"); $hl = ob_get_clean() !== '';   // compiles (tokenizes) too
     $res = [include "$dir/inc.php", require "$dir/inc.php", Cls::V, $hl];
 };
-(new Fiber(fn() => \phasync\ext\manage($code, $wait, $wait, fn($us) => null, TestTimeout::class)))->start();
-var_dump($res, $pooled === $before);
+$loop->runAll($code);
+var_dump($res, $loop->parks === $before);
 
 // Outside a fiber: native, not pooled.
-$before = $pooled;
-\phasync\ext\manage(fn() => file_get_contents("$dir/src"), $wait, $wait, fn($us) => null, TestTimeout::class);
-var_dump($pooled === $before);
+$before = $loop->parks;
+$loop->manage(fn() => file_get_contents("$dir/src"));
+var_dump($loop->parks === $before);
 
 foreach (scandir($dir) as $e) if ($e[0] !== '.') unlink("$dir/$e");
 rmdir($dir);

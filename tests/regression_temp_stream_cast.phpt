@@ -12,8 +12,8 @@ if (!class_exists('Fiber')) die('skip requires Fibers');
 // written inside the cast; the file must stay a plain stdio stream (php://temp
 // checks php_stream_is(STDIO) on it) or the next cast crashed. Reported with
 // phasync::io(), whose driver passes such streams to phasync\ext\stream_select().
-final class TestTimeout extends Exception {}
-$wait = function ($s, $t) { $r = [$s]; $w = $e = null; \phasync\ext\stream_select($r, $w, $e, 5); };
+require __DIR__ . '/loop.inc';
+$loop = new Loop;
 $code = function () {
     $t = fopen('php://temp', 'w+');
     fwrite($t, 'hello');
@@ -36,7 +36,7 @@ $code = function () {
     rewind($big);
     echo 'spilled: ', strlen(stream_get_contents($big)), "\n";
 };
-(new Fiber(fn() => \phasync\ext\manage($code, $wait, $wait, fn($us) => null, TestTimeout::class)))->start();
+$loop->runAll($code);
 ?>
 --EXPECT--
 ext select: 2

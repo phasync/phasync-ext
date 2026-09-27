@@ -6,10 +6,10 @@ phasync
 <?php if (!class_exists('Fiber')) die('skip requires Fibers'); ?>
 --FILE--
 <?php
-final class TestTimeout extends Exception {}
-$got = [];
-$record = function (int $us) use (&$got) { $got[] = $us; };
-(new Fiber(fn() => \phasync\ext\manage(function () {
+require __DIR__ . '/loop.inc';
+$loop = new Loop;
+$loop->instantSleep = true;
+$loop->runAll(function () {
     sleep(2);
     sleep(PHP_INT_MAX);                                 // seconds -> µs used to overflow
     time_nanosleep(PHP_INT_MAX, 999999999);
@@ -19,9 +19,8 @@ $record = function (int $us) use (&$got) { $got[] = $us; };
     } catch (ValueError $e) {
         echo get_class($e), ': ', $e->getMessage(), "\n";
     }
-}, fn($s, $t) => null, fn($s, $t) => null,
-   $record, TestTimeout::class)))->start();
-
+});
+$got = $loop->sleepCalls;
 var_dump($got[0]);                                      // int(2000000)
 var_dump($got[1] === PHP_INT_MAX, $got[2] === PHP_INT_MAX, $got[3] === PHP_INT_MAX);
 ?>

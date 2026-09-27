@@ -1,5 +1,5 @@
 --TEST--
-stream_select() inside a scope suspends the fiber (others keep running) and keeps native results/timeouts
+stream_select() inside a scope parks the coroutine (others keep running) and keeps native results/timeouts
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -9,64 +9,34 @@ if (!function_exists('stream_socket_pair')) die('skip requires stream_socket_pai
 ?>
 --FILE--
 <?php
-final class TestTimeout extends Exception {}
-
-// Minimal scheduler: handlers suspend with what they wait on; the loop waits with
-// phasync\ext\stream_select() (not overridden) and resumes whoever is ready.
-function run(array $fibers): void {
-    $wait = [];
-    foreach ($fibers as $k => $f) $wait[$k] = $f->start();
-    while ($wait = array_filter($wait)) {
-        $r = $w = []; $e = null; $to = 1.0; $now = microtime(true);
-        foreach ($wait as $k => [$type, $x]) {
-            if ($type === 'r') $r[$k] = $x; elseif ($type === 'w') $w[$k] = $x; else $to = min($to, max(0, $x - $now));
-        }
-        if ($r || $w) \phasync\ext\stream_select($r, $w, $e, 0, (int) ($to * 1e6)); else usleep((int) ($to * 1e6));
-        $now = microtime(true);
-        foreach ($wait as $k => [$type, $x]) {
-            if (($type === 'r' && isset($r[$k])) || ($type === 'w' && isset($w[$k])) || ($type === 't' && $x <= $now)) {
-                $wait[$k] = $fibers[$k]->resume();
-            }
-        }
-    }
-}
-$h = [
-    fn($s, $t) => Fiber::suspend(['r', $s]),
-    fn($s, $t) => Fiber::suspend(['w', $s]),
-    fn($us) => Fiber::suspend(['t', microtime(true) + $us / 1e6]),
-];
-
+require __DIR__ . '/loop.inc';
 [$a, $b] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+
+// A's stream_select() parks it; B runs meanwhile and makes A's stream readable.
 $log = [];
-\phasync\ext\manage(function () use ($a, $b, &$log) {
-    run([
-        'A' => new Fiber(function () use ($a, &$log) {
-            $r = ['key' => $a]; $w = $e = null;
-            $n = stream_select($r, $w, $e, 5);        // nothing ready yet -> suspends
-            $log[] = "A: $n " . implode(',', array_keys($r));
-        }),
-        'B' => new Fiber(function () use ($b, &$log) {
-            usleep(100000);
-            $log[] = 'B: writes';
-            fwrite($b, 'x');                          // wakes A
-        }),
-    ]);
-}, ...[...$h, TestTimeout::class]);
+(new Loop)->runAll(
+    function () use ($a, &$log) {
+        $r = ['key' => $a]; $w = $e = null;
+        $n = stream_select($r, $w, $e, 5);        // nothing ready yet -> parks
+        $log[] = "A: $n " . implode(',', array_keys($r));
+    },
+    function () use ($b, &$log) {
+        usleep(100000);
+        $log[] = 'B: writes';
+        fwrite($b, 'x');                          // wakes A
+    },
+);
 echo implode("\n", $log), "\n";
 
-// Timeout: a handler that really waits (like phasync) and then signals timeout.
-$waitReal = function ($s, $t) {
-    $r = [$s]; $w = $e = null;
-    if (\phasync\ext\stream_select($r, $w, $e, 0, (int) ($t * 1e6)) < 1) throw new TestTimeout();
-};
+// Timeout: the loop times the wait out, and select returns 0 with every array emptied.
 fread($a, 1);
-(new Fiber(fn() => \phasync\ext\manage(function () use ($a) {
+(new Loop)->runAll(function () use ($a) {
     $r = [$a]; $w = []; $e = [$a];
     $t = microtime(true);
     var_dump(stream_select($r, $w, $e, 0, 200000), $r, $w, $e);
     $el = microtime(true) - $t;
     var_dump($el > 0.15 && $el < 1.0);
-}, $waitReal, $waitReal, fn($us) => null, TestTimeout::class)))->start();
+});
 ?>
 --EXPECT--
 B: writes

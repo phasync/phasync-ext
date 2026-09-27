@@ -15,20 +15,18 @@ if (!function_exists('stream_socket_pair')) die('skip requires stream_socket_pai
 // (stream->has_buffered_data), so fread() returns at once; 8.2 waited for the
 // timeout first. The wrapper must match either way — on 8.3+ waiting here would
 // hang a request/response protocol whose peer is waiting for our reply.
-final class TestTimeout extends Exception {}
-
+require __DIR__ . '/loop.inc';
 [$a, $b] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
 stream_set_timeout($a, 0, 300000);
 fwrite($b, "line1\nextra");
 
-$waited = false;
-(new Fiber(fn() => \phasync\ext\manage(function () use ($a, &$waited) {
+$loop = new Loop;
+$loop->runAll(function () use ($a, $loop) {
     var_dump(fgets($a));                                    // "line1\n"
     var_dump(fread($a, 100));                               // "extra"
-    var_dump($waited === (PHP_VERSION_ID < 80300));         // bool(true)
+    var_dump(($loop->parks > 0) === (PHP_VERSION_ID < 80300)); // bool(true)
     var_dump(stream_get_meta_data($a)['timed_out'] === (PHP_VERSION_ID < 80300)); // bool(true)
-}, function ($s, ?float $t) use (&$waited) { $waited = true; throw new TestTimeout(); },
-   fn($s, $t) => null, fn($us) => null, TestTimeout::class)))->start();
+});
 fclose($a); fclose($b);
 ?>
 --EXPECT--
