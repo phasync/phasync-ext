@@ -41,6 +41,7 @@ check('stream_get_contents',     function () use ($dir) { $fp = fopen("$dir/src"
 // These mmap() plain files natively; inside a scope they read via the pool.
 check('fpassthru',               function () use ($dir) { $fp = fopen("$dir/src", 'r'); $r = fpassthru($fp); fclose($fp); return $r; });
 check('stream_copy_to_stream',   function () use ($dir) { $a = fopen("$dir/src", 'r'); $b = fopen("$dir/cp2", 'w'); $r = stream_copy_to_stream($a, $b); fclose($a); fclose($b); return [$r, md5_file("$dir/cp2")]; });
+check('fsync/fdatasync',         function () use ($dir) { $fp = fopen("$dir/sync", 'w'); fwrite($fp, 'x'); $r = [fsync($fp), fdatasync($fp)]; fclose($fp); return $r; });
 
 // include/require (and an autoloader's require) read through stdio streams too,
 // but must never suspend mid-compile: not pooled, and they work.
@@ -78,6 +79,7 @@ SplFileObject            same pooled
 stream_get_contents      same pooled
 fpassthru                same pooled
 stream_copy_to_stream    same pooled
+fsync/fdatasync          same pooled
 array(4) {
   [0]=>
   int(42)

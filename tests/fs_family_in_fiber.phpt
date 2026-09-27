@@ -89,6 +89,18 @@ check('mkdir recursive file',   fn() => mkdir('f/x', 0777, true));
 check('rename',                 fn() => [file_exists('g'), rename('g', 'h'), file_exists('g'), file_get_contents('h')]);
 check('rename(missing)',        fn() => rename('missing', 'h'));
 check('rename dir over file',   fn() => rename('d', 'f'));
+check('touch new',              fn() => [touch('new'), file_exists('new')]);
+check('touch mtime',            fn() => [touch('f', 1000000000), filemtime('f')]);
+check('chmod',                  fn() => [chmod('f', 0600), decoct(fileperms('f') & 0777)]);
+check('chmod(missing)',         fn() => chmod('missing', 0600));
+check('chown self',             fn() => chown('f', fileowner('f')));
+check('chgrp self',             fn() => chgrp('f', filegroup('f')));
+check('lchown self',            fn() => lchown('l', fileowner('l')));
+check('symlink',                fn() => [symlink('f', 'l2'), readlink('l2')]);
+check('link',                   fn() => [link('f', 'h2'), stat('f')['nlink']]);
+check('link(existing)',         fn() => link('f', 'g'));
+check('tempnam',                fn() => dirname(tempnam(getcwd(), 'x')) === getcwd());
+check('disk_free_space',        fn() => disk_free_space('.') > 0 && disk_total_space('.') > 0);
 
 // Outside a fiber everything is native (and not pooled).
 $before = $loop->parks;
@@ -132,6 +144,18 @@ mkdir recursive file       same pooled
 rename                     same pooled
 rename(missing)            same pooled
 rename dir over file       same pooled
+touch new                  same pooled
+touch mtime                same pooled
+chmod                      same pooled
+chmod(missing)             same pooled
+chown self                 same pooled
+chgrp self                 same pooled
+lchown self                same pooled
+symlink                    same pooled
+link                       same pooled
+link(existing)             same pooled
+tempnam                    same pooled
+disk_free_space            same pooled
 bool(true)
 bool(true)
 bool(false)

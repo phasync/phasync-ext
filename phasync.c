@@ -73,7 +73,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.5.0-alpha3"
+#define PHP_PHASYNC_VERSION "0.5.0-alpha4"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -90,7 +90,9 @@ typedef enum {
 	PHASYNC_FS_RMDIR,
 	PHASYNC_FS_MKDIR,
 	PHASYNC_FS_MKDIR_P,
-	PHASYNC_FS_RENAME
+	PHASYNC_FS_RENAME,
+	PHASYNC_FS_FSYNC,       /* fsync(t->fd): fsync() on a file stream             */
+	PHASYNC_FS_FDATASYNC
 } phasync_fs_op;
 
 static const struct { const char *name; phasync_fs_op op; } phasync_fs_funcs[] = {
@@ -107,6 +109,11 @@ static const struct { const char *name; phasync_fs_op op; } phasync_fs_funcs[] =
 	{"file_get_contents", PHASYNC_FS_WARM}, {"file_put_contents", PHASYNC_FS_WARM},
 	{"file", PHASYNC_FS_WARM}, {"readfile", PHASYNC_FS_WARM}, {"copy", PHASYNC_FS_WARM},
 	{"md5_file", PHASYNC_FS_WARM}, {"sha1_file", PHASYNC_FS_WARM},
+	{"touch", PHASYNC_FS_WARM}, {"chmod", PHASYNC_FS_WARM}, {"chown", PHASYNC_FS_WARM},
+	{"chgrp", PHASYNC_FS_WARM}, {"lchown", PHASYNC_FS_WARM}, {"lchgrp", PHASYNC_FS_WARM},
+	{"link", PHASYNC_FS_WARM}, {"symlink", PHASYNC_FS_WARM}, {"tempnam", PHASYNC_FS_WARM},
+	{"disk_free_space", PHASYNC_FS_WARM}, {"diskfreespace", PHASYNC_FS_WARM},
+	{"disk_total_space", PHASYNC_FS_WARM},
 	{"unlink", PHASYNC_FS_UNLINK}, {"rmdir", PHASYNC_FS_RMDIR}, {"mkdir", PHASYNC_FS_MKDIR},
 	{"rename", PHASYNC_FS_RENAME},
 };
@@ -163,6 +170,8 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	phasync_scope *scope_top;     /* innermost active manage() scope, or NULL */
 	php_stream_transport_factory orig_tcp;
 	php_stream_transport_factory orig_unix;
+	php_stream_transport_factory orig_udp;
+	php_stream_transport_factory orig_udg;
 	php_stream_transport_factory orig_ssl;
 	void (*orig_proc_open)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_sleep)(INTERNAL_FUNCTION_PARAMETERS);
@@ -185,6 +194,8 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_passthru)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_shell_exec)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_proc_close)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_pcntl_waitpid)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_pcntl_wait)(INTERNAL_FUNCTION_PARAMETERS);
 	phasync_spawn *spawn;         /* armed by an exec-family call until its pipe is seen */
 	bool ub_writing;              /* a fiber is suspended inside an echo (CLI stdout) */
 	int no_suspend;               /* >0: pool ops run inline (phasync\ext\stream_select) */
@@ -1288,6 +1299,10 @@ static int phasync_fs_exec(phasync_task *t)
 			ZEND_FALLTHROUGH;
 		case PHASYNC_FS_MKDIR:
 			return mkdir(t->path, t->omode);
+		case PHASYNC_FS_FSYNC:
+			return fsync(t->fd);
+		case PHASYNC_FS_FDATASYNC:
+			return fdatasync(t->fd);
 	}
 	return -1;
 }
@@ -2163,6 +2178,30 @@ static int phasync_connect_cooperative(php_stream *stream, php_stream_xport_para
 
 /* Record the caller's intended blocking mode and pass it through, so the native
  * op (used outside a scope) sees the real intent while we still know it. */
+/* stream_socket_recvfrom()/sendto() go through the transport (recvfrom()/
+ * sendto() on the socket), not the read/write ops. Inside a scope, in a fiber,
+ * on a blocking stream: wait until the socket is ready, then let the original
+ * do the call in blocking mode, which then doesn't wait, so results and
+ * warnings stay native. PHP applies no timeout here, so neither does the wait.
+ * Out-of-band data goes straight to the original. */
+static int phasync_xport_io_cooperative(php_stream *stream, php_stream_xport_param *xp, int option, int value)
+{
+	phasync_hook_entry *e = phasync_entry_ensure(stream);
+	php_socket_t fd = phasync_stream_fd(stream);
+	int dir = xp->op == STREAM_XPORT_OP_RECV ? PHASYNC_READ : PHASYNC_WRITE;
+
+	if (e->want_block && fd != -1 && !(xp->inputs.flags & STREAM_OOB)) {
+		struct pollfd pfd = { fd, dir == PHASYNC_READ ? POLLIN : POLLOUT, 0 };
+		while (poll(&pfd, 1, 0) == 0) {
+			if (phasync_wait_fd(dir, stream, fd, INFINITY) != PHASYNC_WAIT_READY) {
+				return PHP_STREAM_OPTION_RETURN_ERR;   /* exception pending */
+			}
+		}
+		phasync_apply_mode(stream, fd, e, false, false);
+	}
+	return phasync_orig_set_option(stream, option, value, xp);
+}
+
 static int phasync_wrapped_set_option(php_stream *stream, int option, int value, void *ptrparam)
 {
 	if (option == PHP_STREAM_OPTION_BLOCKING) {
@@ -2180,6 +2219,12 @@ static int phasync_wrapped_set_option(php_stream *stream, int option, int value,
 	        && ((php_stream_xport_param *) ptrparam)->op == STREAM_XPORT_OP_ACCEPT
 	        && phasync_reading() && EG(active_fiber) != NULL) {
 		return phasync_accept_cooperative(stream, (php_stream_xport_param *) ptrparam);
+	} else if (option == PHP_STREAM_OPTION_XPORT_API && ptrparam
+	        && (((php_stream_xport_param *) ptrparam)->op == STREAM_XPORT_OP_RECV
+	         || ((php_stream_xport_param *) ptrparam)->op == STREAM_XPORT_OP_SEND)
+	        && stream->ops->read == phasync_wrapped_read
+	        && phasync_reading() && EG(active_fiber) != NULL) {
+		return phasync_xport_io_cooperative(stream, (php_stream_xport_param *) ptrparam, option, value);
 	} else if (option == PHP_STREAM_OPTION_XPORT_API && ptrparam
 	        && ((php_stream_xport_param *) ptrparam)->op == STREAM_XPORT_OP_CONNECT
 	        && stream->ops->read == phasync_wrapped_read       /* not tls://: crypto follows */
@@ -2296,6 +2341,28 @@ static php_stream *phasync_tcp_factory(const char *proto, size_t protolen,
 		php_stream_context *context STREAMS_DC)
 {
 	php_stream *s = PHASYNC_G(orig_tcp)(proto, protolen, resourcename, resourcenamelen,
+		persistent_id, options, flags, timeout, context STREAMS_CC);
+	phasync_wrap_stream(s, PHASYNC_MODE_RAW);
+	return s;
+}
+
+static php_stream *phasync_udp_factory(const char *proto, size_t protolen,
+		const char *resourcename, size_t resourcenamelen, const char *persistent_id,
+		int options, int flags, struct timeval *timeout,
+		php_stream_context *context STREAMS_DC)
+{
+	php_stream *s = PHASYNC_G(orig_udp)(proto, protolen, resourcename, resourcenamelen,
+		persistent_id, options, flags, timeout, context STREAMS_CC);
+	phasync_wrap_stream(s, PHASYNC_MODE_RAW);
+	return s;
+}
+
+static php_stream *phasync_udg_factory(const char *proto, size_t protolen,
+		const char *resourcename, size_t resourcenamelen, const char *persistent_id,
+		int options, int flags, struct timeval *timeout,
+		php_stream_context *context STREAMS_DC)
+{
+	php_stream *s = PHASYNC_G(orig_udg)(proto, protolen, resourcename, resourcenamelen,
 		persistent_id, options, flags, timeout, context STREAMS_CC);
 	phasync_wrap_stream(s, PHASYNC_MODE_RAW);
 	return s;
@@ -3130,8 +3197,35 @@ static php_socket_t phasync_stdio_poolable(php_stream *stream)
 	return fd;
 }
 
+/* The leading fields of plain_wrapper.c's php_stdio_stream_data, the same from
+ * PHP 8.2 to master. */
+typedef struct {
+	FILE *file;
+	int   fd;
+} phasync_stdio_head;
+
 static int phasync_stdio_set_option(php_stream *stream, int option, int value, void *ptrparam)
 {
+	/* fsync()/fdatasync() wait for the disk: inside a scope, in a fiber, on the
+	 * pool. A stream with a C FILE* (its own buffer, to flush first on PHP's
+	 * thread) stays native; plain file streams write straight to the fd. */
+	if (option == PHP_STREAM_OPTION_SYNC_API
+	 && (value == PHP_STREAM_SYNC_FSYNC || value == PHP_STREAM_SYNC_FDSYNC)
+	 && phasync_reading() && EG(active_fiber) != NULL
+	 && ((phasync_stdio_head *) stream->abstract)->file == NULL
+	 && ((phasync_stdio_head *) stream->abstract)->fd >= 0) {
+		phasync_task t;
+		memset(&t, 0, sizeof(t));
+		t.type = PHASYNC_OP_FS;
+		t.fsop = value == PHP_STREAM_SYNC_FSYNC ? PHASYNC_FS_FSYNC : PHASYNC_FS_FDATASYNC;
+		t.fd = ((phasync_stdio_head *) stream->abstract)->fd;
+		phasync_pool_run(&t);
+		if (EG(exception)) {
+			return PHP_STREAM_OPTION_RETURN_ERR;
+		}
+		errno = t.err;
+		return t.result == 0 ? PHP_STREAM_OPTION_RETURN_OK : PHP_STREAM_OPTION_RETURN_ERR;
+	}
 	/* flock() (and LOCK_EX in file_put_contents(), SplFileObject::flock()) blocks
 	 * in flock(2) until the lock is free, with no descriptor to wait on. Inside a
 	 * scope, in a fiber, try without blocking and sleep through the sleep handler
@@ -3288,6 +3382,85 @@ static ZEND_NAMED_FUNCTION(phasync_proc_close_override)
 		}
 	}
 	PHASYNC_G(orig_proc_close)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+/* pcntl_waitpid()/pcntl_wait() block until a child changes state. Inside a
+ * scope, in a fiber, for an exit (no WNOHANG/WUNTRACED/WCONTINUED): a given pid
+ * that is still an unreaped child of ours is waited for on a pidfd, readable
+ * once it exits; any child or a process group (pid <= 0) has no pidfd, so it is
+ * checked without reaping (waitid(WNOWAIT)) and slept on between checks (1ms,
+ * doubling to 20ms). Then the original reaps at once, with the native status
+ * and resource usage. */
+static void phasync_waitpid_common(INTERNAL_FUNCTION_PARAMETERS, zend_long pid, zend_long flags,
+                                   void (*orig)(INTERNAL_FUNCTION_PARAMETERS))
+{
+	siginfo_t si;
+	int pidfd;
+
+	if (!phasync_reading() || EG(active_fiber) == NULL
+	 || (flags & (WNOHANG | WUNTRACED
+#ifdef WCONTINUED
+	              | WCONTINUED
+#endif
+	 ))) {
+		orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	if (pid > 0) {
+		if ((pidfd = (int) syscall(SYS_pidfd_open, (pid_t) pid, 0)) >= 0) {
+			int w = PHASYNC_WAIT_READY;
+			memset(&si, 0, sizeof(si));
+			if (waitid(P_PID, (id_t) pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid == 0) {
+				w = phasync_wait_fd(PHASYNC_READ, NULL, pidfd, INFINITY);   /* not exited yet */
+			}
+			close(pidfd);
+			if (w != PHASYNC_WAIT_READY) {
+				return;                      /* exception pending */
+			}
+		}
+	} else {
+		idtype_t type = pid == -1 ? P_ALL : P_PGID;
+		id_t id = pid == -1 ? 0 : pid == 0 ? (id_t) getpgrp() : (id_t) -pid;
+		zend_long usec = 1000;
+		for (;;) {
+			memset(&si, 0, sizeof(si));
+			if (waitid(type, id, &si, WEXITED | WNOHANG | WNOWAIT) != 0 || si.si_pid != 0) {
+				break;                       /* one exited, or none to wait for (ECHILD) */
+			}
+			if (phasync_call_sleep(phasync_sleep_handler(), usec) < 0) {
+				return;                      /* exception pending */
+			}
+			usec = MIN(usec * 2, 20000);
+		}
+	}
+	orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+static ZEND_NAMED_FUNCTION(phasync_pcntl_waitpid_override)
+{
+	uint32_t argc = ZEND_NUM_ARGS();
+	zval *zpid = argc >= 1 ? ZEND_CALL_ARG(execute_data, 1) : NULL;
+	zval *zflags = argc >= 3 ? ZEND_CALL_ARG(execute_data, 3) : NULL;
+
+	if (!zpid || Z_TYPE_P(zpid) != IS_LONG || (zflags && Z_TYPE_P(zflags) != IS_LONG)) {
+		PHASYNC_G(orig_pcntl_waitpid)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	phasync_waitpid_common(INTERNAL_FUNCTION_PARAM_PASSTHRU, Z_LVAL_P(zpid), zflags ? Z_LVAL_P(zflags) : 0,
+		PHASYNC_G(orig_pcntl_waitpid));
+}
+
+static ZEND_NAMED_FUNCTION(phasync_pcntl_wait_override)
+{
+	uint32_t argc = ZEND_NUM_ARGS();
+	zval *zflags = argc >= 2 ? ZEND_CALL_ARG(execute_data, 2) : NULL;
+
+	if (zflags && Z_TYPE_P(zflags) != IS_LONG) {
+		PHASYNC_G(orig_pcntl_wait)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	phasync_waitpid_common(INTERNAL_FUNCTION_PARAM_PASSTHRU, -1, zflags ? Z_LVAL_P(zflags) : 0,
+		PHASYNC_G(orig_pcntl_wait));
 }
 
 /* ---- filesystem functions --------------------------------------------------
@@ -3881,6 +4054,10 @@ static void phasync_install_hooks(void)
 	PHASYNC_G(orig_unix) = zend_hash_str_find_ptr(xhash, "unix", sizeof("unix") - 1);
 	if (PHASYNC_G(orig_tcp))  php_stream_xport_register("tcp", phasync_tcp_factory);
 	if (PHASYNC_G(orig_unix)) php_stream_xport_register("unix", phasync_unix_factory);
+	PHASYNC_G(orig_udp) = zend_hash_str_find_ptr(xhash, "udp", sizeof("udp") - 1);
+	PHASYNC_G(orig_udg) = zend_hash_str_find_ptr(xhash, "udg", sizeof("udg") - 1);
+	if (PHASYNC_G(orig_udp)) php_stream_xport_register("udp", phasync_udp_factory);
+	if (PHASYNC_G(orig_udg)) php_stream_xport_register("udg", phasync_udg_factory);
 
 	PHASYNC_G(orig_ssl) = zend_hash_str_find_ptr(xhash, "ssl", sizeof("ssl") - 1);
 	if (PHASYNC_G(orig_ssl)) {
@@ -3923,6 +4100,14 @@ static void phasync_install_hooks(void)
 	if ((f = phasync_find_ifunc("proc_close", sizeof("proc_close") - 1))) {
 		PHASYNC_G(orig_proc_close) = f->handler;
 		f->handler = phasync_proc_close_override;
+	}
+	if ((f = phasync_find_ifunc("pcntl_waitpid", sizeof("pcntl_waitpid") - 1))) {
+		PHASYNC_G(orig_pcntl_waitpid) = f->handler;
+		f->handler = phasync_pcntl_waitpid_override;
+	}
+	if ((f = phasync_find_ifunc("pcntl_wait", sizeof("pcntl_wait") - 1))) {
+		PHASYNC_G(orig_pcntl_wait) = f->handler;
+		f->handler = phasync_pcntl_wait_override;
 	}
 	for (zend_long i = 0; i < (zend_long) PHASYNC_FS_NFUNCS; i++) {
 		if ((f = phasync_find_ifunc(phasync_fs_funcs[i].name, strlen(phasync_fs_funcs[i].name)))) {
@@ -4004,6 +4189,8 @@ static void phasync_restore_hooks(void)
 	}
 	if (PHASYNC_G(orig_tcp))  php_stream_xport_register("tcp", PHASYNC_G(orig_tcp));
 	if (PHASYNC_G(orig_unix)) php_stream_xport_register("unix", PHASYNC_G(orig_unix));
+	if (PHASYNC_G(orig_udp))  php_stream_xport_register("udp", PHASYNC_G(orig_udp));
+	if (PHASYNC_G(orig_udg))  php_stream_xport_register("udg", PHASYNC_G(orig_udg));
 	if (PHASYNC_G(orig_ssl)) {
 		HashTable *xh = php_stream_xport_get_hash();
 		const char **scheme;
@@ -4037,6 +4224,12 @@ static void phasync_restore_hooks(void)
 	}
 	if (PHASYNC_G(orig_proc_close) && (f = phasync_find_ifunc("proc_close", sizeof("proc_close") - 1))) {
 		f->handler = PHASYNC_G(orig_proc_close);
+	}
+	if (PHASYNC_G(orig_pcntl_waitpid) && (f = phasync_find_ifunc("pcntl_waitpid", sizeof("pcntl_waitpid") - 1))) {
+		f->handler = PHASYNC_G(orig_pcntl_waitpid);
+	}
+	if (PHASYNC_G(orig_pcntl_wait) && (f = phasync_find_ifunc("pcntl_wait", sizeof("pcntl_wait") - 1))) {
+		f->handler = PHASYNC_G(orig_pcntl_wait);
 	}
 	for (size_t i = 0; i < PHASYNC_FS_NFUNCS; i++) {
 		if (PHASYNC_G(orig_fs)[i] && (f = phasync_find_ifunc(phasync_fs_funcs[i].name, strlen(phasync_fs_funcs[i].name)))) {

@@ -12,13 +12,14 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
 2. **Transparent async I/O via `phasync\ext\manage()`** — run a closure with
    blocking I/O cooperatively yielding the current fiber instead of blocking the
    process, for the dynamic extent of that closure. It covers:
-   - `tcp://` / `unix://` sockets (incl. `fsockopen`, `stream_socket_client/server`),
-     including `tcp://` connect + its DNS lookup, and `stream_socket_accept()`
+   - `tcp://` / `unix://` / `udp://` / `udg://` sockets (incl. `fsockopen`,
+     `stream_socket_client/server`), including `tcp://` connect + its DNS lookup,
+     `stream_socket_accept()`, and `stream_socket_recvfrom()`/`sendto()`
    - `ssl://` / `tls://` sockets
    - `stream_select()` and `socket_select()`
    - `proc_open()` pipes and `proc_close()`; `popen()`/`pclose()`, `shell_exec()`
      (and backticks), `exec()`, `system()`, `passthru()` — both the output pipe
-     and the wait for the child to exit
+     and the wait for the child to exit; `pcntl_waitpid()`/`pcntl_wait()`
    - `STDIN`/`STDOUT`/`STDERR` and `php://stdin|stdout|stderr` reads and writes
      on pipes, sockets and ttys; in the CLI also `echo`/`print` to a stdout that
      would block (each echo stays contiguous, as natively)
@@ -32,13 +33,15 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
    - regular-file reads and writes, via a thread pool: `fopen()`'d files (and FIFO
      open), `file_get_contents()`, `file_put_contents()`, `file()`, `readfile()`,
      `fpassthru()`, `copy()`, `stream_copy_to_stream()`, `md5_file()`/`sha1_file()`/
-     `hash_file()`, `SplFileObject` — never `include`/`require`, which must not
-     suspend mid-compile
+     `hash_file()`, `SplFileObject`, `fsync()`/`fdatasync()` — never
+     `include`/`require`, which must not suspend mid-compile
    - filesystem metadata and namespace calls on network/FUSE mounts: `stat()`,
      `lstat()`, `file_exists()`, `is_file()`/`is_dir()`/`is_link()`/`is_readable()`/
      `is_writable()`/`is_executable()`, `filesize()`/`filemtime()` & co.,
      `realpath()`, `readlink()`, `linkinfo()`, `scandir()`, `glob()`,
-     `opendir()`/`dir()`, `unlink()`, `rename()`, `mkdir()`, `rmdir()`
+     `opendir()`/`dir()`, `unlink()`, `rename()`, `mkdir()`, `rmdir()`, `touch()`,
+     `chmod()`/`chown()`/`chgrp()` & `l*` variants, `link()`, `symlink()`,
+     `tempnam()`, `disk_free_space()`/`disk_total_space()`
      (via a thread pool; see below)
 
    The extension performs the real I/O; on a would-block it parks the coroutine
