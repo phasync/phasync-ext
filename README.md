@@ -3,7 +3,7 @@
 [![CI](https://github.com/phasync/phasync-ext/actions/workflows/ci.yml/badge.svg)](https://github.com/phasync/phasync-ext/actions/workflows/ci.yml)
 
 A PHP extension that gives [phasync](https://github.com/phasync/phasync) — and any
-fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
+fiber-based async code — three things on **PHP 8.2+**, without patching PHP:
 
 1. **`phasync\ext\stream_select()`** — a drop-in `stream_select()` that uses
    `poll(2)` internally, so it is **not bounded by `FD_SETSIZE`** (the ~1024
@@ -46,6 +46,11 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
    `Fiber::suspend()` into a scheduler). The C side never touches the Fiber API —
    your callback owns all suspension. This works because PHP fibers are stackful,
    so a suspend from inside `fread()`/`SSL_read()` unwinds and resumes correctly.
+
+3. **`phasync\ext\tcp_server()`** — a TCP server multiplexed into a single
+   stream: the extension accepts connections and reads/writes the client sockets
+   (epoll), and PHP sees connects, data and disconnects as frames on that stream.
+   One select and one read cover any number of connections. See below.
 
 ## Why
 
@@ -223,6 +228,68 @@ coroutine rendezvous concurrently. After the open, a FIFO honours `O_NONBLOCK`, 
 its reads/writes use the ordinary readiness path. If phasync times out or cancels
 the coroutine, the extension `pthread_cancel`s the thread stuck in `open()`
 (cancellation is scoped to that one syscall) and reaps it, so nothing leaks.
+
+## `phasync\ext\tcp_server()`
+
+```php
+$fp = phasync\ext\tcp_server('0.0.0.0', 8080, ['nodelay' => true]);
+stream_set_blocking($fp, false);
+```
+
+Everything goes through `$fp`: select on it, read frames from it, write frames to
+it, `fclose()` it to close the server and every connection. Each frame is a 9-byte
+header, `type:u8 id:u32 len:u32` little-endian (`unpack('Ctype/Vid/Vlen', $buf,
+$offset)`), then `len` bytes of payload.
+
+| Direction | Type | Payload | Meaning |
+|---|---|---|---|
+| server → PHP | `C` | `"peer local"` (as `stream_socket_get_name()`) | New connection |
+| | `D` | bytes (≤ `read_chunk`) | Data from the client |
+| | `E` | — | The client finished sending; we can still write |
+| | `W` | — | Output buffered past `high_water` has drained |
+| | `X` | errno `u32` (0 = clean) | The connection is gone; always its last frame |
+| PHP → server | `D` | bytes | Send data |
+| | `E` | — | Shut down our sending side |
+| | `X` | — | Flush, then close; answered by an `X` frame |
+| | `P` / `R` | — | Pause / resume reading this connection |
+
+```php
+while (true) {
+    phasync::readable($fp);                 // or stream_select() on [$fp]
+    $buf = fread($fp, 65536);               // whole frames only
+    for ($o = 0; $o < strlen($buf); $o += 9 + $h['len']) {
+        $h = unpack('atype/Vid/Vlen', $buf, $o);
+        $payload = substr($buf, $o + 9, $h['len']);
+        switch ($h['type']) {
+            case 'C': $peers[$h['id']] = explode(' ', $payload)[0]; break;
+            case 'D': fwrite($fp, 'D' . pack('VV', $h['id'], strlen($payload)) . $payload); break;  // echo
+            case 'E': fwrite($fp, 'X' . pack('VV', $h['id'], 0)); break;                           // close
+            case 'X': unset($peers[$h['id']]); break;
+        }
+    }
+}
+```
+
+- **No thread.** `$fp` is backed by an epoll fd: selectable whenever the listener
+  or a client has an event. `fread()` collects those events without blocking;
+  `fwrite()` parses the frames and writes to the sockets, buffering what a client
+  can't take yet. An eventfd keeps `$fp` readable while frames are queued.
+- **Whole frames.** A read returns only complete frames, unless a single frame is
+  bigger than the read length (then it comes in parts). Frames may be written in
+  any pieces.
+- **Backpressure.** Clients are only read while PHP reads `$fp`. Writes always
+  take the whole buffer; a connection whose buffered output passes `high_water`
+  gets a `W` frame once it has drained.
+- **Lifecycle.** Connection ids are never reused, and every connection ends with
+  exactly one `X`. When both sides have finished sending (`E` both ways) the
+  connection closes by itself. Frames for a connection that is gone are dropped;
+  an unknown frame type makes `fwrite()` warn and return false.
+- **Blocking mode** (the default): a read with nothing to return waits, inside
+  `manage()` in a fiber through the read handler. `stream_socket_get_name($fp)`
+  gives the listening address (useful with port 0).
+- **Options:** `backlog` (4096, capped by the kernel), `reuseport` (false),
+  `nodelay` (false), `max_connections` (0 = no limit; accepting pauses at the
+  limit), `read_chunk` (16384), `high_water` (1048576).
 
 ## Status
 
