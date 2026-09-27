@@ -3,18 +3,21 @@
  * phasync\ext\stream_select() — growable, poll(2)-based, no FD_SETSIZE limit.
  *         Accepts stream resources and plain integer file descriptors.
  *
- * phasync\ext\manage($task, $getSlot, $park, $unpark, $sleep, $timeoutException)
- *         — run $task with transparent async I/O active for its dynamic extent.
+ * phasync\ext\Poller — waiting for streams for an event loop, on epoll: a
+ *         coroutine parks in a slot of the loop (getSlot/park/unpark), and the
+ *         Poller's poll() — the loop's one blocking call — unparks it.
+ *
+ * phasync\ext\manage($task, $poller, $sleep, $timeoutException) — run $task
+ *         with transparent async I/O active for its dynamic extent.
  *         The tcp/unix/ssl transports are re-registered, and the process, sleep,
  *         DNS, file and filesystem functions, stream_select()/socket_select() and
  *         friends overridden at request start; every descriptor-backed stream is
  *         wrapped as it is created (plus STDIN/STDOUT/STDERR and any fds inherited
  *         before load). The wrappers are inert outside a scope: a wrapped stream
  *         then behaves exactly like an unwrapped one. Inside a scope, in a fiber,
- *         a would-block parks the coroutine in a fresh slot of the scope's event
- *         loop, and phasync\ext\poll() — the loop's one blocking call, on epoll —
- *         unparks it when it may continue: descriptors through one-shot epoll
- *         registrations, thread-pool tasks through a queue and an eventfd. The
+ *         a would-block parks the coroutine through the scope's Poller, whose
+ *         poll() unparks it when it may continue: descriptors through one-shot
+ *         epoll registrations, thread-pool tasks through a queue and an eventfd. The
  *         native timeout of the call goes to park(); park() throwing
  *         $timeoutException after it ran out finishes the op the way native PHP
  *         does on a timeout, any other exception propagates. The C side never
@@ -70,7 +73,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.5.0-alpha1"
+#define PHP_PHASYNC_VERSION "0.5.0-alpha2"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -146,10 +149,11 @@ typedef enum {
 /* One active phasync\manage() scope. Frames live on the C stack of the manage()
  * call and link to the enclosing scope, so nesting is plain LIFO and unwinds
  * automatically. The three handlers are owned copies of the closures. */
+struct phasync_poller;
+
 typedef struct phasync_scope {
-	zval get_slot;                  /* getSlot(): int                               */
-	zval park;                      /* park(int $slot, float $timeout): void        */
-	zval unpark;                    /* unpark(int $slot): bool                      */
+	zval poller_zv;                 /* the loop's phasync\ext\Poller (a reference)  */
+	struct phasync_poller *poller;
 	zval sleep;                     /* sleep(int $microseconds): void               */
 	zend_class_entry *timeout_ce;   /* park() throwing this = the wait's time ran out */
 	struct phasync_scope *prev;
@@ -337,12 +341,12 @@ static double phasync_now(void)
 	return (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
 }
 
-/* ---- waiting: slots, epoll, poll() -----------------------------------------
+/* ---- waiting: phasync\ext\Poller -------------------------------------------
  *
- * A coroutine waits by parking in a slot of the event loop (getSlot(), park(),
- * unpark(), from manage()); the extension resumes it by unparking the slot, and
- * only ever on PHP's thread, inside poll(). Every wait takes a fresh slot, so a
- * late wake-up can only find a vacant slot (unpark() returns false).
+ * A Poller belongs to an event loop, which gives it its getSlot(), park() and
+ * unpark(). A coroutine waits by parking in a fresh slot; the Poller resumes it
+ * by unparking the slot, and only ever on PHP's thread, inside its poll(). A late
+ * wake-up can only find a vacant slot (unpark() returns false).
  *
  * Waiting for a descriptor arms a one-shot epoll registration (EPOLLONESHOT):
  * a level-triggered one with nobody waiting would make every epoll_wait()
@@ -350,9 +354,22 @@ static double phasync_now(void)
  * long as its stream, which is deregistered in its close op (epoll keeps a
  * registration while any duplicate of the descriptor lives, so close() alone is
  * not enough); streams without a close hook, and bare descriptors, get a
- * registration for the one wait only. Threads never call PHP: they queue the
- * slot to wake and write to an eventfd in the epoll set, and poll() drains the
- * queue. */
+ * registration for the one wait only.
+ *
+ * The thread tasks of the hooked operations under a manage() given this Poller
+ * report to its completion channel: they queue the slot to wake and write to an
+ * eventfd in the epoll set, never calling PHP; poll() drains the queue. The
+ * channel is reference counted, so a task still running when its Poller is freed
+ * finds a live channel. */
+
+typedef struct {
+	pthread_mutex_t mutex;
+	pthread_cond_t  cond;     /* a finished task (see phasync_task_wait())       */
+	zend_long      *queue;    /* slots of finished tasks, for poll()            */
+	size_t          len, cap;
+	int             evfd;
+	int             refs;     /* the Poller + each running task; under mutex    */
+} phasync_chan;
 
 typedef struct {
 	php_socket_t fd;
@@ -362,115 +379,103 @@ typedef struct {
 	bool         transient;   /* for the current wait only                       */
 } phasync_reg;
 
+typedef struct phasync_poller {
+	int           epfd;
+	pid_t         pid;        /* epoll and eventfd are shared with a fork()ed child */
+	phasync_chan *chan;
+	HashTable     regs;       /* fd -> phasync_reg*                              */
+	zval          get_slot, park, unpark;
+	struct phasync_poller *next;   /* the live Pollers (for the close hooks)     */
+	zend_object   std;
+} phasync_poller;
+
 #define PHASYNC_EP_COMPLETIONS UINT64_MAX
 
-static int   phasync_epfd = -1;          /* per process (see phasync_ep_ensure) */
-static pid_t phasync_ep_pid;
-static int   phasync_evfd = -1;          /* threads' completion signal          */
-static pid_t phasync_evfd_pid;
-static HashTable phasync_regs;           /* fd -> phasync_reg*                  */
-static bool  phasync_regs_ready;
+static zend_class_entry *phasync_poller_ce;
+static zend_object_handlers phasync_poller_handlers;
+static phasync_poller *phasync_pollers;   /* live Pollers of this process */
 
-/* Slots of finished thread tasks, queued by the threads (under the mutex) and
- * drained by poll(). phasync_cq_cond wakes a coroutine that was cancelled while
- * its bounded task ran and has to wait for the task before it can go on. */
-static pthread_mutex_t phasync_cq_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  phasync_cq_cond  = PTHREAD_COND_INITIALIZER;
-static zend_long *phasync_cq;
-static size_t     phasync_cq_len, phasync_cq_cap;
+static zend_always_inline phasync_poller *phasync_poller_from(zend_object *obj)
+{
+	return (phasync_poller *) ((char *) obj - XtOffsetOf(phasync_poller, std));
+}
 
 static void phasync_reg_dtor(zval *zv)
 {
 	pefree(Z_PTR_P(zv), 1);
 }
 
+static void phasync_chan_release(phasync_chan *ch)
+{
+	int refs;
+
+	pthread_mutex_lock(&ch->mutex);
+	refs = --ch->refs;
+	pthread_mutex_unlock(&ch->mutex);
+	if (refs == 0) {
+		close(ch->evfd);
+		free(ch->queue);
+		pthread_mutex_destroy(&ch->mutex);
+		pthread_cond_destroy(&ch->cond);
+		free(ch);
+	}
+}
+
 /* Queue a slot for poll() to unpark, from any thread. */
-static void phasync_cq_push(zend_long slot)
+static void phasync_chan_push(phasync_chan *ch, zend_long slot)
 {
 	uint64_t one = 1;
 	ssize_t w;
 
-	pthread_mutex_lock(&phasync_cq_mutex);
-	if (phasync_cq_len == phasync_cq_cap) {
-		size_t cap = phasync_cq_cap ? phasync_cq_cap * 2 : 64;
-		zend_long *q = realloc(phasync_cq, cap * sizeof(*q));
+	pthread_mutex_lock(&ch->mutex);
+	if (ch->len == ch->cap) {
+		size_t cap = ch->cap ? ch->cap * 2 : 64;
+		zend_long *q = realloc(ch->queue, cap * sizeof(*q));
 		if (q) {
-			phasync_cq = q;
-			phasync_cq_cap = cap;
+			ch->queue = q;
+			ch->cap = cap;
 		}
 	}
-	if (phasync_cq_len < phasync_cq_cap) {
-		phasync_cq[phasync_cq_len++] = slot;
+	if (ch->len < ch->cap) {
+		ch->queue[ch->len++] = slot;
 	}
-	pthread_cond_broadcast(&phasync_cq_cond);
-	pthread_mutex_unlock(&phasync_cq_mutex);
-	do { w = write(phasync_evfd, &one, sizeof(one)); } while (w < 0 && errno == EINTR);
+	pthread_cond_broadcast(&ch->cond);
+	pthread_mutex_unlock(&ch->mutex);
+	do { w = write(ch->evfd, &one, sizeof(one)); } while (w < 0 && errno == EINTR);
 }
 
-/* The epoll set, created on first use. epoll and eventfd instances are shared
- * with a fork()ed child, where using them would steal the parent's events: a
- * child makes its own (its copies of the parent's close without touching them). */
-static bool phasync_ep_ensure(void)
+/* Throw unless this process created the Poller: in a fork()ed child its epoll
+ * and eventfd instances are the parent's. */
+static bool phasync_poller_usable(phasync_poller *p)
 {
-	pid_t pid = getpid();
-	struct epoll_event e;
-
-	if (phasync_epfd >= 0 && phasync_ep_pid == pid) {
+	if (p->pid == getpid()) {
 		return true;
 	}
-	if (phasync_epfd >= 0) {
-		close(phasync_epfd);
-		phasync_epfd = -1;
-	}
-	if (!phasync_regs_ready) {
-		zend_hash_init(&phasync_regs, 64, NULL, phasync_reg_dtor, 1);
-		phasync_regs_ready = true;
-	}
-	zend_hash_clean(&phasync_regs);
-	if (phasync_evfd >= 0 && phasync_evfd_pid != pid) {
-		close(phasync_evfd);
-		phasync_evfd = -1;
-		pthread_mutex_lock(&phasync_cq_mutex);
-		phasync_cq_len = 0;
-		pthread_mutex_unlock(&phasync_cq_mutex);
-	}
-	if (phasync_evfd < 0) {
-		phasync_evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-		phasync_evfd_pid = pid;
-	}
-	phasync_epfd = epoll_create1(EPOLL_CLOEXEC);
-	if (phasync_epfd < 0 || phasync_evfd < 0) {
-		return false;
-	}
-	phasync_ep_pid = pid;
-	e.events = EPOLLIN;
-	e.data.u64 = PHASYNC_EP_COMPLETIONS;
-	epoll_ctl(phasync_epfd, EPOLL_CTL_ADD, phasync_evfd, &e);
-	return true;
+	zend_throw_error(NULL, "This Poller belongs to another process; create a new one after fork()");
+	return false;
 }
 
-/* A new slot from the scope's getSlot(); -1 if it threw. */
-static zend_long phasync_get_slot(void)
+/* A new slot from the loop's getSlot(); -1 if it threw. */
+static zend_long phasync_get_slot(phasync_poller *p)
 {
 	zval retval;
 	zend_long slot = -1;
 
 	ZVAL_UNDEF(&retval);
-	if (call_user_function(NULL, NULL, &PHASYNC_G(scope_top)->get_slot, &retval, 0, NULL) == SUCCESS
-	 && !EG(exception)) {
+	if (call_user_function(NULL, NULL, &p->get_slot, &retval, 0, NULL) == SUCCESS && !EG(exception)) {
 		slot = zval_get_long(&retval);
 	}
 	zval_ptr_dtor(&retval);
 	return slot;
 }
 
-/* Park the current coroutine in $slot. READY when unparked. When park() throws
- * the scope's timeout class after the timeout given (the native timeout the op
- * would wait) has run out, the exception is cleared: TIMEOUT, finish the op the
- * way PHP does on a timeout. With native_timeout false (the public readable()
- * and writable()), or for any other exception (a cancellation), it stays
+/* Park the current coroutine in $slot. READY when unparked. With a timeout
+ * class (the manage() scope's, for a hooked call with a native timeout), park()
+ * throwing it once the timeout given has run out clears the exception: TIMEOUT,
+ * finish the op the way PHP does on a timeout. Otherwise (the public
+ * readable()/writable(), or any other exception, a cancellation) it stays
  * pending: ERROR. */
-static int phasync_park(zend_long slot, double timeout, bool native_timeout)
+static int phasync_park(phasync_poller *p, zend_long slot, double timeout, zend_class_entry *timeout_ce)
 {
 	zval args[2], retval;
 	double deadline = isinf(timeout) ? INFINITY : phasync_now() + timeout;
@@ -479,11 +484,10 @@ static int phasync_park(zend_long slot, double timeout, bool native_timeout)
 	ZVAL_LONG(&args[0], slot);
 	ZVAL_DOUBLE(&args[1], isinf(timeout) ? DBL_MAX : timeout);
 	ZVAL_UNDEF(&retval);
-	if (call_user_function(NULL, NULL, &PHASYNC_G(scope_top)->park, &retval, 2, args) == FAILURE) {
+	if (call_user_function(NULL, NULL, &p->park, &retval, 2, args) == FAILURE) {
 		rc = PHASYNC_WAIT_ERROR;
 	} else if (EG(exception)) {
-		zend_class_entry *tce = PHASYNC_G(scope_top)->timeout_ce;
-		if (native_timeout && !isinf(deadline) && tce && instanceof_function(EG(exception)->ce, tce)
+		if (timeout_ce && !isinf(deadline) && instanceof_function(EG(exception)->ce, timeout_ce)
 		 && phasync_now() + 0.001 >= deadline) {
 			zend_clear_exception();
 			rc = PHASYNC_WAIT_TIMEOUT;
@@ -497,70 +501,80 @@ static int phasync_park(zend_long slot, double timeout, bool native_timeout)
 
 /* Arm the registration for whoever is parked on it (one-shot); with nobody,
  * leave it disarmed. Returns -1 (errno set) if epoll refused the descriptor. */
-static int phasync_reg_arm(phasync_reg *r)
+static int phasync_reg_arm(phasync_poller *p, phasync_reg *r)
 {
 	struct epoll_event e;
 	uint32_t ev = (r->slot[0] >= 0 ? EPOLLIN | EPOLLRDHUP : 0) | (r->slot[1] >= 0 ? EPOLLOUT : 0);
 
 	e.events = ev | EPOLLONESHOT;
 	e.data.u64 = (uint64_t) r->fd;
-	if (epoll_ctl(phasync_epfd, r->added ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, r->fd, &e) != 0) {
+	if (epoll_ctl(p->epfd, r->added ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, r->fd, &e) != 0) {
 		return -1;
 	}
 	r->added = true;
 	return 0;
 }
 
-static void phasync_reg_drop(phasync_reg *r)
+static void phasync_reg_drop(phasync_poller *p, phasync_reg *r)
 {
 	if (r->added) {
-		epoll_ctl(phasync_epfd, EPOLL_CTL_DEL, r->fd, NULL);
+		epoll_ctl(p->epfd, EPOLL_CTL_DEL, r->fd, NULL);
 	}
-	zend_hash_index_del(&phasync_regs, (zend_ulong) r->fd);   /* frees r */
+	zend_hash_index_del(&p->regs, (zend_ulong) r->fd);   /* frees r */
 }
 
-/* A stream is closing: deregister it before its descriptor goes away, and wake
- * whoever is parked on it (through poll(), like any wake-up); their next use of
- * the stream finds it closed. */
+/* A stream is closing: deregister it (from every live Poller) before its
+ * descriptor goes away, and wake whoever is parked on it (through poll(), like
+ * any wake-up); their next use of the stream finds it closed. */
 static void phasync_stream_forget(php_stream *stream)
 {
-	phasync_reg *r;
-	php_socket_t fd;
+	php_socket_t fd = -2;
+	pid_t pid = 0;
 
-	if (!phasync_regs_ready || phasync_epfd < 0 || phasync_ep_pid != getpid()
-	 || zend_hash_num_elements(&phasync_regs) == 0 || (fd = phasync_stream_fd(stream)) == -1
-	 || (r = zend_hash_index_find_ptr(&phasync_regs, (zend_ulong) fd)) == NULL || r->stream != stream) {
-		return;
-	}
-	for (int i = 0; i < 2; i++) {
-		if (r->slot[i] >= 0) {
-			phasync_cq_push(r->slot[i]);
+	for (phasync_poller *p = phasync_pollers; p; p = p->next) {
+		phasync_reg *r;
+
+		if (zend_hash_num_elements(&p->regs) == 0) {
+			continue;
 		}
+		if (fd == -2) {
+			fd = phasync_stream_fd(stream);
+			pid = getpid();
+		}
+		if (fd == -1 || p->pid != pid
+		 || (r = zend_hash_index_find_ptr(&p->regs, (zend_ulong) fd)) == NULL || r->stream != stream) {
+			continue;
+		}
+		for (int i = 0; i < 2; i++) {
+			if (r->slot[i] >= 0) {
+				phasync_chan_push(p->chan, r->slot[i]);
+			}
+		}
+		phasync_reg_drop(p, r);
 	}
-	phasync_reg_drop(r);
 }
 
 static bool phasync_has_close_hook(php_stream *stream);
 
-/* Wait (in a fiber, inside a scope) until fd is readable or writable, or closed
- * or failed. timeout is the native timeout, INFINITY for none. Returns READY,
- * TIMEOUT or ERROR (exception pending); see phasync_park(). */
-static int phasync_wait_fd_ex(int dir, php_stream *stream, php_socket_t fd, double timeout, bool native_timeout)
+/* Wait (in a fiber) until fd is readable or writable, or closed or failed.
+ * timeout is the native timeout, INFINITY for none. Returns READY, TIMEOUT or
+ * ERROR (exception pending); see phasync_park(). */
+static int phasync_poller_wait(phasync_poller *p, int dir, php_stream *stream, php_socket_t fd,
+                               double timeout, zend_class_entry *timeout_ce)
 {
 	int idx = dir == PHASYNC_WRITE, rc, dupfd = -1;
 	phasync_reg *r;
 	zend_long slot;
 
+	if (!phasync_poller_usable(p)) {
+		return PHASYNC_WAIT_ERROR;
+	}
 	if (fd == -1) {
 		zend_throw_error(NULL, "The stream has no file descriptor to wait on");
 		return PHASYNC_WAIT_ERROR;
 	}
-	if (!phasync_ep_ensure()) {
-		zend_throw_error(NULL, "Unable to create the epoll set: %s", strerror(errno));
-		return PHASYNC_WAIT_ERROR;
-	}
-	r = zend_hash_index_find_ptr(&phasync_regs, (zend_ulong) fd);
-	if (r && stream && r->stream != stream && r->stream) {
+	r = zend_hash_index_find_ptr(&p->regs, (zend_ulong) fd);
+	if (r && stream && r->stream && r->stream != stream) {
 		/* The other stream's close op never deregistered it: a bug in the extension.
 		 * Never re-register quietly. */
 		zend_error_noreturn(E_ERROR, "phasync: descriptor %d is still registered for stream %p, now waited on by stream %p",
@@ -582,7 +596,7 @@ static int phasync_wait_fd_ex(int dir, php_stream *stream, php_socket_t fd, doub
 		r->stream = stream;
 		r->slot[0] = r->slot[1] = -1;
 		r->transient = stream == NULL || !phasync_has_close_hook(stream);
-		zend_hash_index_add_new_ptr(&phasync_regs, (zend_ulong) fd, r);
+		zend_hash_index_add_new_ptr(&p->regs, (zend_ulong) fd, r);
 	}
 	if (r->slot[idx] >= 0) {
 		zend_throw_exception_ex(spl_ce_LogicException, 0, "Another coroutine is already waiting to %s this stream",
@@ -590,12 +604,12 @@ static int phasync_wait_fd_ex(int dir, php_stream *stream, php_socket_t fd, doub
 		rc = PHASYNC_WAIT_ERROR;
 		goto done;
 	}
-	if ((slot = phasync_get_slot()) < 0) {
+	if ((slot = phasync_get_slot(p)) < 0) {
 		rc = PHASYNC_WAIT_ERROR;
 		goto done;
 	}
 	r->slot[idx] = slot;
-	if (phasync_reg_arm(r) != 0) {
+	if (phasync_reg_arm(p, r) != 0) {
 		r->slot[idx] = -1;
 		if (errno == EPERM) {
 			rc = PHASYNC_WAIT_READY;   /* a regular file: always ready, as select() says */
@@ -606,21 +620,30 @@ static int phasync_wait_fd_ex(int dir, php_stream *stream, php_socket_t fd, doub
 		goto done;
 	}
 
-	rc = phasync_park(slot, timeout, native_timeout);
+	GC_ADDREF(&p->std);                  /* the loop may drop the Poller while we wait */
+	rc = phasync_park(p, slot, timeout, timeout_ce);
 
 	/* The stream may have been closed meanwhile (r freed): look it up again. */
-	r = zend_hash_index_find_ptr(&phasync_regs, (zend_ulong) fd);
+	r = zend_hash_index_find_ptr(&p->regs, (zend_ulong) fd);
 	if (r && r->stream != stream) {
 		r = NULL;
 	}
 	if (r && r->slot[idx] == slot) {
 		/* Not unparked: cancelled or timed out. Disarm before the exception goes on. */
 		r->slot[idx] = -1;
-		phasync_reg_arm(r);
+		phasync_reg_arm(p, r);
 	}
+	if (r && r->transient && r->slot[0] < 0 && r->slot[1] < 0) {
+		phasync_reg_drop(p, r);
+	}
+	if (dupfd >= 0) {
+		close(dupfd);
+	}
+	OBJ_RELEASE(&p->std);
+	return rc;
 done:
 	if (r && r->transient && r->slot[0] < 0 && r->slot[1] < 0) {
-		phasync_reg_drop(r);
+		phasync_reg_drop(p, r);
 	}
 	if (dupfd >= 0) {
 		close(dupfd);
@@ -628,9 +651,12 @@ done:
 	return rc;
 }
 
-static zend_always_inline int phasync_wait_fd(int dir, php_stream *stream, php_socket_t fd, double timeout)
+/* The hooked operations wait through the manage() scope's Poller, with its
+ * timeout class. */
+static int phasync_wait_fd(int dir, php_stream *stream, php_socket_t fd, double timeout)
 {
-	return phasync_wait_fd_ex(dir, stream, fd, timeout, true);
+	phasync_scope *s = PHASYNC_G(scope_top);
+	return phasync_poller_wait(s->poller, dir, stream, fd, timeout, s->timeout_ce);
 }
 
 #define PHASYNC_COOP_ERROR    0   /* stop: exception pending          */
@@ -730,7 +756,8 @@ typedef struct phasync_task {
 	phasync_fs_op fsop;       /* FS: which operation                           */
 	char         path2[PATH_MAX]; /* FS rename: destination                     */
 	zend_long    slot;        /* the waiter's slot, queued for poll() when done  */
-	int          done;        /* set (under phasync_cq_mutex) once finished      */
+	void        *chan;        /* its Poller's completion channel (a reference)   */
+	int          done;        /* set (under the channel's mutex) once finished   */
 	struct phasync_task *next;
 } phasync_task;
 
@@ -1324,22 +1351,37 @@ static void phasync_task_exec(phasync_task *t)
 static void phasync_task_signal(phasync_task *t)
 {
 	zend_long slot = t->slot;
+	phasync_chan *ch = t->chan;
 
-	pthread_mutex_lock(&phasync_cq_mutex);
+	pthread_mutex_lock(&ch->mutex);
 	t->done = 1;
-	pthread_mutex_unlock(&phasync_cq_mutex);
-	phasync_cq_push(slot);
+	pthread_mutex_unlock(&ch->mutex);
+	phasync_chan_push(ch, slot);
+	phasync_chan_release(ch);            /* the task's reference */
 }
 
 /* Wait for a task whose waiter stopped waiting (cancelled): it still points into
  * the waiter's frame. Pool tasks are bounded, so this is short. */
-static void phasync_task_wait(phasync_task *t)
+static void phasync_task_wait(phasync_task *t, phasync_chan *ch)
 {
-	pthread_mutex_lock(&phasync_cq_mutex);
+	pthread_mutex_lock(&ch->mutex);
 	while (!t->done) {
-		pthread_cond_wait(&phasync_cq_cond, &phasync_cq_mutex);
+		pthread_cond_wait(&ch->cond, &ch->mutex);
 	}
-	pthread_mutex_unlock(&phasync_cq_mutex);
+	pthread_mutex_unlock(&ch->mutex);
+}
+
+/* Give a task its Poller's channel (a reference, released by the thread). */
+static phasync_chan *phasync_task_chan(phasync_task *t, phasync_poller *p)
+{
+	phasync_chan *ch = p->chan;
+
+	pthread_mutex_lock(&ch->mutex);
+	ch->refs++;
+	pthread_mutex_unlock(&ch->mutex);
+	t->chan = ch;
+	t->done = 0;
+	return ch;
 }
 
 /* Block all signals on a helper thread, leaving them to the main thread. */
@@ -1410,9 +1452,6 @@ static void phasync_pool_child_atfork(void)
 	phasync_pool_started = 0;
 	phasync_pool_stop = 0;
 	phasync_pool_n = 0;
-	pthread_mutex_init(&phasync_cq_mutex, NULL);
-	pthread_cond_init(&phasync_cq_cond, NULL);
-	phasync_cq_len = 0;
 }
 
 /* Start the worker pool once. Returns non-zero if at least one worker exists. If
@@ -1486,28 +1525,49 @@ static void phasync_pool_submit(phasync_task *t)
  * no heap allocation is needed for it. */
 static void phasync_pool_run(phasync_task *t)
 {
+	phasync_poller *p = PHASYNC_G(scope_top) ? PHASYNC_G(scope_top)->poller : NULL;
+	phasync_chan *ch;
 	int rc;
 
-	if (!phasync_reading() || EG(active_fiber) == NULL || PHASYNC_G(no_suspend)
-	 || !phasync_ep_ensure() || !phasync_pool_ensure() || (t->slot = phasync_get_slot()) < 0) {
+	if (!p || EG(active_fiber) == NULL || PHASYNC_G(no_suspend) || p->pid != getpid()
+	 || !phasync_pool_ensure() || (t->slot = phasync_get_slot(p)) < 0) {
 		/* No coroutine to park (or no worker, or getSlot() threw): run inline. */
 		phasync_task_exec(t);
 		return;
 	}
-	t->done = 0;
+	ch = phasync_task_chan(t, p);
 	phasync_pool_submit(t);
 
 	/* The task (and a read's buffer) live in this frame and the worker holds
 	 * pointers into them, so neither a cancellation nor a fatal error (bailout)
 	 * may leave this frame before the worker is done. */
+	GC_ADDREF(&p->std);
 	zend_try {
-		rc = phasync_park(t->slot, INFINITY, false);
+		rc = phasync_park(p, t->slot, INFINITY, NULL);
 	} zend_catch {
-		phasync_task_wait(t);
+		phasync_task_wait(t, ch);
 		zend_bailout();
 	} zend_end_try();
 	if (rc != PHASYNC_WAIT_READY) {
-		phasync_task_wait(t);
+		phasync_task_wait(t, ch);
+	}
+	OBJ_RELEASE(&p->std);
+}
+
+/* Reap a one-shot thread. Cancelled inside open(), it never signals, so its
+ * channel reference is released here instead. */
+static void phasync_oneshot_reap(pthread_t th, phasync_task *t)
+{
+	phasync_chan *ch = t->chan;
+	int done;
+
+	pthread_cancel(th);
+	pthread_join(th, NULL);
+	pthread_mutex_lock(&ch->mutex);
+	done = t->done;
+	pthread_mutex_unlock(&ch->mutex);
+	if (!done) {
+		phasync_chan_release(ch);
 	}
 }
 
@@ -1516,33 +1576,34 @@ static void phasync_pool_run(phasync_task *t)
  * pool would deadlock when reader- and writer-opens outnumber the workers. */
 static void phasync_pool_run_dedicated(phasync_task *t)
 {
+	phasync_poller *p = PHASYNC_G(scope_top) ? PHASYNC_G(scope_top)->poller : NULL;
 	pthread_t th;
 	pthread_attr_t attr;
 	int rc;
 
-	if (!phasync_reading() || EG(active_fiber) == NULL || !phasync_ep_ensure()
-	 || (t->slot = phasync_get_slot()) < 0) {
+	if (!p || EG(active_fiber) == NULL || p->pid != getpid() || (t->slot = phasync_get_slot(p)) < 0) {
 		phasync_task_exec(t);   /* no coroutine to park: block inline, as fopen() would */
 		return;
 	}
-	t->done = 0;
+	phasync_task_chan(t, p);
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, PHASYNC_WORKER_STACK);
 	if (pthread_create(&th, &attr, phasync_oneshot, t) != 0) {
 		pthread_attr_destroy(&attr);
+		phasync_chan_release(t->chan);
 		phasync_task_exec(t);
 		return;
 	}
 	pthread_attr_destroy(&attr);
+	GC_ADDREF(&p->std);
 
 	/* A fatal error (bailout) must not unwind past this frame while the thread
 	 * still holds a pointer to the stack-resident task: cancel and reap it first,
 	 * drop any fd it opened, then re-raise. */
 	zend_try {
-		rc = phasync_park(t->slot, INFINITY, false);
+		rc = phasync_park(p, t->slot, INFINITY, NULL);
 	} zend_catch {
-		pthread_cancel(th);
-		pthread_join(th, NULL);
+		phasync_oneshot_reap(th, t);
 		if (t->fd >= 0) {
 			close(t->fd);
 		}
@@ -1555,8 +1616,8 @@ static void phasync_pool_run_dedicated(phasync_task *t)
 	 * cancellation disabled, so the cancel is a no-op and join returns at once.
 	 * If the wait was cancelled, the thread is still in open(): the cancel
 	 * unblocks it there, and it never queues its slot. */
-	pthread_cancel(th);
-	pthread_join(th, NULL);
+	phasync_oneshot_reap(th, t);
+	OBJ_RELEASE(&p->std);
 
 	/* On a pending exception, drop any fd the open managed to produce. */
 	if (rc != PHASYNC_WAIT_READY) {
@@ -4022,17 +4083,15 @@ static void phasync_wrap_existing_streams(bool include_files);
 
 ZEND_FUNCTION(phasync_ext_manage)
 {
-	zval *code, *get_slot, *park, *unpark, *sleep;
+	zval *code, *poller, *sleep;
 	zend_string *timeout_name;
 	zend_class_entry *timeout_ce;
 	phasync_scope frame;
 	zval retval;
 
-	ZEND_PARSE_PARAMETERS_START(6, 6)
+	ZEND_PARSE_PARAMETERS_START(4, 4)
 		Z_PARAM_OBJECT_OF_CLASS(code, zend_ce_closure)
-		Z_PARAM_OBJECT_OF_CLASS(get_slot, zend_ce_closure)
-		Z_PARAM_OBJECT_OF_CLASS(park, zend_ce_closure)
-		Z_PARAM_OBJECT_OF_CLASS(unpark, zend_ce_closure)
+		Z_PARAM_OBJECT_OF_CLASS(poller, phasync_poller_ce)
 		Z_PARAM_OBJECT_OF_CLASS(sleep, zend_ce_closure)
 		Z_PARAM_STR(timeout_name)
 	ZEND_PARSE_PARAMETERS_END();
@@ -4042,15 +4101,14 @@ ZEND_FUNCTION(phasync_ext_manage)
 	timeout_ce = zend_lookup_class(timeout_name);
 	if (timeout_ce == NULL || !instanceof_function(timeout_ce, zend_ce_throwable)) {
 		if (!EG(exception)) {
-			zend_argument_value_error(6, "must be the name of an existing Throwable class");
+			zend_argument_value_error(4, "must be the name of an existing Throwable class");
 		}
 		RETURN_THROWS();
 	}
 
-	/* Push this scope (owned copies of the closures), linked to the enclosing one. */
-	ZVAL_COPY(&frame.get_slot, get_slot);
-	ZVAL_COPY(&frame.park, park);
-	ZVAL_COPY(&frame.unpark, unpark);
+	/* Push this scope (owned references), linked to the enclosing one. */
+	ZVAL_COPY(&frame.poller_zv, poller);
+	frame.poller = phasync_poller_from(Z_OBJ_P(poller));
 	ZVAL_COPY(&frame.sleep, sleep);
 	frame.timeout_ce = timeout_ce;
 	frame.prev = PHASYNC_G(scope_top);
@@ -4073,17 +4131,13 @@ ZEND_FUNCTION(phasync_ext_manage)
 		call_user_function(NULL, NULL, code, &retval, 0, NULL);
 	} zend_catch {
 		PHASYNC_G(scope_top) = frame.prev;
-		zval_ptr_dtor(&frame.get_slot);
-		zval_ptr_dtor(&frame.park);
-		zval_ptr_dtor(&frame.unpark);
+		zval_ptr_dtor(&frame.poller_zv);
 		zval_ptr_dtor(&frame.sleep);
 		zend_bailout();
 	} zend_end_try();
 
 	PHASYNC_G(scope_top) = frame.prev;
-	zval_ptr_dtor(&frame.get_slot);
-	zval_ptr_dtor(&frame.park);
-	zval_ptr_dtor(&frame.unpark);
+	zval_ptr_dtor(&frame.poller_zv);
 	zval_ptr_dtor(&frame.sleep);
 
 	if (Z_ISUNDEF(retval)) {
@@ -4092,35 +4146,146 @@ ZEND_FUNCTION(phasync_ext_manage)
 	RETURN_COPY_VALUE(&retval);
 }
 
-/* ---- poll(), readable(), writable() -------------------------------------- */
+/* ---- phasync\ext\Poller -------------------------------------------------- */
+
+static zend_object *phasync_poller_create(zend_class_entry *ce)
+{
+	phasync_poller *p = zend_object_alloc(sizeof(phasync_poller), ce);
+
+	zend_object_std_init(&p->std, ce);
+	object_properties_init(&p->std, ce);
+	p->std.handlers = &phasync_poller_handlers;
+	p->epfd = -1;
+	p->pid = getpid();
+	ZVAL_UNDEF(&p->get_slot);
+	ZVAL_UNDEF(&p->park);
+	ZVAL_UNDEF(&p->unpark);
+	zend_hash_init(&p->regs, 16, NULL, phasync_reg_dtor, 1);
+	p->next = phasync_pollers;
+	phasync_pollers = p;
+	return &p->std;
+}
+
+/* Waiters still parked through a freed Poller are never unparked: their waits
+ * run to their timeouts (a waiter keeps the Poller alive while it waits, so this
+ * happens only to the loop's own parked coroutines). In a fork()ed child only
+ * the child's copies of the descriptors are closed. */
+static void phasync_poller_free(zend_object *obj)
+{
+	phasync_poller *p = phasync_poller_from(obj);
+
+	for (phasync_poller **pp = &phasync_pollers; *pp; pp = &(*pp)->next) {
+		if (*pp == p) {
+			*pp = p->next;
+			break;
+		}
+	}
+	zend_hash_destroy(&p->regs);         /* closing the epoll set drops the registrations */
+	if (p->epfd >= 0) {
+		close(p->epfd);
+	}
+	if (p->chan) {
+		if (p->pid == getpid()) {
+			phasync_chan_release(p->chan);
+		} else {
+			close(p->chan->evfd);        /* its mutex may be the parent's, held at fork */
+		}
+	}
+	zval_ptr_dtor(&p->get_slot);
+	zval_ptr_dtor(&p->park);
+	zval_ptr_dtor(&p->unpark);
+	zend_object_std_dtor(obj);
+}
+
+/* The closures usually capture the loop that owns the Poller: let the cycle
+ * collector see them. */
+static HashTable *phasync_poller_get_gc(zend_object *obj, zval **table, int *n)
+{
+	phasync_poller *p = phasync_poller_from(obj);
+
+	*table = &p->get_slot;               /* get_slot, park, unpark are adjacent */
+	*n = 3;
+	return zend_std_get_properties(obj);
+}
+
+ZEND_METHOD(phasync_ext_Poller, __construct)
+{
+	zval *get_slot, *park, *unpark;
+	phasync_poller *p = phasync_poller_from(Z_OBJ_P(ZEND_THIS));
+	phasync_chan *ch;
+	struct epoll_event e;
+
+	ZEND_PARSE_PARAMETERS_START(3, 3)
+		Z_PARAM_OBJECT_OF_CLASS(get_slot, zend_ce_closure)
+		Z_PARAM_OBJECT_OF_CLASS(park, zend_ce_closure)
+		Z_PARAM_OBJECT_OF_CLASS(unpark, zend_ce_closure)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (p->epfd >= 0) {
+		zend_throw_error(NULL, "The Poller is already constructed");
+		RETURN_THROWS();
+	}
+	ch = calloc(1, sizeof(*ch));
+	p->epfd = epoll_create1(EPOLL_CLOEXEC);
+	if (ch) {
+		ch->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	}
+	if (!ch || p->epfd < 0 || ch->evfd < 0) {
+		int err = errno;
+		if (ch) {
+			if (ch->evfd >= 0) close(ch->evfd);
+			free(ch);
+		}
+		zend_throw_error(NULL, "Unable to create the epoll set: %s", strerror(err));
+		RETURN_THROWS();
+	}
+	pthread_mutex_init(&ch->mutex, NULL);
+	pthread_cond_init(&ch->cond, NULL);
+	ch->refs = 1;
+	p->chan = ch;
+	e.events = EPOLLIN;
+	e.data.u64 = PHASYNC_EP_COMPLETIONS;
+	epoll_ctl(p->epfd, EPOLL_CTL_ADD, ch->evfd, &e);
+	ZVAL_COPY(&p->get_slot, get_slot);
+	ZVAL_COPY(&p->park, park);
+	ZVAL_COPY(&p->unpark, unpark);
+}
+
+static phasync_poller *phasync_this_poller(zval *this_zv)
+{
+	phasync_poller *p = phasync_poller_from(Z_OBJ_P(this_zv));
+
+	if (p->epfd < 0) {
+		zend_throw_error(NULL, "The Poller is not constructed");
+		return NULL;
+	}
+	return phasync_poller_usable(p) ? p : NULL;
+}
 
 /* The event loop's one blocking call: wait up to $maxTime seconds (0: don't
- * wait) in one epoll_wait(), then unpark the waiters of what became ready and of
- * the finished thread tasks. Costs per ready event, never a scan of everything
+ * wait) in one epoll_wait(), then unpark the waiters of what became ready, and
+ * of the hooked operations started under a manage() given this Poller whose
+ * thread tasks finished. Costs per ready event, never a scan of everything
  * registered. */
-ZEND_FUNCTION(phasync_ext_poll)
+ZEND_METHOD(phasync_ext_Poller, poll)
 {
 	double max_time;
 	struct epoll_event ev[256];
 	zend_long wake_stack[512], *wake = wake_stack;
 	size_t nwake = 0, cap = sizeof(wake_stack) / sizeof(wake_stack[0]);
+	phasync_poller *p;
 	int ms, n;
 
 	ZEND_PARSE_PARAMETERS_START(1, 1)
 		Z_PARAM_DOUBLE(max_time)
 	ZEND_PARSE_PARAMETERS_END();
 
-	if (PHASYNC_G(scope_top) == NULL) {
-		zend_throw_error(NULL, "phasync\\ext\\poll() must be called inside manage()");
-		RETURN_THROWS();
-	}
-	if (!phasync_ep_ensure()) {
-		zend_throw_error(NULL, "Unable to create the epoll set: %s", strerror(errno));
+	if ((p = phasync_this_poller(ZEND_THIS)) == NULL) {
 		RETURN_THROWS();
 	}
 	/* Round up, so a wait shorter than a millisecond doesn't spin. */
 	ms = max_time <= 0 ? 0 : (max_time >= INT_MAX / 1000 ? -1 : (int) ceil(max_time * 1000));
-	n = epoll_wait(phasync_epfd, ev, sizeof(ev) / sizeof(ev[0]), ms);
+	n = epoll_wait(p->epfd, ev, sizeof(ev) / sizeof(ev[0]), ms);
 	if (n < 0) {
 		if (errno == EINTR) {
 			return;                          /* a signal: its handler has run */
@@ -4132,20 +4297,21 @@ ZEND_FUNCTION(phasync_ext_poll)
 	/* Settle every registration first, then call unpark() (PHP) for each. */
 	for (int i = 0; i < n; i++) {
 		if (ev[i].data.u64 == PHASYNC_EP_COMPLETIONS) {
+			phasync_chan *ch = p->chan;
 			uint64_t count;
-			(void) !read(phasync_evfd, &count, sizeof(count));
-			pthread_mutex_lock(&phasync_cq_mutex);
-			if (nwake + phasync_cq_len > cap) {
-				cap = nwake + phasync_cq_len;
+			(void) !read(ch->evfd, &count, sizeof(count));
+			pthread_mutex_lock(&ch->mutex);
+			if (nwake + ch->len > cap) {
+				cap = nwake + ch->len;
 				wake = wake == wake_stack ? memcpy(emalloc(cap * sizeof(*wake)), wake_stack, nwake * sizeof(*wake))
 				                          : erealloc(wake, cap * sizeof(*wake));
 			}
-			memcpy(wake + nwake, phasync_cq, phasync_cq_len * sizeof(*wake));
-			nwake += phasync_cq_len;
-			phasync_cq_len = 0;
-			pthread_mutex_unlock(&phasync_cq_mutex);
+			memcpy(wake + nwake, ch->queue, ch->len * sizeof(*wake));
+			nwake += ch->len;
+			ch->len = 0;
+			pthread_mutex_unlock(&ch->mutex);
 		} else {
-			phasync_reg *r = zend_hash_index_find_ptr(&phasync_regs, (zend_ulong) ev[i].data.u64);
+			phasync_reg *r = zend_hash_index_find_ptr(&p->regs, (zend_ulong) ev[i].data.u64);
 			uint32_t got = ev[i].events;
 			bool rd, wr;
 
@@ -4169,7 +4335,7 @@ ZEND_FUNCTION(phasync_ext_poll)
 				r->slot[1] = -1;
 			}
 			if (r->slot[0] >= 0 || r->slot[1] >= 0) {
-				phasync_reg_arm(r);          /* the other direction still waits */
+				phasync_reg_arm(p, r);       /* the other direction still waits */
 			}
 		}
 	}
@@ -4177,7 +4343,7 @@ ZEND_FUNCTION(phasync_ext_poll)
 		zval arg, retval;
 		ZVAL_LONG(&arg, wake[i]);
 		ZVAL_UNDEF(&retval);
-		call_user_function(NULL, NULL, &PHASYNC_G(scope_top)->unpark, &retval, 1, &arg);
+		call_user_function(NULL, NULL, &p->unpark, &retval, 1, &arg);
 		zval_ptr_dtor(&retval);
 	}
 	if (wake != wake_stack) {
@@ -4185,36 +4351,39 @@ ZEND_FUNCTION(phasync_ext_poll)
 	}
 }
 
-static void phasync_wait_public(INTERNAL_FUNCTION_PARAMETERS, int dir)
+static void phasync_poller_wait_method(INTERNAL_FUNCTION_PARAMETERS, int dir)
 {
 	zval *zstream;
-	double timeout = 0;
-	bool timeout_null = true;
+	double timeout = DBL_MAX;
 	php_stream *stream;
+	phasync_poller *p;
 
 	ZEND_PARSE_PARAMETERS_START(1, 2)
 		Z_PARAM_RESOURCE(zstream)
 		Z_PARAM_OPTIONAL
-		Z_PARAM_DOUBLE_OR_NULL(timeout, timeout_null)
+		Z_PARAM_DOUBLE(timeout)
 	ZEND_PARSE_PARAMETERS_END();
 
 	php_stream_from_zval(stream, zstream);
-	if (PHASYNC_G(scope_top) == NULL || EG(active_fiber) == NULL) {
-		zend_throw_error(NULL, "%s() must be called in a coroutine inside manage()", get_active_function_name());
+	if ((p = phasync_this_poller(ZEND_THIS)) == NULL) {
 		RETURN_THROWS();
 	}
-	/* The loop's exceptions (TimeoutException, cancellation) reach the caller as they are. */
-	phasync_wait_fd_ex(dir, stream, phasync_stream_fd(stream), timeout_null ? INFINITY : timeout, false);
+	if (EG(active_fiber) == NULL) {
+		zend_throw_error(NULL, "Poller::%s() must be called in a coroutine", dir == PHASYNC_READ ? "readable" : "writable");
+		RETURN_THROWS();
+	}
+	/* The loop's exceptions (a timeout, a cancellation) reach the caller as they are. */
+	phasync_poller_wait(p, dir, stream, phasync_stream_fd(stream), timeout >= DBL_MAX ? INFINITY : timeout, NULL);
 }
 
-ZEND_FUNCTION(phasync_ext_readable)
+ZEND_METHOD(phasync_ext_Poller, readable)
 {
-	phasync_wait_public(INTERNAL_FUNCTION_PARAM_PASSTHRU, PHASYNC_READ);
+	phasync_poller_wait_method(INTERNAL_FUNCTION_PARAM_PASSTHRU, PHASYNC_READ);
 }
 
-ZEND_FUNCTION(phasync_ext_writable)
+ZEND_METHOD(phasync_ext_Poller, writable)
 {
-	phasync_wait_public(INTERNAL_FUNCTION_PARAM_PASSTHRU, PHASYNC_WRITE);
+	phasync_poller_wait_method(INTERNAL_FUNCTION_PARAM_PASSTHRU, PHASYNC_WRITE);
 }
 
 /* ---- phasync\stream_select (Tier 1) -------------------------------------- */
@@ -4500,6 +4669,13 @@ PHP_INI_END()
 static PHP_MINIT_FUNCTION(phasync)
 {
 	REGISTER_INI_ENTRIES();
+	phasync_poller_ce = register_class_phasync_ext_Poller();
+	phasync_poller_ce->create_object = phasync_poller_create;
+	memcpy(&phasync_poller_handlers, &std_object_handlers, sizeof(zend_object_handlers));
+	phasync_poller_handlers.offset = XtOffsetOf(phasync_poller, std);
+	phasync_poller_handlers.free_obj = phasync_poller_free;
+	phasync_poller_handlers.get_gc = phasync_poller_get_gc;
+	phasync_poller_handlers.clone_obj = NULL;
 	phasync_stdio_read_orig = php_stream_stdio_ops.read;
 	phasync_stdio_write_orig = php_stream_stdio_ops.write;
 	phasync_stdio_set_option_orig = php_stream_stdio_ops.set_option;
@@ -4624,17 +4800,6 @@ static PHP_RINIT_FUNCTION(phasync)
 
 static PHP_RSHUTDOWN_FUNCTION(phasync)
 {
-	/* The request's registrations go with it (closing the epoll set drops them). */
-	if (phasync_epfd >= 0 && phasync_ep_pid == getpid()) {
-		close(phasync_epfd);
-		phasync_epfd = -1;
-	}
-	if (phasync_regs_ready) {
-		zend_hash_clean(&phasync_regs);
-	}
-	pthread_mutex_lock(&phasync_cq_mutex);
-	phasync_cq_len = 0;
-	pthread_mutex_unlock(&phasync_cq_mutex);
 	phasync_restore_hooks();
 	/* Any manage() scopes have unwound already (their frames live on the C
 	 * stack); nothing to free here. Leave the hooked table intact: streams may

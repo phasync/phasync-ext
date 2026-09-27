@@ -1,7 +1,8 @@
 <?php
 // A minimal event loop for the tests, on the extension's contract: slots
-// (getSlot/park/unpark), a sleep timer, and phasync\ext\poll() as the one
-// blocking call. It counts parks, and records the timeouts park() was given.
+// (getSlot/park/unpark) given to a phasync\ext\Poller, a sleep timer, and the
+// Poller's poll() as the one blocking call. It counts parks, and records the
+// timeouts park() was given.
 
 final class LoopTimeout extends Exception {}
 final class LoopCancelled extends Exception {}
@@ -14,14 +15,20 @@ final class Loop
     public array $sleepCalls = [];     // the microseconds asked for
     public bool $instantSleep = false; // record sleeps, don't wait
     public ?string $parkThrows = null; // park() throws this class at once
-    public ?Closure $onPark = null;
-    public bool $reverse = false;      // resume what became ready in reverse order    // fn(int $slot, ?float $timeout): true = return at once (a spurious wake), or throw
+    public ?Closure $onPark = null;    // fn(int $slot, ?float $timeout): true = return at once (a spurious wake), or throw
+    public bool $reverse = false;      // resume what became ready in reverse order
+    public \phasync\ext\Poller $poller;
 
     private int $nextSlot = 0;
     private array $parked = [];        // slot => Fiber
     private array $deadlines = [];     // slot => microtime deadline
     private array $ready = [];         // [Fiber, 'start' | null | Throwable]
     private array $timers = [];        // [microtime, Fiber]
+
+    public function __construct()
+    {
+        $this->poller = new \phasync\ext\Poller($this->getSlot(...), $this->park(...), $this->unpark(...));
+    }
 
     public function getSlot(): int
     {
@@ -122,7 +129,7 @@ final class Loop
                 $next = min($next, $t);
             }
             $ready = count($this->ready);
-            \phasync\ext\poll(max(0, $next - $now));
+            $this->poller->poll(max(0, $next - $now));
             if ($this->reverse) {
                 $this->ready = array_merge(array_slice($this->ready, 0, $ready), array_reverse(array_slice($this->ready, $ready)));
             }
@@ -144,7 +151,7 @@ final class Loop
 
     public function manage(Closure $task, string $timeoutClass = LoopTimeout::class): mixed
     {
-        return \phasync\ext\manage($task, $this->getSlot(...), $this->park(...), $this->unpark(...), $this->sleep(...), $timeoutClass);
+        return \phasync\ext\manage($task, $this->poller, $this->sleep(...), $timeoutClass);
     }
 
     /** Run the coroutines inside manage() until all are done. */

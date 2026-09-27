@@ -1,5 +1,5 @@
 --TEST--
-manage(): the 6th argument must name an existing Throwable class; it is scoped per (nested) manage(), and only ends a wait whose native timeout ran out
+manage(): the 4th argument must name an existing Throwable class; it is scoped per (nested) manage(), and only ends a wait whose native timeout ran out
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -16,7 +16,7 @@ $noop = fn(...$a) => null;
 
 foreach (['NoSuchClass', 'stdClass'] as $bad) {
     try {
-        \phasync\ext\manage(fn() => null, $noop, $noop, $noop, $noop, $bad);
+        \phasync\ext\manage(fn() => null, (new Loop)->poller, $noop, $bad);
     } catch (ValueError $e) {
         echo $e->getMessage(), "\n";
     }
@@ -54,8 +54,8 @@ $l->runAll(function () use ($a) {
 fclose($a); fclose($b);
 ?>
 --EXPECT--
-phasync\ext\manage(): Argument #6 ($timeoutException) must be the name of an existing Throwable class
-phasync\ext\manage(): Argument #6 ($timeoutException) must be the name of an existing Throwable class
+phasync\ext\manage(): Argument #4 ($timeoutException) must be the name of an existing Throwable class
+phasync\ext\manage(): Argument #4 ($timeoutException) must be the name of an existing Throwable class
 OuterTimeout propagated
 bool(false)
 early LoopTimeout propagated

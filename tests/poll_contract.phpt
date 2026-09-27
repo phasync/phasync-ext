@@ -1,5 +1,5 @@
 --TEST--
-poll()/readable()/writable(): slots, one-shot registrations, the loop's timeouts pass through, close wakes waiters, cancelled pool tasks are safe
+Poller: slots, one-shot registrations, the loop's timeouts pass through, close wakes waiters, cancelled pool tasks are safe, usable without manage(), fork guard, collectable
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -14,13 +14,14 @@ require __DIR__ . '/loop.inc';
 // readable() parks until data arrives.
 $loop = new Loop;
 $loop->runAll(
-    function () use ($a) { \phasync\ext\readable($a); echo 'readable: ', fread($a, 10), "\n"; },
+    function () use ($a, $loop) { $loop->poller->readable($a); echo 'readable: ', fread($a, 10), "\n"; },
     function () use ($b) { usleep(50000); fwrite($b, 'x'); },
 );
 
 // The loop's timeout reaches the caller as it is (no native conversion here).
-(new Loop)->runAll(function () use ($a) {
-    try { \phasync\ext\readable($a, 0.1); echo "no timeout?!\n"; }
+$loop = new Loop;
+$loop->runAll(function () use ($a, $loop) {
+    try { $loop->poller->readable($a, 0.1); echo "no timeout?!\n"; }
     catch (LoopTimeout $e) { echo "readable: LoopTimeout\n"; }
 });
 
@@ -29,11 +30,13 @@ stream_set_blocking($a, false);
 while (fwrite($a, str_repeat('.', 65536)) > 0) {}      // $a's send buffer is full
 stream_set_blocking($a, true);
 $log = [];
-(new Loop)->runAll(
-    function () use ($a, &$log) { \phasync\ext\readable($a); $log[] = 'reader woke: ' . fread($a, 5); },
-    function () use ($a, &$log) { \phasync\ext\writable($a); $log[] = 'writer woke'; },
-    function () use ($a, &$log) {
-        try { \phasync\ext\readable($a); } catch (LogicException $e) { $log[] = 'second reader: ' . $e->getMessage(); }
+$loop = new Loop;
+$p = $loop->poller;
+$loop->runAll(
+    function () use ($a, $p, &$log) { $p->readable($a); $log[] = 'reader woke: ' . fread($a, 5); },
+    function () use ($a, $p, &$log) { $p->writable($a); $log[] = 'writer woke'; },
+    function () use ($a, $p, &$log) {
+        try { $p->readable($a); } catch (LogicException $e) { $log[] = 'second reader: ' . $e->getMessage(); }
     },
     function () use ($b, &$log) {
         usleep(50000);
@@ -49,9 +52,10 @@ echo implode("\n", $log), "\n";
 
 // Closing a stream wakes whoever waits on it; the next read finds it closed.
 [$c, $d] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
-(new Loop)->runAll(
-    function () use ($c) {
-        \phasync\ext\readable($c);
+$loop = new Loop;
+$loop->runAll(
+    function () use ($c, $loop) {
+        $loop->poller->readable($c);
         echo 'close woke the waiter: ', is_resource($c) ? 'still open' : 'closed', "\n";
     },
     function () use ($c) { usleep(50000); fclose($c); },
@@ -59,19 +63,17 @@ echo implode("\n", $log), "\n";
 
 // A regular file is always ready (epoll refuses it): no park.
 $loop = new Loop;
-$loop->runAll(fn() => \phasync\ext\readable(fopen(__FILE__, 'r')));
+$loop->runAll(fn() => $loop->poller->readable(fopen(__FILE__, 'r')));
 echo 'regular file parks: ', $loop->parks, "\n";
 
 // One-shot: once woken, an unread socket with nobody waiting doesn't make
 // poll() return at once (no busy loop).
 fwrite($b, 'unread');
 $loop = new Loop;
-$loop->runAll(function () use ($a) { \phasync\ext\readable($a); });   // woken, doesn't read
-$loop->manage(function () {
-    $t = microtime(true);
-    \phasync\ext\poll(0.2);
-    echo 'idle poll waited: ', microtime(true) - $t >= 0.15 ? 'yes' : 'no (busy loop)', "\n";
-});
+$loop->runAll(function () use ($a, $loop) { $loop->poller->readable($a); });   // woken, doesn't read
+$t = microtime(true);
+$loop->poller->poll(0.2);
+echo 'idle poll waited: ', microtime(true) - $t >= 0.15 ? 'yes' : 'no (busy loop)', "\n";
 fread($a, 100);
 
 // Cancelling a coroutine whose pool task is running: the cancellation arrives
@@ -87,9 +89,41 @@ $loop->runAll(
     function () { usleep(100000); echo 'loop still fine: ', gethostbyname('localhost'), "\n"; },
 );
 
-// poll() needs manage(); readable() needs a coroutine inside manage().
-try { \phasync\ext\poll(0); } catch (Error $e) { echo $e->getMessage(), "\n"; }
-try { (new Loop)->manage(fn() => \phasync\ext\readable($a)); } catch (Error $e) { echo $e->getMessage(), "\n"; }
+// Without manage(): a loop can use a Poller on its own (no functions hooked).
+$loop = new Loop;
+$f = $loop->go(function () use ($a, $loop) { $loop->poller->readable($a); echo 'no manage(): ', fread($a, 10), "\n"; });
+$loop->go(function () use ($b, $loop) { $loop->poller->writable($b); fwrite($b, 'plain'); });
+$loop->run();
+
+// readable() needs a coroutine.
+try { (new Loop)->poller->readable($a); } catch (Error $e) { echo $e->getMessage(), "\n"; }
+
+// A Poller freed while a stream it knew is still open: closing the stream later is safe.
+$loop = new Loop;
+[$e1, $e2] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+fwrite($e2, 'y');
+$loop->runAll(function () use ($e1, $loop) { $loop->poller->readable($e1); });
+unset($loop);
+gc_collect_cycles();                                     // the loop <-> Poller closures cycle goes
+fclose($e1); fclose($e2);
+echo "freed Poller: ok\n";
+
+// fork(): the child must make its own Poller.
+if (function_exists('pcntl_fork')) {
+    $loop = new Loop;
+    if (($pid = pcntl_fork()) === 0) {
+        try { $loop->poller->poll(0); } catch (Error $e) { echo 'child: ', $e->getMessage(), "\n"; }
+        $child = new Loop;
+        $child->poller->poll(0);
+        echo "child: new Poller works\n";
+        exit;
+    }
+    pcntl_waitpid($pid, $st);
+    $loop->poller->poll(0);
+    echo "parent: still works\n";
+} else {
+    echo "child: This Poller belongs to another process; create a new one after fork()\nchild: new Poller works\nparent: still works\n";
+}
 ?>
 --EXPECT--
 readable: x
@@ -104,5 +138,9 @@ regular file parks: 0
 idle poll waited: yes
 pool task: cancelled
 loop still fine: 127.0.0.1
-phasync\ext\poll() must be called inside manage()
-phasync\ext\readable() must be called in a coroutine inside manage()
+no manage(): plain
+Poller::readable() must be called in a coroutine
+freed Poller: ok
+child: This Poller belongs to another process; create a new one after fork()
+child: new Poller works
+parent: still works

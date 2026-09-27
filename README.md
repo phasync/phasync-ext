@@ -42,9 +42,10 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
      (via a thread pool; see below)
 
    The extension performs the real I/O; on a would-block it parks the coroutine
-   in the event loop you pass to `manage()` (`getSlot()`/`park()`/`unpark()`),
-   and `phasync\ext\poll()` — the loop's one blocking call, on epoll — unparks it
-   when it may continue. The C side never touches the Fiber API: the loop owns all
+   through the event loop's `phasync\ext\Poller` you pass to `manage()`, whose
+   `poll()` — the loop's one blocking call, on epoll — unparks it when it may
+   continue. A `Poller` also works on its own, without `manage()`, for a loop that
+   only wants epoll-based waiting. The C side never touches the Fiber API: the loop owns all
    suspension. This works because PHP fibers are stackful, so a suspend from
    inside `fread()`/`SSL_read()` unwinds and resumes correctly.
 
@@ -118,34 +119,44 @@ namespace phasync\ext;
 function stream_select(?array &$read, ?array &$write, ?array &$except,
                        ?int $seconds, ?int $microseconds = null): int|false;
 
+final class Poller {
+    public function __construct(\Closure $getSlot,  // (): int — a slot number no one else uses
+                                \Closure $park,     // (int $slot, float $timeout) — suspend the coroutine in the slot
+                                \Closure $unpark);  // (int $slot): bool — resume it; false if the slot is vacant
+    public function poll(float $maxTime): void;     // the loop's one blocking call
+    public function readable(mixed $stream, float $timeout = PHP_FLOAT_MAX): void;
+    public function writable(mixed $stream, float $timeout = PHP_FLOAT_MAX): void;
+}
+
 function manage(
     \Closure $task,             // run with async I/O active; its return value is returned
-    \Closure $getSlot,          // (): int — a slot number no one else uses
-    \Closure $park,             // (int $slot, float $timeout) — suspend the coroutine in the slot
-    \Closure $unpark,           // (int $slot): bool — resume it; false if the slot is vacant
+    Poller   $poller,           // the loop's Poller: hooked I/O waits through it
     \Closure $sleep,            // (int $microseconds) — wait that long (a timer)
     string   $timeoutException, // what park() throws when its $timeout ran out
 ): mixed;
-
-function poll(float $maxTime): void;            // the loop's one blocking call
-function readable($stream, ?float $timeout = null): void;
-function writable($stream, ?float $timeout = null): void;
 ```
 
 **Waiting.** A coroutine waits by parking in a slot of the event loop: the
-extension takes a fresh `getSlot()` for every wait and calls `park($slot,
+`Poller` takes a fresh `getSlot()` for every wait and calls `park($slot,
 $timeout)`; the loop suspends the coroutine and resumes it when `unpark($slot)`
-is called. The extension unparks **only on PHP's thread, inside `poll()`**:
+is called. The `Poller` unparks **only on PHP's thread, inside `poll()`**:
 waiting for a descriptor arms a one-shot epoll registration (a level-triggered one
 with nobody waiting would make every `epoll_wait()` return at once while unread
-data sits in a socket), and worker threads never call PHP — they queue the slot
-and write to an eventfd in the epoll set, which `poll()` drains. So `poll($maxTime)`
-replaces the loop's `stream_select()` and idle `usleep()`: one `epoll_wait()` for
-up to `$maxTime` seconds (0 when it has work queued, else the time until its next
-timer), costing work per ready event, never a scan of everything registered. A
-registration lives as long as its stream and is removed in the stream's close op;
-a coroutine waiting on a stream that is closed is woken, and its next use of the
-stream finds it closed.
+data sits in a socket), and worker threads never call PHP — the thread-pool work
+of hooked operations (file operations, DNS) started under a `manage()` given this
+`Poller` queues the slot and writes to an eventfd in its epoll set, which `poll()`
+drains. So `poll($maxTime)` replaces the loop's `stream_select()` and idle
+`usleep()`: one `epoll_wait()` for up to `$maxTime` seconds (0 when it has work
+queued, else the time until its next timer), costing work per ready event, never
+a scan of everything registered. A registration lives as long as its stream and is
+removed in the stream's close op; a coroutine waiting on a stream that is closed is
+woken, and its next use of the stream finds it closed.
+
+The loop keeps its `Poller` alive: waiters parked through a `Poller` that is freed
+are never unparked, so their waits run to their timeouts. A `Poller` belongs to the
+process that created it: after `fork()`, create a new one (using the old one
+throws). Its closures usually capture the loop that owns it; the cycle collector
+handles that.
 
 **Timeouts and cancellation are the loop's.** When PHP's own call has a timeout
 (a socket's `stream_set_timeout()` or `default_socket_timeout`, counted per
@@ -156,12 +167,14 @@ FIFOs, pool operations) it passes none (`PHP_FLOAT_MAX`). If `park()` throws
 exactly as native PHP does on a timeout — partial data or `false`,
 `stream_get_meta_data()['timed_out']`, the notice for a timed-out send — so no
 exception escapes. Any other exception (a cancellation) propagates out of the I/O
-call unchanged, after the extension has disarmed the wait. `readable()` and
-`writable()` pass the loop's exceptions through as they are. phasync passes its
-loop's `getSlot`/`park`/`unpark`, its sleep, and `phasync\TimeoutException::class`.
+call unchanged, after the extension has disarmed the wait. `Poller::readable()`
+and `writable()` pass the loop's exceptions through as they are. phasync gives the
+`Poller` its loop's `getSlot`/`park`/`unpark`, and `manage()` its sleep and
+`phasync\TimeoutException::class`.
 
 `manage()` scopes are **automatic and stacking**: they apply only while `$task`
-runs, and a nested `manage()` shadows the outer loop until it returns. Waits only
+runs, and a nested `manage()` sends hooked I/O to its own `Poller` until it
+returns. Waits only
 happen inside a coroutine (fiber); outside one, calls run as the ordinary
 blocking call.
 
