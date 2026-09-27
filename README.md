@@ -246,7 +246,8 @@ $buf, $offset)`), then `len` bytes of payload.
 | server → PHP | `C` | `"peer\0local"`, each as `stream_socket_get_name()` (`1.2.3.4:5`, `[::1]:5`) | New connection |
 | | `D` | bytes (≤ `read_chunk`) | Data from the client |
 | | `E` | — | The client finished sending; we can still write |
-| | `W` | — | Output buffered past `high_water` has drained |
+| | `B` | — | Output buffered for this client passed `high_water`: stop producing for it |
+| | `W` | — | That output has drained since (always follows a `B`) |
 | | `X` | errno `u32` (0 = clean) | The connection is gone; always its last frame |
 | | `F` | errno `u32`: 0 = `max_connections`, else e.g. `EMFILE` | (id 0) Accepting stopped; new connections wait in the backlog |
 | | `A` | — | (id 0) Accepting again |
@@ -286,8 +287,9 @@ while (true) {
   last one, and each reported connection moves behind the others, so every ready
   connection gets a turn before any gets a second.
 - **Backpressure.** Clients are only read while PHP reads `$fp`. Writes always
-  take the whole buffer; a connection whose buffered output passes `high_water`
-  gets a `W` frame once it has drained.
+  take the whole buffer; when a connection's buffered output passes `high_water`
+  a `B` frame says so, and a `W` frame follows once it has drained, so an
+  application can stop producing for a slow client in between.
 - **Pause.** `P` leaves a client's data unread in the socket until `R`, which
   then delivers it. A paused client leaving is still reported: `X` at once on a
   reset, `E` at once if nothing is unread, otherwise `E` after that data once

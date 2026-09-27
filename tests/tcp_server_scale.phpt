@@ -51,12 +51,14 @@ $d = collect($fp, fn($f) => array_sum(array_map(fn($x) => strlen($x[2]), $f)) >=
 echo 'chunks: ', count($d), ' max ', max(array_map(fn($x) => strlen($x[2]), $d)), ' total ', array_sum(array_map(fn($x) => strlen($x[2]), $d)), "\n";
 
 // Backpressure: 16 MB to a client that isn't reading overflows the kernel's
-// socket buffers and goes past high_water; W comes once the client has read it.
+// socket buffers and goes past high_water: B at once, W once the client has read it.
 var_dump(fwrite($fp, frame('D', 1, str_repeat('y', 16 << 20))));
-echo 'W early: ', var_export((has('W', 1))(collect($fp, $never, 65536, 0.2)), true), "\n";
+$early = collect($fp, has('B', 1));
+echo 'B: ', var_export((has('B', 1))($early), true), ', W early: ', var_export((has('W', 1))($early), true), "\n";
+fwrite($fp, frame('D', 1, str_repeat('y', 1 << 20)));   // still over: no second B
 $got = 0; $w = [];
 stream_set_blocking($a, false);
-for ($t = microtime(true); $got < (16 << 20) && microtime(true) - $t < 20; ) {
+for ($t = microtime(true); $got < (17 << 20) && microtime(true) - $t < 20; ) {
     $n = strlen(fread($a, 1 << 20));
     $chunk = fread($fp, 65536);                        // non-blocking: also flushes
     if ($chunk !== '') array_push($w, ...parse($chunk));
@@ -64,7 +66,8 @@ for ($t = microtime(true); $got < (16 << 20) && microtime(true) - $t < 20; ) {
     $got += $n;
 }
 stream_set_blocking($a, true);
-echo 'W after drain: ', var_export((has('W', 1))(array_merge($w, collect($fp, has('W', 1)))), true), "\n";
+$w = array_merge($early, $w, collect($fp, has('W', 1)));
+echo 'W after drain: ', var_export((has('W', 1))($w), true), ', B frames: ', count(array_filter($w, fn($x) => $x[0] === 'B')), "\n";
 
 // Pause/resume: no D while paused; it arrives after R.
 fwrite($fp, frame('P', 1));
@@ -104,8 +107,8 @@ C 3 "127.0.0.1:%d\u0000127.0.0.1:%d"
 F 0 "\u0000\u0000\u0000\u0000"
 chunks: 25 max 4096 total 100000
 int(16777229)
-W early: false
-W after drain: true
+B: true, W early: false
+W after drain: true, B frames: 1
 D while paused: 0
 D 1 "during pause"
 parts: D 1 3000

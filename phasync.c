@@ -71,7 +71,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.4.0-alpha20"
+#define PHP_PHASYNC_VERSION "0.4.0-alpha21"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -4202,7 +4202,8 @@ static void phasync_ops_dtor(zval *zv)
  *   server -> PHP   C  connected: payload "peer\0local", as stream_socket_get_name()
  *                   D  data from the client
  *                   E  the client finished sending (we can still write)
- *                   W  buffered output past high_water has drained
+ *                   B  buffered output passed high_water (the client is slow)
+ *                   W  ...and has drained since
  *                   X  the connection is gone: errno:u32 (0 = clean); always last
  *                   F  (id 0) accepting stopped: errno:u32, 0 = max_connections
  *                   A  (id 0) accepting again
@@ -4240,7 +4241,7 @@ typedef struct {
 	bool     shut_pending;   /* PHP sent E: shut down once the output drains  */
 	bool     shut_done;
 	bool     close_pending;  /* PHP sent X: close once the output drains      */
-	bool     over;           /* output went past high_water: W when drained   */
+	bool     over;           /* output passed high_water (B sent): W when drained */
 	char    *wbuf;
 	size_t   woff, wlen, wcap;
 } phasync_ts_conn;
@@ -4491,8 +4492,9 @@ static void phasync_ts_send(phasync_ts *s, phasync_ts_conn *c, const char *buf, 
 	}
 	memcpy(c->wbuf + c->wlen, buf, len);
 	c->wlen += len;
-	if (c->wlen - c->woff > (size_t) s->high_water) {
+	if (!c->over && c->wlen - c->woff > (size_t) s->high_water) {
 		c->over = true;
+		phasync_ts_emit(s, 'B', c->id, NULL, 0);   /* W follows once it drains */
 	}
 	phasync_ts_update(s, c);
 }

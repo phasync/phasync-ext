@@ -71,7 +71,8 @@ function manage(\Closure $code, \Closure $readHandler, \Closure $writeHandler, \
  *      writes it ("1.2.3.4:5", "[::1]:5")
  *   D  data from the client (at most read_chunk bytes per frame)
  *   E  the client finished sending; it can still be written to
- *   W  output buffered past high_water has drained
+ *   B  output buffered for this client passed high_water: stop producing for it
+ *   W  that output has drained since (always follows a B)
  *   X  the connection is gone; payload errno:u32 (0 = clean). Always its last frame.
  *   F  (id 0) accepting stopped; payload errno:u32: 0 = max_connections reached,
  *      else why accept() failed (EMFILE...). New connections wait in the backlog.
@@ -90,7 +91,8 @@ function manage(\Closure $code, \Closure $readHandler, \Closure $writeHandler, \
  * wait for the next frame (inside manage(), in a fiber, through the read
  * handler). Every ready connection gets a turn before any gets a second.
  * Writes always take the whole buffer: output a client can't take yet is
- * buffered. A paused connection still reports the client leaving: X at once on a
+ * buffered; B and W bracket the time a connection holds more than high_water
+ * bytes of it. A paused connection still reports the client leaving: X at once on a
  * reset, E at once if nothing is unread, else E after that data once resumed.
  * Connection ids are never reused. fclose() closes the server and every
  * connection. stream_socket_get_name() gives the listening address (useful with
