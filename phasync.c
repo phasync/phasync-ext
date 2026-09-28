@@ -318,12 +318,12 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_connection_aborted)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_connection_status)(INTERNAL_FUNCTION_PARAMETERS);
 	zif_handler orig_sock[8];
-	HashTable sock_hooks;         /* (uintptr_t)zend_function -> index in phasync_sock_funcs */
+	HashTable sock_hooks;         /* (uintptr_t)function_name -> index in phasync_sock_funcs */
 	phasync_spawn *spawn;         /* armed by an exec-family call until its pipe is seen */
 	bool ub_writing;              /* a fiber is suspended inside an echo (CLI stdout) */
 	int no_suspend;               /* >0: pool ops run inline (phasync\ext\stream_select) */
 	zif_handler orig_fs[PHASYNC_FS_NFUNCS];
-	HashTable fs_hooks;           /* (uintptr_t)zend_function -> index in phasync_fs_funcs */
+	HashTable fs_hooks;           /* (uintptr_t)function_name -> index in phasync_fs_funcs */
 	int fs_offload;               /* INI: phasync.fs_offload */
 	int mountinfo_fd;             /* /proc/self/mountinfo, kept open to poll for changes */
 	phasync_mount *mounts;
@@ -3879,7 +3879,9 @@ static int phasync_fs_path(zval *z, char *out)
 
 static ZEND_NAMED_FUNCTION(phasync_fs_override)
 {
-	zval *idx = zend_hash_index_find(&PHASYNC_G(fs_hooks), (zend_ulong) (uintptr_t) EX(func));
+	/* Keyed by the name, not the function: a closure of it (is_file(...),
+	 * Closure::fromCallable()) calls a copy that shares the name (#9). */
+	zval *idx = zend_hash_index_find(&PHASYNC_G(fs_hooks), (zend_ulong) (uintptr_t) EX(func)->common.function_name);
 	zif_handler orig = PHASYNC_G(orig_fs)[Z_LVAL_P(idx)];
 	uint32_t argc = ZEND_NUM_ARGS();
 	phasync_task t;
@@ -4298,7 +4300,9 @@ static php_socket_t phasync_socket_arg(zend_execute_data *execute_data, phasync_
 
 static ZEND_NAMED_FUNCTION(phasync_socket_io_override)
 {
-	zval *idx = zend_hash_index_find(&PHASYNC_G(sock_hooks), (zend_ulong) (uintptr_t) EX(func));
+	/* Keyed by the name, not the function: a closure of it (socket_read(...),
+	 * Closure::fromCallable()) calls a copy that shares the name (#9). */
+	zval *idx = zend_hash_index_find(&PHASYNC_G(sock_hooks), (zend_ulong) (uintptr_t) EX(func)->common.function_name);
 	zif_handler orig = PHASYNC_G(orig_sock)[Z_LVAL_P(idx)];
 	int dir = phasync_sock_funcs[Z_LVAL_P(idx)].dir;
 	phasync_php_socket *ps;
@@ -5569,7 +5573,7 @@ static void phasync_install_hooks(void)
 			ZVAL_LONG(&zi, i);
 			PHASYNC_G(orig_sock)[i] = f->handler;
 			f->handler = phasync_socket_io_override;
-			zend_hash_index_update(&PHASYNC_G(sock_hooks), (zend_ulong) (uintptr_t) f, &zi);
+			zend_hash_index_update(&PHASYNC_G(sock_hooks), (zend_ulong) (uintptr_t) f->function_name, &zi);
 		}
 	}
 	if ((f = phasync_find_ifunc("pcntl_waitpid", sizeof("pcntl_waitpid") - 1))) {
@@ -5586,7 +5590,7 @@ static void phasync_install_hooks(void)
 			ZVAL_LONG(&zi, i);
 			PHASYNC_G(orig_fs)[i] = f->handler;
 			f->handler = phasync_fs_override;
-			zend_hash_index_update(&PHASYNC_G(fs_hooks), (zend_ulong) (uintptr_t) f, &zi);
+			zend_hash_index_update(&PHASYNC_G(fs_hooks), (zend_ulong) (uintptr_t) f->function_name, &zi);
 		}
 	}
 	if ((f = phasync_find_ifunc("stream_select", sizeof("stream_select") - 1))) {
