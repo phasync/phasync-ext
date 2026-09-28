@@ -57,8 +57,13 @@
 #include "ext/standard/php_filestat.h"
 #include "ext/standard/basic_functions.h"
 #include "rfc1867.h"
+#include "php_open_temporary_file.h"
 #include "zend_observer.h"
 #include "zend_fibers.h"
+#if __has_include("ext/session/php_session.h")
+# include "ext/session/php_session.h"
+# define PHASYNC_HAVE_SESSION 1
+#endif
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -225,6 +230,45 @@ typedef struct phasync_vstate {
 #undef PHASYNC_VSTATE_DECL
 } phasync_vstate;
 
+#ifdef PHASYNC_HAVE_SESSION
+/* ext/session's per-request state (what its RINIT/RSHUTDOWN reset), reached
+ * through PHASYNC_G(ps). Its settings behind INI entries (session.name, the cookie
+ * parameters, ...) stay shared: the INI system owns those strings. */
+# if PHP_VERSION_ID >= 80300
+#  define PHASYNC_VSESSION_STARTED(X) X(started_file, session_started_filename) X(started_line, session_started_lineno)
+# else
+#  define PHASYNC_VSESSION_STARTED(X)
+# endif
+# if PHP_VERSION_ID >= 80600
+#  define PHASYNC_VSESSION_OBJ_METHODS(X) X(user_obj_methods, mod_user_uses_object_methods_as_handlers)
+# else
+#  define PHASYNC_VSESSION_OBJ_METHODS(X)
+# endif
+# define PHASYNC_VSESSION_FIELDS(X) \
+	X(id,               id) \
+	X(status,           session_status) \
+	X(mod,              mod) \
+	X(mod_data,         mod_data) \
+	X(user_names,       mod_user_names) \
+	X(user_implemented, mod_user_implemented) \
+	X(user_is_open,     mod_user_is_open) \
+	X(user_class_name,  mod_user_class_name) \
+	PHASYNC_VSESSION_OBJ_METHODS(X) \
+	X(vars,             session_vars) \
+	X(http_vars,        http_session_vars) \
+	X(send_cookie,      send_cookie) \
+	X(define_sid,       define_sid) \
+	X(in_save_handler,  in_save_handler) \
+	X(set_handler,      set_handler) \
+	PHASYNC_VSESSION_STARTED(X)
+
+typedef struct phasync_vsession {
+# define PHASYNC_VSESSION_DECL(name, field) __typeof__(((php_ps_globals *) 0)->field) name;
+	PHASYNC_VSESSION_FIELDS(PHASYNC_VSESSION_DECL)
+# undef PHASYNC_VSESSION_DECL
+} phasync_vsession;
+#endif
+
 struct phasync_boundary;
 
 ZEND_BEGIN_MODULE_GLOBALS(phasync)
@@ -233,6 +277,10 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	phasync_vstate vroot;         /* the SAPI's own state while a boundary's is live */
 	HashTable vfibers;            /* (uintptr_t)zend_fiber_context -> its boundary (members only) */
 	uint32_t vcount;              /* live boundaries; 0 = the fiber observers return at once */
+#ifdef PHASYNC_HAVE_SESSION
+	php_ps_globals *ps;           /* ext/session's globals, NULL if it isn't loaded */
+	phasync_vsession vroot_session;
+#endif
 	php_stream_transport_factory orig_tcp;
 	php_stream_transport_factory orig_unix;
 	php_stream_transport_factory orig_udp;
@@ -4667,6 +4715,9 @@ typedef struct phasync_boundary {
 	HashTable *bodies_replaced;   /* ...and earlier ones PHP replaced (each            */
 	                              /* request_parse_body() starts a new one), to free   */
 	phasync_vstate st;            /* this boundary's state while it is not live        */
+#ifdef PHASYNC_HAVE_SESSION
+	phasync_vsession session;
+#endif
 } phasync_boundary;
 
 #define PHASYNC_VKEY(ctx) ((zend_ulong) (uintptr_t) (ctx))
@@ -4693,6 +4744,19 @@ static void phasync_v_install(phasync_boundary *b)
 #define PHASYNC_VSTATE_LOAD(name, live) live = st->name;
 	PHASYNC_VSTATE_FIELDS(PHASYNC_VSTATE_LOAD)
 #undef PHASYNC_VSTATE_LOAD
+#ifdef PHASYNC_HAVE_SESSION
+	if (PHASYNC_G(ps)) {
+		php_ps_globals *ps = PHASYNC_G(ps);
+		phasync_vsession *vs = cur ? &cur->session : &PHASYNC_G(vroot_session);
+# define PHASYNC_VSESSION_SAVE(name, field) vs->name = ps->field;
+		PHASYNC_VSESSION_FIELDS(PHASYNC_VSESSION_SAVE)
+# undef PHASYNC_VSESSION_SAVE
+		vs = b ? &b->session : &PHASYNC_G(vroot_session);
+# define PHASYNC_VSESSION_LOAD(name, field) ps->field = vs->name;
+		PHASYNC_VSESSION_FIELDS(PHASYNC_VSESSION_LOAD)
+# undef PHASYNC_VSESSION_LOAD
+	}
+#endif
 	PHASYNC_G(vb_cur) = b;
 }
 
@@ -4797,6 +4861,167 @@ static void phasync_vstate_free(phasync_vstate *st)
 	}
 }
 
+#ifdef PHASYNC_HAVE_SESSION
+/* ext/session's globals, looked up rather than linked, so a session.so loaded
+ * after this extension works too. */
+static php_ps_globals *phasync_ps_globals(void)
+{
+	zend_module_entry *m = zend_hash_str_find_ptr(&module_registry, ZEND_STRL("session"));
+	if (m == NULL || !m->module_started) {
+		return NULL;
+	}
+# ifdef ZTS
+	return (php_ps_globals *) TSRMG_BULK(*m->globals_id_ptr, php_ps_globals *);
+# else
+	return (php_ps_globals *) m->globals_ptr;
+# endif
+}
+
+/* The files save handler locks the session file with flock(2) in C, which would
+ * block the worker while another request of the same worker holds the session:
+ * a deadlock, as that request can't run to release it. A boundary gets a copy of
+ * the handler whose read first waits, cooperatively, until the file can be
+ * locked; nothing else runs on PHP's thread between that check and the real
+ * lock, so no request of this worker can take it in between. A holder in another
+ * process still makes the real flock() wait, as under php-fpm. */
+static ps_module phasync_ps_files;
+static const ps_module *phasync_ps_files_orig;
+
+/* mod_files' path for a session id (ps_files_path_create()), from session.save_path
+ * ("[depth;[mode;]]dir"). */
+static bool phasync_ps_files_path(const zend_string *key, char *buf, size_t buflen)
+{
+# if PHP_VERSION_ID >= 80500
+	const char *save_path = PHASYNC_G(ps)->save_path ? ZSTR_VAL(PHASYNC_G(ps)->save_path) : "";
+# else
+	const char *save_path = PHASYNC_G(ps)->save_path ? PHASYNC_G(ps)->save_path : "";
+# endif
+	const char *dir = strrchr(save_path, ';');
+	size_t depth = dir ? (size_t) ZEND_STRTOL(save_path, NULL, 10) : 0;
+	size_t n;
+
+	dir = dir ? dir + 1 : save_path;
+	if (*dir == '\0') {
+		dir = php_get_temporary_directory();
+	}
+	n = strlen(dir);
+	if (ZSTR_LEN(key) <= depth || buflen < n + 2 * depth + ZSTR_LEN(key) + sizeof("/sess_")) {
+		return false;
+	}
+	memcpy(buf, dir, n);
+	buf[n++] = '/';
+	for (size_t i = 0; i < depth; i++) {
+		buf[n++] = ZSTR_VAL(key)[i];
+		buf[n++] = '/';
+	}
+	memcpy(buf + n, "sess_", 5);
+	n += 5;
+	memcpy(buf + n, ZSTR_VAL(key), ZSTR_LEN(key) + 1);
+	return true;
+}
+
+static zend_result phasync_ps_files_read(PS_READ_ARGS)
+{
+	zval *sleep = phasync_sleep_handler();
+	char path[MAXPATHLEN];
+	zend_long backoff = 1000;
+
+	if (sleep && EG(active_fiber) && key && phasync_ps_files_path(key, path, sizeof(path))) {
+		for (;;) {
+			int fd = open(path, O_RDONLY | O_CLOEXEC), rc;
+			if (fd < 0) {
+				break;                    /* no file yet: nobody holds it */
+			}
+			rc = flock(fd, LOCK_EX | LOCK_NB);
+			close(fd);                    /* releases the probe's lock */
+			if (rc == 0 || errno != EWOULDBLOCK) {
+				break;
+			}
+			if (phasync_call_sleep(sleep, backoff) < 0) {
+				return FAILURE;           /* cancelled: the exception propagates */
+			}
+			backoff = MIN(backoff * 2, 50000);
+		}
+	}
+	return phasync_ps_files_orig->s_read(mod_data, key, val, maxlifetime);
+}
+
+/* A fresh request's session state, as ext/session's RINIT leaves it: no session,
+ * the worker's save handler (from session.save_handler at its request start). */
+static void phasync_vsession_init(phasync_vsession *vs)
+{
+	php_ps_globals *ps = PHASYNC_G(ps);
+	zval *names = (zval *) &vs->user_names;
+
+	memset(vs, 0, sizeof(*vs));
+	vs->mod = ps->mod;
+	if (vs->mod && strcmp(vs->mod->s_name, "files") == 0) {
+		if (!phasync_ps_files_orig) {
+			phasync_ps_files_orig = vs->mod;
+			phasync_ps_files = *vs->mod;
+			phasync_ps_files.s_read = phasync_ps_files_read;
+		}
+		if (vs->mod == phasync_ps_files_orig) {
+			vs->mod = &phasync_ps_files;
+		}
+	}
+	vs->status = ps->mod ? php_session_none : php_session_disabled;
+	vs->define_sid = 1;
+	ZVAL_UNDEF(&vs->http_vars);
+	for (size_t i = 0; i < sizeof(vs->user_names) / sizeof(zval); i++) {
+		ZVAL_UNDEF(&names[i]);
+	}
+}
+
+/* Free what a boundary's session state owns (it is not live). */
+static void phasync_vsession_free(phasync_vsession *vs)
+{
+	zval *names = (zval *) &vs->user_names;
+
+	zval_ptr_dtor(&vs->http_vars);
+	if (vs->id) {
+		zend_string_release(vs->id);
+	}
+	if (vs->vars) {
+		zend_string_release(vs->vars);
+	}
+	if (vs->user_class_name) {
+		zend_string_release(vs->user_class_name);
+	}
+# if PHP_VERSION_ID >= 80300
+	if (vs->started_file) {
+		zend_string_release(vs->started_file);
+	}
+# endif
+	for (size_t i = 0; i < sizeof(vs->user_names) / sizeof(zval); i++) {
+		zval_ptr_dtor(&names[i]);
+	}
+}
+
+/* The session's end of request, as ext/session's RSHUTDOWN does it: write and
+ * close an active session, then close the save handler (releasing a files
+ * session's lock). Runs with the boundary live. */
+static void phasync_vsession_end(void)
+{
+	php_ps_globals *ps = PHASYNC_G(ps);
+
+	if (ps->session_status == php_session_active) {
+		zend_try {
+			php_session_flush(1);
+		} zend_end_try();
+	}
+	zval_ptr_dtor(&ps->http_session_vars);
+	ZVAL_UNDEF(&ps->http_session_vars);
+	if (ps->mod && (ps->mod_data || ps->mod_user_implemented)) {
+		zend_try {
+			ps->mod->s_close(&ps->mod_data);
+		} zend_end_try();
+	}
+	ps->mod_data = NULL;
+	ps->session_status = php_session_none;
+}
+#endif
+
 static void phasync_v_release(phasync_boundary *b)
 {
 	if (--b->refcount == 0) {
@@ -4809,6 +5034,11 @@ static void phasync_v_release(phasync_boundary *b)
 			FREE_HASHTABLE(b->bodies_replaced);
 		}
 		phasync_vstate_free(&b->st);
+#ifdef PHASYNC_HAVE_SESSION
+		if (PHASYNC_G(ps)) {
+			phasync_vsession_free(&b->session);
+		}
+#endif
 		zval_ptr_dtor(&b->sapi);
 		efree(b);
 		PHASYNC_G(vcount)--;
@@ -5111,8 +5341,9 @@ static void phasync_v_request_info(phasync_boundary *b, zend_function *fn)
 }
 
 /* The end of a request, in php_request_shutdown()'s order: shutdown functions,
- * the output buffers flushed (removable or not), then the headers if no output
- * sent them. Runs with the boundary live, in the virtualize() call's fiber. */
+ * the output buffers flushed (removable or not), the headers if no output sent
+ * them, then the session written and closed. Runs with the boundary live, in the
+ * virtualize() call's fiber. */
 static void phasync_v_finalize(phasync_boundary *b)
 {
 	zend_object *ex = EG(exception);
@@ -5130,6 +5361,11 @@ static void phasync_v_finalize(phasync_boundary *b)
 	if (!EG(exception) && !SG(headers_sent)) {
 		sapi_send_headers();
 	}
+#ifdef PHASYNC_HAVE_SESSION
+	if (PHASYNC_G(ps)) {
+		phasync_vsession_end();
+	}
+#endif
 	php_output_set_status(PHP_OUTPUT_DISABLED);
 	b->ended = true;
 	EG(exit_status) = b->exit_status;
@@ -5181,6 +5417,14 @@ ZEND_FUNCTION(phasync_ext_virtualize)
 	b->exit_status = EG(exit_status);
 	ZVAL_COPY(&b->sapi, sapi);
 	phasync_vstate_init(&b->st);
+#ifdef PHASYNC_HAVE_SESSION
+	if (!PHASYNC_G(vcount)) {
+		PHASYNC_G(ps) = phasync_ps_globals();
+	}
+	if (PHASYNC_G(ps)) {
+		phasync_vsession_init(&b->session);
+	}
+#endif
 	PHASYNC_G(vcount)++;
 	if (m_request_info) {
 		phasync_v_request_info(b, m_request_info);

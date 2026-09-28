@@ -285,6 +285,7 @@ state PHP otherwise keeps once per process:
 | `connection_aborted()`, `connection_status()`, `ignore_user_abort()` | user-abort state |
 | `register_shutdown_function()` | the shutdown functions |
 | `set_error_handler()`, `set_exception_handler()`, `restore_*()` | the error and exception handlers |
+| `session_start()`, `session_id()`, `session_status()`, `session_set_save_handler()`, ... | the session: its id, status, save handler and data |
 
 The fiber observers swap that state when execution moves between boundaries, so
 these functions run PHP's own code, with no override and no cost outside a
@@ -319,6 +320,15 @@ returns null; in a fiber started inside, that fiber ends quietly and
 (`ub_write()` returning `false`) aborts the request as PHP does: output stops,
 and unless `ignore_user_abort(true)`, the request ends as by `exit()`. Fibers
 of a request still running after it ended have their output discarded.
+
+Each request starts with the session state of a fresh request (no session, the
+worker's save handler) and ends by writing and closing its session, as PHP ends a
+request. Two concurrent requests on the same session take turns on its lock, as
+under php-fpm: with the files handler, inside `manage()`, the second waits
+cooperatively instead of blocking the worker. Settings behind INI entries, such
+as `session_name()` and the cookie parameters, stay shared by the worker's
+requests, like any `ini_set()`. `$_SESSION` is a global variable: a server
+isolating globals per request must keep it the reference ext/session holds.
 
 Global variables are not isolated, and a fatal error still ends the worker
 (after being displayed in the request's output, as natively). Nesting

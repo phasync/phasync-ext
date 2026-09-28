@@ -100,9 +100,9 @@ function manage(\Closure $task, Poller $poller, \Closure $sleep, string $timeout
  * boundary of the fiber that calls its start()), echo and the ob_*() functions,
  * header(), headers_list(), headers_sent(), http_response_code(), setcookie(),
  * header_register_callback(), register_shutdown_function(), set_error_handler(),
- * set_exception_handler(), php://input, request_parse_body(),
- * connection_aborted() and ignore_user_abort() work as they do in a request of
- * their own. What would go to the client goes to $sapi,
+ * set_exception_handler(), the session functions, php://input,
+ * request_parse_body(), connection_aborted() and ignore_user_abort() work as they
+ * do in a request of their own (INI settings, such as session_name(), stay shared). What would go to the client goes to $sapi,
  * as a SAPI would receive it:
  *
  * - ub_write(string $data): bool (required): output leaving the output buffers.
