@@ -74,7 +74,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.5.0-alpha7"
+#define PHP_PHASYNC_VERSION "0.5.0-alpha8"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
@@ -367,13 +367,21 @@ static double phasync_now(void)
  * by unparking the slot, and only ever on PHP's thread, inside its poll(). A late
  * wake-up can only find a vacant slot (unpark() returns false).
  *
- * Waiting for a descriptor arms a one-shot epoll registration (EPOLLONESHOT):
- * a level-triggered one with nobody waiting would make every epoll_wait()
- * return at once while unread data sits in the socket. A registration lives as
+ * A stream with a close hook keeps a level-triggered registration, armed for a
+ * direction on its first wait and left armed after it: in request/response I/O
+ * nothing arrives while the coroutine is busy, so the next wait needs no
+ * syscall. An event that finds nobody waiting disarms its direction (MOD) there
+ * and then, so unread data with nobody waiting costs one wake-up, never a busy
+ * loop; a hang-up with nobody waiting deletes the registration (epoll reports
+ * hang-ups whatever the interest). Each direction reuses one slot, unparked
+ * only from its registration. Other descriptors get a one-shot registration
+ * (EPOLLONESHOT), re-armed on every wait, and a fresh slot. A registration lives as
  * long as its stream, which is deregistered in its close op (epoll keeps a
  * registration while any duplicate of the descriptor lives, so close() alone is
- * not enough); streams without a close hook, and bare descriptors, get a
- * registration for the one wait only.
+ * not enough). A stream without a close hook keeps its registration too, until
+ * another stream turns up with its descriptor number and takes it over (epoll
+ * dropped it when the file closed; a stale one can only cause a spurious
+ * wake-up). Bare descriptors get a registration for the one wait only.
  *
  * The thread tasks of the hooked operations under a manage() given this Poller
  * report to its completion channel: they queue the slot to wake and write to an
@@ -394,8 +402,11 @@ typedef struct {
 	php_socket_t fd;
 	php_stream  *stream;      /* owner; NULL for a bare descriptor               */
 	zend_long    slot[2];     /* parked reader [0] and writer [1]; -1 = nobody   */
-	bool         added;       /* in the epoll set                                */
-	bool         transient;   /* for the current wait only                       */
+	zend_long    sid[2];      /* hooked: the slot each direction reuses; -1 = none yet */
+	uint32_t     events;      /* hooked: the interest registered (level-triggered) */
+	bool         added;       /* in the epoll set (as far as we know)            */
+	bool         transient;   /* for the current wait only (a bare descriptor)   */
+	bool         hooked;      /* the stream's close op deregisters it            */
 } phasync_reg;
 
 typedef struct phasync_poller {
@@ -530,18 +541,37 @@ static int phasync_park(phasync_poller *p, zend_long slot, double timeout, zend_
 
 /* Arm the registration for whoever is parked on it (one-shot); with nobody,
  * leave it disarmed. Returns -1 (errno set) if epoll refused the descriptor. */
-static int phasync_reg_arm(phasync_poller *p, phasync_reg *r)
+static int phasync_reg_ctl(phasync_poller *p, phasync_reg *r, uint32_t ev, bool oneshot)
 {
 	struct epoll_event e;
-	uint32_t ev = (r->slot[0] >= 0 ? EPOLLIN | EPOLLRDHUP : 0) | (r->slot[1] >= 0 ? EPOLLOUT : 0);
 
-	e.events = ev | EPOLLONESHOT;
+	e.events = ev | (oneshot ? EPOLLONESHOT : 0);
 	e.data.u64 = (uint64_t) r->fd;
 	if (epoll_ctl(p->epfd, r->added ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, r->fd, &e) != 0) {
-		return -1;
+		/* A taken-over registration: epoll may have dropped it (the file closed), or
+		 * the descriptor may be another file it has never seen. */
+		if (!(errno == ENOENT && r->added) && !(errno == EEXIST && !r->added)) {
+			return -1;
+		}
+		if (epoll_ctl(p->epfd, r->added ? EPOLL_CTL_ADD : EPOLL_CTL_MOD, r->fd, &e) != 0) {
+			return -1;
+		}
 	}
 	r->added = true;
+	r->events = ev;
 	return 0;
+}
+
+/* Make the registration cover whoever is parked on it: a hooked one only ever
+ * gains interest here (a no-op costs no syscall), a one-shot one is re-armed. */
+static int phasync_reg_arm(phasync_poller *p, phasync_reg *r)
+{
+	uint32_t want = (r->slot[0] >= 0 ? EPOLLIN | EPOLLRDHUP : 0) | (r->slot[1] >= 0 ? EPOLLOUT : 0);
+
+	if (r->hooked) {
+		return r->added && (r->events | want) == r->events ? 0 : phasync_reg_ctl(p, r, r->events | want, false);
+	}
+	return phasync_reg_ctl(p, r, want, true);
 }
 
 static void phasync_reg_drop(phasync_poller *p, phasync_reg *r)
@@ -603,10 +633,16 @@ static int phasync_poller_wait(phasync_poller *p, int dir, php_stream *stream, p
 	}
 	r = zend_hash_index_find_ptr(&p->regs, (zend_ulong) fd);
 	if (r && stream && r->stream && r->stream != stream) {
-		/* The other stream's close op never deregistered it: a bug in the extension.
-		 * Never re-register quietly. */
-		zend_error_noreturn(E_ERROR, "phasync: descriptor %d is still registered for stream %p, now waited on by stream %p",
-			(int) fd, (void *) r->stream, (void *) stream);
+		if (r->hooked) {
+			/* The other stream's close op never deregistered it: a bug in the
+			 * extension. Never re-register quietly. */
+			zend_error_noreturn(E_ERROR, "phasync: descriptor %d is still registered for stream %p, now waited on by stream %p",
+				(int) fd, (void *) r->stream, (void *) stream);
+		}
+		/* The previous owner had no close hook: it is gone, its descriptor reused. */
+		r->stream = stream;
+		r->hooked = phasync_has_close_hook(stream);
+		r->sid[0] = r->sid[1] = -1;
 	}
 	if (r && !stream) {
 		/* A bare-descriptor wait on a descriptor a stream owns (echo to STDOUT):
@@ -623,7 +659,9 @@ static int phasync_poller_wait(phasync_poller *p, int dir, php_stream *stream, p
 		r->fd = fd;
 		r->stream = stream;
 		r->slot[0] = r->slot[1] = -1;
-		r->transient = stream == NULL || !phasync_has_close_hook(stream);
+		r->sid[0] = r->sid[1] = -1;
+		r->transient = stream == NULL;
+		r->hooked = stream && phasync_has_close_hook(stream);
 		zend_hash_index_add_new_ptr(&p->regs, (zend_ulong) fd, r);
 	}
 	if (r->slot[idx] >= 0) {
@@ -632,9 +670,12 @@ static int phasync_poller_wait(phasync_poller *p, int dir, php_stream *stream, p
 		rc = PHASYNC_WAIT_ERROR;
 		goto done;
 	}
-	if ((slot = phasync_get_slot(p)) < 0) {
+	if ((slot = r->hooked && r->sid[idx] >= 0 ? r->sid[idx] : phasync_get_slot(p)) < 0) {
 		rc = PHASYNC_WAIT_ERROR;
 		goto done;
+	}
+	if (r->hooked) {
+		r->sid[idx] = slot;
 	}
 	r->slot[idx] = slot;
 	p->armed++;
@@ -2262,7 +2303,26 @@ static int phasync_crypto_enable(php_stream *stream, int option, int value, php_
 	return rc;
 }
 
+static void phasync_wrap_stream(php_stream *stream, phasync_mode mode);
+static int phasync_wrapped_set_option_inner(php_stream *stream, int option, int value, void *ptrparam);
+
+/* An accepted client is created with the listener's ops at the time, which are
+ * the original ones while the socket layer runs (phasync_orig_set_option()):
+ * give it the listener's wrapper, so it cooperates and its close op deregisters it. */
 static int phasync_wrapped_set_option(php_stream *stream, int option, int value, void *ptrparam)
+{
+	int rc = phasync_wrapped_set_option_inner(stream, option, value, ptrparam);
+
+	if (option == PHP_STREAM_OPTION_XPORT_API && ptrparam
+	 && ((php_stream_xport_param *) ptrparam)->op == STREAM_XPORT_OP_ACCEPT
+	 && ((php_stream_xport_param *) ptrparam)->outputs.client) {
+		phasync_wrap_stream(((php_stream_xport_param *) ptrparam)->outputs.client,
+			stream->ops->read == phasync_wrapped_read_tls ? PHASYNC_MODE_TLS : PHASYNC_MODE_RAW);
+	}
+	return rc;
+}
+
+static int phasync_wrapped_set_option_inner(php_stream *stream, int option, int value, void *ptrparam)
 {
 	if (option == PHP_STREAM_OPTION_BLOCKING) {
 		phasync_hook_entry *e = phasync_entry_ensure(stream);
@@ -5072,6 +5132,24 @@ ZEND_METHOD(phasync_ext_Poller, poll)
 			/* Ready also when closed or failed: the op then reports it as PHP does. */
 			rd = r->slot[0] >= 0 && (got & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR));
 			wr = r->slot[1] >= 0 && (got & (EPOLLOUT | EPOLLHUP | EPOLLERR));
+			if (r->hooked) {
+				/* Level-triggered: disarm what fired with nobody waiting for it. */
+				uint32_t stray = (r->slot[0] < 0 && (got & (EPOLLIN | EPOLLRDHUP)) ? EPOLLIN | EPOLLRDHUP : 0)
+				               | (r->slot[1] < 0 && (got & EPOLLOUT) ? EPOLLOUT : 0);
+				if ((got & (EPOLLHUP | EPOLLERR)) && !rd && !wr) {
+					epoll_ctl(p->epfd, EPOLL_CTL_DEL, r->fd, NULL);
+					r->added = false;
+					r->events = 0;
+				} else if (stray & r->events) {
+					if ((r->events & ~stray) == 0) {
+						epoll_ctl(p->epfd, EPOLL_CTL_DEL, r->fd, NULL);
+						r->added = false;
+						r->events = 0;
+					} else {
+						phasync_reg_ctl(p, r, r->events & ~stray, false);
+					}
+				}
+			}
 			if (nwake + 2 > cap) {
 				cap *= 2;
 				wake = wake == wake_stack ? memcpy(emalloc(cap * sizeof(*wake)), wake_stack, nwake * sizeof(*wake))
@@ -5087,8 +5165,8 @@ ZEND_METHOD(phasync_ext_Poller, poll)
 				r->slot[1] = -1;
 				p->armed--;
 			}
-			if (r->slot[0] >= 0 || r->slot[1] >= 0) {
-				phasync_reg_arm(p, r);       /* the other direction still waits */
+			if (!r->hooked && (r->slot[0] >= 0 || r->slot[1] >= 0)) {
+				phasync_reg_arm(p, r);       /* one-shot: the other direction still waits */
 			}
 		}
 	}

@@ -1,5 +1,5 @@
 --TEST--
-Poller: slots, one-shot registrations, the loop's timeouts pass through, close wakes waiters, cancelled pool tasks are safe, usable without manage(), fork guard, collectable
+Poller: slots, registrations without a busy loop, the loop's timeouts pass through, close wakes waiters, cancelled pool tasks are safe, usable without manage(), fork guard, collectable
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -66,11 +66,12 @@ $loop = new Loop;
 $loop->runAll(fn() => $loop->poller->readable(fopen(__FILE__, 'r')));
 echo 'regular file parks: ', $loop->parks, "\n";
 
-// One-shot: once woken, an unread socket with nobody waiting doesn't make
-// poll() return at once (no busy loop).
+// No busy loop: once woken, an unread socket with nobody waiting makes poll()
+// return at most once more (that disarms it), then poll() waits.
 fwrite($b, 'unread');
 $loop = new Loop;
 $loop->runAll(function () use ($a, $loop) { $loop->poller->readable($a); });   // woken, doesn't read
+$loop->poller->poll(0.2);                               // may return at once, once
 $t = microtime(true);
 $loop->poller->poll(0.2);
 echo 'idle poll waited: ', microtime(true) - $t >= 0.15 ? 'yes' : 'no (busy loop)', "\n";
