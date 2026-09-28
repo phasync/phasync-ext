@@ -18,7 +18,6 @@ use function phasync\ext\virtualize;
 $dir = sys_get_temp_dir() . '/phasync_sesslock_' . getmypid();
 @mkdir($dir);
 ini_set('session.save_path', $dir);
-$_COOKIE = ['PHPSESSID' => 'sharedsession123'];
 
 $loop = new Loop;
 $log = [];
@@ -32,7 +31,7 @@ $loop->go(function () use ($loop, &$log, &$done) {
         $loop->sleep(200000);
         $_SESSION['by'] = 'A';
         $log[] = 'A done';
-    }, new Sink);
+    }, Sink::withSession('sharedsession123'));
     $done++;
 });
 $loop->go(function () use ($loop, &$log, &$done) {
@@ -41,7 +40,7 @@ $loop->go(function () use ($loop, &$log, &$done) {
         $log[] = 'B asks for the session';
         session_start();
         $log[] = 'B has the session, written by ' . ($_SESSION['by'] ?? 'nobody');
-    }, new Sink);
+    }, Sink::withSession('sharedsession123'));
     $done++;
 });
 $loop->go(function () use ($loop, &$ticks, &$done) {

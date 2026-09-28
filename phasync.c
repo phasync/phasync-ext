@@ -57,12 +57,17 @@
 #include "ext/standard/php_filestat.h"
 #include "ext/standard/basic_functions.h"
 #include "rfc1867.h"
+#include "php_variables.h"
 #include "php_open_temporary_file.h"
 #include "zend_observer.h"
 #include "zend_fibers.h"
 #if __has_include("ext/session/php_session.h")
 # include "ext/session/php_session.h"
 # define PHASYNC_HAVE_SESSION 1
+#endif
+#if __has_include("ext/filter/php_filter.h")
+# include "ext/filter/php_filter.h"
+# define PHASYNC_HAVE_FILTER 1
 #endif
 #include <string.h>
 #include <fcntl.h>
@@ -177,9 +182,9 @@ typedef struct phasync_scope {
 } phasync_scope;
 
 /* The per-request state a virtualize() boundary gets its own copy of: PHP's
- * output layer, the SAPI's response headers and request body, user-abort state
- * and shutdown functions. Each entry is (field, the live global it mirrors); the
- * field takes the global's type, so PHP versions differing in types need no
+ * output layer, the SAPI's response headers and request, the superglobals'
+ * arrays, user-abort state and shutdown functions. Each entry is (field, the
+ * live global it mirrors); the field takes the global's type, so PHP versions differing in types need no
  * #ifs, only the fields that exist differ. */
 #if PHP_VERSION_ID >= 80600
 # define PHASYNC_VSTATE_HEADER_CB(X) X(send_header_fcc, SG(send_header_fcc))
@@ -213,6 +218,18 @@ typedef struct phasync_scope {
 	X(no_headers,         SG(request_info).no_headers) \
 	X(post_entry,         SG(request_info).post_entry) \
 	X(proto_num,          SG(request_info).proto_num) \
+	X(query_string,       SG(request_info).query_string) \
+	X(request_uri,        SG(request_info).request_uri) \
+	X(cookie_data,        SG(request_info).cookie_data) \
+	X(auth_user,          SG(request_info).auth_user) \
+	X(auth_password,      SG(request_info).auth_password) \
+	X(auth_digest,        SG(request_info).auth_digest) \
+	X(request_time,       SG(global_request_time)) \
+	X(http_post,          PG(http_globals)[TRACK_VARS_POST]) \
+	X(http_get,           PG(http_globals)[TRACK_VARS_GET]) \
+	X(http_cookie,        PG(http_globals)[TRACK_VARS_COOKIE]) \
+	X(http_server,        PG(http_globals)[TRACK_VARS_SERVER]) \
+	X(http_files,         PG(http_globals)[TRACK_VARS_FILES]) \
 	PHASYNC_VSTATE_PARSE_BODY(X) \
 	X(connection_status,  PG(connection_status)) \
 	X(ignore_user_abort,  PG(ignore_user_abort)) \
@@ -224,11 +241,30 @@ typedef struct phasync_scope {
 	X(exception_handler,  EG(user_exception_handler)) \
 	X(exception_handlers, EG(user_exception_handlers))
 
+/* The superglobals a boundary has its own of, in the order PHP creates them
+ * (php_startup_auto_globals(), without $_ENV, which stays the process's). */
+#define PHASYNC_NSG 6
+static const char *const phasync_sg_cnames[PHASYNC_NSG] = { "_GET", "_POST", "_COOKIE", "_SERVER", "_REQUEST", "_FILES" };
+static zend_string *phasync_sg_names[PHASYNC_NSG];
+#define PHASYNC_SG_SERVER 3
+
 typedef struct phasync_vstate {
 #define PHASYNC_VSTATE_DECL(name, live) __typeof__(live) name;
 	PHASYNC_VSTATE_FIELDS(PHASYNC_VSTATE_DECL)
 #undef PHASYNC_VSTATE_DECL
+	zval sg[PHASYNC_NSG];         /* EG(symbol_table)'s "_GET", ...; UNDEF = not there */
 } phasync_vstate;
+
+#ifdef PHASYNC_HAVE_FILTER
+/* ext/filter's copies of the raw input (filter_input()), filled as the
+ * superglobals are built. $_ENV's stays the process's. */
+# define PHASYNC_VFILTER_FIELDS(X) X(post_array) X(get_array) X(cookie_array) X(server_array)
+typedef struct phasync_vfilter {
+# define PHASYNC_VFILTER_DECL(field) zval field;
+	PHASYNC_VFILTER_FIELDS(PHASYNC_VFILTER_DECL)
+# undef PHASYNC_VFILTER_DECL
+} phasync_vfilter;
+#endif
 
 #ifdef PHASYNC_HAVE_SESSION
 /* ext/session's per-request state (what its RINIT/RSHUTDOWN reset), reached
@@ -277,9 +313,14 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	phasync_vstate vroot;         /* the SAPI's own state while a boundary's is live */
 	HashTable vfibers;            /* (uintptr_t)zend_fiber_context -> its boundary (members only) */
 	uint32_t vcount;              /* live boundaries; 0 = the fiber observers return at once */
+	uint32_t sg_idx[PHASYNC_NSG]; /* the superglobals' last bucket in EG(symbol_table) */
 #ifdef PHASYNC_HAVE_SESSION
 	php_ps_globals *ps;           /* ext/session's globals, NULL if it isn't loaded */
 	phasync_vsession vroot_session;
+#endif
+#ifdef PHASYNC_HAVE_FILTER
+	zend_filter_globals *fg;      /* ext/filter's globals, NULL if it isn't loaded */
+	phasync_vfilter vroot_filter;
 #endif
 	php_stream_transport_factory orig_tcp;
 	php_stream_transport_factory orig_unix;
@@ -4693,10 +4734,11 @@ cancelled:
  * A boundary gives the code it runs, and every fiber started inside it, its own
  * copy of the per-request state PHP otherwise keeps once per process
  * (PHASYNC_VSTATE_FIELDS): the output buffers, the response headers and status,
- * header_register_callback(), the request body behind php://input, user-abort
- * state and shutdown functions. The fiber observers swap that state in and out
- * when execution moves between boundaries, so PHP's own functions (echo, ob_*,
- * header(), headers_list(), request_parse_body(), ...) run unchanged. What
+ * header_register_callback(), the request body behind php://input, the
+ * superglobals, user-abort state and shutdown functions. The fiber observers
+ * swap that state in and out when execution moves between boundaries, so PHP's
+ * own functions (echo, ob_*, header(), headers_list(), request_parse_body(),
+ * ...) run unchanged. What
  * leaves a boundary goes where a SAPI's would, through the SAPI callbacks, to
  * the $sapi object: ub_write(), send_headers(), flush(), read_post().
  *
@@ -4715,12 +4757,16 @@ typedef struct phasync_boundary {
 	zval sapi;
 	zend_function *m_ub_write, *m_send_headers, *m_flush, *m_read_post, *m_exit,
 		*m_connection_aborted;
+	zval server_vars;             /* register_server_variables(), until $_SERVER is built */
 	php_stream *body_seen;        /* the body stream read_post() last filled...        */
 	HashTable *bodies_replaced;   /* ...and earlier ones PHP replaced (each            */
 	                              /* request_parse_body() starts a new one), to free   */
 	phasync_vstate st;            /* this boundary's state while it is not live        */
 #ifdef PHASYNC_HAVE_SESSION
 	phasync_vsession session;
+#endif
+#ifdef PHASYNC_HAVE_FILTER
+	phasync_vfilter filter;
 #endif
 } phasync_boundary;
 
@@ -4748,6 +4794,51 @@ static void phasync_v_install(phasync_boundary *b)
 #define PHASYNC_VSTATE_LOAD(name, live) live = st->name;
 	PHASYNC_VSTATE_FIELDS(PHASYNC_VSTATE_LOAD)
 #undef PHASYNC_VSTATE_LOAD
+	/* The superglobals' symbol table entries: compiled code and C code (such as
+	 * ext/session reading $_COOKIE) look them up by name each time. */
+	{
+		zval *save = cur ? cur->st.sg : PHASYNC_G(vroot).sg;
+		zval *load = b ? b->st.sg : PHASYNC_G(vroot).sg;
+		HashTable *symtab = &EG(symbol_table);
+		for (int i = 0; i < PHASYNC_NSG; i++) {
+			/* Where the entry was last time, if it still is: a lookup saved. */
+			uint32_t idx = PHASYNC_G(sg_idx)[i];
+			zval *slot;
+			if (idx < symtab->nNumUsed && symtab->arData[idx].key == phasync_sg_names[i]
+			 && !Z_ISUNDEF(symtab->arData[idx].val)) {
+				slot = &symtab->arData[idx].val;
+			} else if ((slot = zend_hash_find(symtab, phasync_sg_names[i]))) {
+				PHASYNC_G(sg_idx)[i] = (uint32_t) ((Bucket *) slot - symtab->arData);
+			}
+			if (slot) {
+				ZVAL_COPY_VALUE(&save[i], slot);
+				if (Z_ISUNDEF(load[i])) {
+					ZVAL_NULL(slot);          /* moved to save[i]: nothing to destroy */
+					zend_hash_del(symtab, phasync_sg_names[i]);
+				} else {
+					ZVAL_COPY_VALUE(slot, &load[i]);
+				}
+			} else {
+				ZVAL_UNDEF(&save[i]);
+				if (!Z_ISUNDEF(load[i])) {
+					zend_hash_add_new(symtab, phasync_sg_names[i], &load[i]);
+				}
+			}
+		}
+	}
+#ifdef PHASYNC_HAVE_FILTER
+	if (PHASYNC_G(fg)) {
+		zend_filter_globals *fg = PHASYNC_G(fg);
+		phasync_vfilter *vf = cur ? &cur->filter : &PHASYNC_G(vroot_filter);
+# define PHASYNC_VFILTER_SAVE(field) vf->field = fg->field;
+		PHASYNC_VFILTER_FIELDS(PHASYNC_VFILTER_SAVE)
+# undef PHASYNC_VFILTER_SAVE
+		vf = b ? &b->filter : &PHASYNC_G(vroot_filter);
+# define PHASYNC_VFILTER_LOAD(field) fg->field = vf->field;
+		PHASYNC_VFILTER_FIELDS(PHASYNC_VFILTER_LOAD)
+# undef PHASYNC_VFILTER_LOAD
+	}
+#endif
 #ifdef PHASYNC_HAVE_SESSION
 	if (PHASYNC_G(ps)) {
 		php_ps_globals *ps = PHASYNC_G(ps);
@@ -4787,6 +4878,9 @@ static void phasync_vstate_init(phasync_vstate *st)
 	zend_stack_init(&st->error_handlers_mask, sizeof(int));
 	zend_stack_init(&st->error_handlers, sizeof(zval));
 	zend_stack_init(&st->exception_handlers, sizeof(zval));
+	for (int i = 0; i < PHASYNC_NSG; i++) {
+		ZVAL_EMPTY_ARRAY(&st->sg[i]);   /* replaced as they are built */
+	}
 }
 
 /* php://input handles point at a body stream without a reference (its
@@ -4856,29 +4950,68 @@ static void phasync_vstate_free(phasync_vstate *st)
 	if (st->content_type_dup) {
 		efree(st->content_type_dup);
 	}
-	/* Set from request_info(): owned copies. */
+	/* Set from request_info() and read_cookies(): owned copies. */
 	if (st->request_method) {
 		efree((char *) st->request_method);
 	}
 	if (st->content_type) {
 		efree((char *) st->content_type);
 	}
+	if (st->query_string) {
+		efree(st->query_string);
+	}
+	if (st->request_uri) {
+		efree(st->request_uri);
+	}
+	if (st->cookie_data) {
+		efree(st->cookie_data);
+	}
+	zval_ptr_dtor(&st->http_post);
+	zval_ptr_dtor(&st->http_get);
+	zval_ptr_dtor(&st->http_cookie);
+	zval_ptr_dtor(&st->http_server);
+	zval_ptr_dtor(&st->http_files);
+	for (int i = 0; i < PHASYNC_NSG; i++) {
+		zval_ptr_dtor(&st->sg[i]);
+	}
 }
 
-#ifdef PHASYNC_HAVE_SESSION
-/* ext/session's globals, looked up rather than linked, so a session.so loaded
- * after this extension works too. */
-static php_ps_globals *phasync_ps_globals(void)
+/* An extension's globals, looked up rather than linked, so one loaded after
+ * this extension works too. NULL if it isn't loaded. */
+static void *phasync_module_globals(const char *name, size_t len)
 {
-	zend_module_entry *m = zend_hash_str_find_ptr(&module_registry, ZEND_STRL("session"));
+	zend_module_entry *m = zend_hash_str_find_ptr(&module_registry, name, len);
 	if (m == NULL || !m->module_started) {
 		return NULL;
 	}
+#ifdef ZTS
+	return TSRMG_BULK(*m->globals_id_ptr, void *);
+#else
+	return m->globals_ptr;
+#endif
+}
+
+#ifdef PHASYNC_HAVE_FILTER
+/* ext/filter declares its globals without its module entry knowing them; its INI
+ * entry filter.default points at them, as the INI system reaches them. */
+static zend_filter_globals *phasync_filter_globals(void)
+{
+	zend_ini_entry *e = zend_hash_str_find_ptr(EG(ini_directives), ZEND_STRL("filter.default"));
+	if (e == NULL) {
+		return NULL;
+	}
 # ifdef ZTS
-	return (php_ps_globals *) TSRMG_BULK(*m->globals_id_ptr, php_ps_globals *);
+	return TSRMG_BULK(*(ts_rsrc_id *) e->mh_arg2, zend_filter_globals *);
 # else
-	return (php_ps_globals *) m->globals_ptr;
+	return (zend_filter_globals *) e->mh_arg2;
 # endif
+}
+#endif
+
+#ifdef PHASYNC_HAVE_SESSION
+static php_ps_globals *phasync_ps_globals(void)
+{
+	return phasync_module_globals(ZEND_STRL("session"));
 }
 
 /* The files save handler locks the session file with flock(2) in C, which would
@@ -5038,6 +5171,14 @@ static void phasync_v_release(phasync_boundary *b)
 			FREE_HASHTABLE(b->bodies_replaced);
 		}
 		phasync_vstate_free(&b->st);
+		zval_ptr_dtor(&b->server_vars);
+#ifdef PHASYNC_HAVE_FILTER
+		if (PHASYNC_G(fg)) {
+# define PHASYNC_VFILTER_FREE(field) zval_ptr_dtor(&b->filter.field);
+			PHASYNC_VFILTER_FIELDS(PHASYNC_VFILTER_FREE)
+# undef PHASYNC_VFILTER_FREE
+		}
+#endif
 #ifdef PHASYNC_HAVE_SESSION
 		if (PHASYNC_G(ps)) {
 			phasync_vsession_free(&b->session);
@@ -5116,6 +5257,7 @@ static int (*phasync_v_send_headers_prev)(sapi_headers_struct *h);
 static void (*phasync_v_flush_prev)(void *server_context);
 static size_t (*phasync_v_read_post_prev)(char *buf, size_t len);
 static int (*phasync_v_header_handler_prev)(sapi_header_struct *h, sapi_header_op_enum op, sapi_headers_struct *hs);
+static void (*phasync_v_register_server_variables_prev)(zval *track_vars_array);
 
 static void phasync_v_before_exit(zval *status);
 
@@ -5209,9 +5351,6 @@ static size_t phasync_v_read_post(char *buf, size_t len)
 	if (!b) {
 		return phasync_v_read_post_prev ? phasync_v_read_post_prev(buf, len) : 0;
 	}
-	if (!b->m_read_post || b->ended) {
-		return 0;
-	}
 	if (b->body_seen != SG(request_info).request_body) {
 		if (b->body_seen) {
 			if (!b->bodies_replaced) {
@@ -5222,6 +5361,9 @@ static size_t phasync_v_read_post(char *buf, size_t len)
 		}
 		b->body_seen = SG(request_info).request_body;
 	}
+	if (!b->m_read_post || b->ended) {
+		return 0;
+	}
 	ZVAL_LONG(&arg, (zend_long) len);
 	phasync_v_call(b, b->m_read_post, &rv, 1, &arg);
 	if (Z_TYPE(rv) == IS_STRING) {
@@ -5230,6 +5372,40 @@ static size_t phasync_v_read_post(char *buf, size_t len)
 	}
 	zval_ptr_dtor(&rv);
 	return n;
+}
+
+/* $_SERVER's entries from register_server_variables(), registered as a SAPI
+ * registers its own: through the input filter, then php_register_variable_safe(). */
+static void phasync_v_register_server_variables(zval *track_vars_array)
+{
+	phasync_boundary *b = PHASYNC_G(vb_cur);
+	zend_string *key;
+	zval *v;
+
+	if (!b) {
+		if (phasync_v_register_server_variables_prev) {
+			phasync_v_register_server_variables_prev(track_vars_array);
+		}
+		return;
+	}
+	if (Z_TYPE(b->server_vars) != IS_ARRAY) {
+		return;
+	}
+	ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL(b->server_vars), key, v) {
+		zend_string *str;
+		char *val;
+		size_t new_len;
+
+		if (!key) {
+			continue;
+		}
+		str = zval_get_string(v);
+		val = ZSTR_VAL(str);
+		if (sapi_module.input_filter(PARSE_SERVER, ZSTR_VAL(key), &val, ZSTR_LEN(str), &new_len)) {
+			php_register_variable_safe(ZSTR_VAL(key), val, new_len, track_vars_array);
+		}
+		zend_string_release(str);
+	} ZEND_HASH_FOREACH_END();
 }
 
 /* Installed only if the SAPI has one: headers set in a boundary are the
@@ -5322,8 +5498,9 @@ static ZEND_NAMED_FUNCTION(phasync_connection_status_override)
 
 /* ---- virtualize() ---- */
 
-/* request_info(): ['method' => ..., 'content_type' => ..., 'content_length' => ...]
- * describes the request body, as a SAPI's request_info does. */
+/* request_info(): ['method' => ..., 'content_type' => ..., 'content_length' => ...,
+ * 'query_string' => ..., 'request_uri' => ...] describes the request, as a SAPI's
+ * request_info does. */
 static void phasync_v_request_info(phasync_boundary *b, zend_function *fn)
 {
 	zval rv, *v;
@@ -5340,8 +5517,95 @@ static void phasync_v_request_info(phasync_boundary *b, zend_function *fn)
 		if ((v = zend_hash_str_find_deref(Z_ARRVAL(rv), ZEND_STRL("content_length"))) && Z_TYPE_P(v) == IS_LONG) {
 			b->st.content_length = Z_LVAL_P(v);
 		}
+		if ((v = zend_hash_str_find_deref(Z_ARRVAL(rv), ZEND_STRL("query_string"))) && Z_TYPE_P(v) == IS_STRING) {
+			b->st.query_string = estrndup(Z_STRVAL_P(v), Z_STRLEN_P(v));
+		}
+		if ((v = zend_hash_str_find_deref(Z_ARRVAL(rv), ZEND_STRL("request_uri"))) && Z_TYPE_P(v) == IS_STRING) {
+			b->st.request_uri = estrndup(Z_STRVAL_P(v), Z_STRLEN_P(v));
+		}
 	}
 	zval_ptr_dtor(&rv);
+}
+
+/* What sapi_activate() asks the SAPI for at the start of a request, besides
+ * request_info(): the Cookie header and the server variables. Called with the
+ * worker's state live, before the superglobals are built, so building them runs
+ * no PHP code of the server's but read_post() for a form body. */
+static void phasync_v_request_start(phasync_boundary *b, zend_function *m_cookies, zend_function *m_server)
+{
+	zval rv;
+
+	if (m_cookies && !EG(exception)) {
+		phasync_v_call(b, m_cookies, &rv, 0, NULL);
+		if (Z_TYPE(rv) == IS_STRING) {
+			b->st.cookie_data = estrndup(Z_STRVAL(rv), Z_STRLEN(rv));
+		}
+		zval_ptr_dtor(&rv);
+	}
+	if (m_server && !EG(exception)) {
+		phasync_v_call(b, m_server, &b->server_vars, 0, NULL);
+	}
+}
+
+/* The request's form body, as sapi_activate() reads it through
+ * sapi_read_post_data() for a POST: the content type's post reader (for
+ * application/x-www-form-urlencoded, the whole body into the stream behind
+ * php://input) and the handler that sapi_handle_post() will run for $_POST. A
+ * content type PHP has no handler for isn't read ahead ("swallowed") here:
+ * php://input reads it from read_post() when the code asks. */
+static void phasync_v_read_post_data(void)
+{
+	const char *ct = SG(request_info).content_type;
+	size_t n = strcspn(ct, ";, ");
+	char *type = zend_str_tolower_dup(ct, n);
+	sapi_post_entry *entry = zend_hash_str_find_ptr(&SG(known_post_content_types), type, n);
+
+	efree(type);
+	if (!entry) {
+		return;
+	}
+	SG(request_info).post_entry = entry;
+	SG(request_info).content_type_dup = estrdup(ct);
+	zend_str_tolower(SG(request_info).content_type_dup, n);
+	if (entry->post_reader) {
+		entry->post_reader();
+	}
+}
+
+/* The request's superglobals, as PHP builds them at the start of a request
+ * (sapi_activate(), php_hash_environment()): the form body read, then each
+ * auto global's own callback, which parses through sapi_module.treat_data (the
+ * query string, the Cookie header, the body by its post handler, with ext/filter
+ * seeing each variable) and registers the result. Runs with the boundary live.
+ *
+ * All are built at the start, including those PHP builds just in time ($_SERVER,
+ * $_REQUEST): PHP arms those per request and builds them when a script using them
+ * is compiled or loaded from opcache, which in a worker happened long before this
+ * request. $_POST and $_FILES come from the body at the start as well, as PHP
+ * does: nothing can build them later, since code reads the arrays directly. */
+static void phasync_v_build_superglobals(void)
+{
+	if (PG(enable_post_data_reading) && SG(request_info).content_type
+	 && SG(request_info).request_method && strcmp(SG(request_info).request_method, "POST") == 0) {
+		phasync_v_read_post_data();
+	}
+	for (int i = 0; i < PHASYNC_NSG && !EG(exception); i++) {
+		zend_auto_global *ag = zend_hash_find_ptr(CG(auto_globals), phasync_sg_names[i]);
+		if (i == PHASYNC_SG_SERVER) {
+			/* A web request's $_SERVER has no argv or argc: the worker's CLI
+			 * arguments aren't the request's, and deriving argv from the query
+			 * string (register_argc_argv, which the CLI forces on) is deprecated. */
+			int argc = SG(request_info).argc;
+			bool reg = PG(register_argc_argv);
+			SG(request_info).argc = 0;
+			PG(register_argc_argv) = 0;
+			ag->auto_global_callback(ag->name);
+			SG(request_info).argc = argc;
+			PG(register_argc_argv) = reg;
+		} else {
+			ag->auto_global_callback(ag->name);
+		}
+	}
 }
 
 /* The end of a request, in php_request_shutdown()'s order: shutdown functions,
@@ -5388,7 +5652,7 @@ ZEND_FUNCTION(phasync_ext_virtualize)
 	zend_class_entry *ce;
 	phasync_boundary *b;
 	zend_fiber_context *ctx = EG(current_fiber_context);
-	zend_function *m_request_info;
+	zend_function *m_request_info, *m_read_cookies, *m_register_server_variables;
 	bool bailout = false;
 
 	ZEND_PARSE_PARAMETERS_START(2, 2)
@@ -5410,6 +5674,8 @@ ZEND_FUNCTION(phasync_ext_virtualize)
 	b->m_exit = PHASYNC_V_METHOD("exit");
 	b->m_connection_aborted = PHASYNC_V_METHOD("connection_aborted");
 	m_request_info = PHASYNC_V_METHOD("request_info");
+	m_read_cookies = PHASYNC_V_METHOD("read_cookies");
+	m_register_server_variables = PHASYNC_V_METHOD("register_server_variables");
 #undef PHASYNC_V_METHOD
 	if (!b->m_ub_write || !b->m_send_headers) {
 		efree(b);
@@ -5421,6 +5687,11 @@ ZEND_FUNCTION(phasync_ext_virtualize)
 	b->exit_status = EG(exit_status);
 	ZVAL_COPY(&b->sapi, sapi);
 	phasync_vstate_init(&b->st);
+	{
+		struct timeval tp;           /* REQUEST_TIME: now, as sapi_get_request_time() */
+		gettimeofday(&tp, NULL);
+		b->st.request_time = (double) tp.tv_sec + tp.tv_usec / 1000000.00;
+	}
 #ifdef PHASYNC_HAVE_SESSION
 	if (!PHASYNC_G(vcount)) {
 		PHASYNC_G(ps) = phasync_ps_globals();
@@ -5429,17 +5700,33 @@ ZEND_FUNCTION(phasync_ext_virtualize)
 		phasync_vsession_init(&b->session);
 	}
 #endif
+	if (!PHASYNC_G(vcount)) {
+#ifdef PHASYNC_HAVE_FILTER
+		PHASYNC_G(fg) = phasync_filter_globals();
+#endif
+		/* The worker's own superglobals PHP builds just in time: build them now,
+		 * as a script using them would, so that isn't first done in a boundary. */
+		for (int i = 0; i < PHASYNC_NSG; i++) {
+			zend_is_auto_global(phasync_sg_names[i]);
+		}
+	}
 	PHASYNC_G(vcount)++;
 	if (m_request_info) {
 		phasync_v_request_info(b, m_request_info);
 	}
+	phasync_v_request_start(b, m_read_cookies, m_register_server_variables);
 	zend_hash_index_add_new_ptr(&PHASYNC_G(vfibers), PHASYNC_VKEY(ctx), b);
 
 	ZVAL_UNDEF(&retval);
 	if (!EG(exception)) {
 		phasync_v_install(b);
 		zend_try {
-			call_user_function(NULL, NULL, code, &retval, 0, NULL);
+			phasync_v_build_superglobals();
+			zval_ptr_dtor(&b->server_vars);
+			ZVAL_UNDEF(&b->server_vars);
+			if (!EG(exception)) {
+				call_user_function(NULL, NULL, code, &retval, 0, NULL);
+			}
 			if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
 				zend_clear_exception();   /* exit(): the request ends here */
 			} else if (EG(exception) && !zend_is_graceful_exit(EG(exception))
@@ -6467,6 +6754,11 @@ static PHP_MINIT_FUNCTION(phasync)
 	sapi_module.flush = phasync_v_flush;
 	phasync_v_read_post_prev = sapi_module.read_post;
 	sapi_module.read_post = phasync_v_read_post;
+	phasync_v_register_server_variables_prev = sapi_module.register_server_variables;
+	sapi_module.register_server_variables = phasync_v_register_server_variables;
+	for (int i = 0; i < PHASYNC_NSG; i++) {
+		phasync_sg_names[i] = zend_string_init_interned(phasync_sg_cnames[i], strlen(phasync_sg_cnames[i]), 1);
+	}
 	if ((phasync_v_header_handler_prev = sapi_module.header_handler)) {
 		sapi_module.header_handler = phasync_v_header_handler;
 	}

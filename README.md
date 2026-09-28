@@ -282,6 +282,7 @@ state PHP otherwise keeps once per process:
 | `header()`, `header_remove()`, `headers_list()`, `headers_sent()`, `http_response_code()`, `setcookie()`, session cookies | the response headers and status |
 | `header_register_callback()` | the header callback |
 | `php://input`, `request_parse_body()`, `is_uploaded_file()`, `move_uploaded_file()` | the request body and uploads |
+| `$_GET`, `$_POST`, `$_COOKIE`, `$_SERVER`, `$_FILES`, `$_REQUEST`, `filter_input()` | the request's input |
 | `connection_aborted()`, `connection_status()`, `ignore_user_abort()` | user-abort state |
 | `register_shutdown_function()` | the shutdown functions |
 | `set_error_handler()`, `set_exception_handler()`, `restore_*()` | the error and exception handlers |
@@ -298,7 +299,9 @@ through PHP's SAPI callbacks:
 | `send_headers(int $status, ?string $statusLine, array $headers): void` | required: once, before the first output or when the request ends without any; raw lines as `headers_list()` gives them, with PHP's default `Content-type` |
 | `flush(): void` | `flush()` was called |
 | `read_post(int $length): string` | the request body: up to `$length` bytes, fewer only at its end |
-| `request_info(): array` | once at the start: `method`, `content_type`, `content_length` |
+| `request_info(): array` | once at the start: `method`, `content_type`, `content_length`, `query_string`, `request_uri` |
+| `read_cookies(): ?string` | once at the start: the `Cookie` header |
+| `register_server_variables(): array` | once at the start: `$_SERVER`'s entries (`REQUEST_METHOD`, `QUERY_STRING`, `HTTP_*`, `REMOTE_ADDR`, ...) |
 | `exit(int\|string $status): void` | `exit()`/`die()` was called inside |
 | `connection_aborted(): bool` | for a server that knows the client left before a write fails |
 
@@ -321,6 +324,16 @@ returns null; in a fiber started inside, that fiber ends quietly and
 and unless `ignore_user_abort(true)`, the request ends as by `exit()`. Fibers
 of a request still running after it ended have their output discarded.
 
+The superglobals are built at the start of the request by PHP's own code, as
+PHP builds them from a SAPI: `$_GET` from the query string and `$_COOKIE` from
+the Cookie header by PHP's parser, `$_SERVER` from `register_server_variables()`
+plus PHP's `REQUEST_TIME` entries (no `argv`, and not the process environment),
+`$_POST` and `$_FILES` from a POST's urlencoded or multipart body (read through
+`read_post()` before the code runs, as PHP does; `move_uploaded_file()` works),
+and `$_REQUEST` by `request_order`. Without the optional methods they are empty
+arrays. Other bodies are read only when the code reads `php://input`. A
+`session_start()` finds the session id in the request's own `$_COOKIE`.
+
 Each request starts with the session state of a fresh request (no session, the
 worker's save handler) and ends by writing and closing its session, as PHP ends a
 request. Two concurrent requests on the same session take turns on its lock, as
@@ -330,7 +343,7 @@ as `session_name()` and the cookie parameters, stay shared by the worker's
 requests, like any `ini_set()`. `$_SESSION` is a global variable: a server
 isolating globals per request must keep it the reference ext/session holds.
 
-Global variables are not isolated, and a fatal error still ends the worker
+Other global variables are not isolated, and a fatal error still ends the worker
 (after being displayed in the request's output, as natively). Nesting
 `virtualize()` throws.
 

@@ -8,6 +8,8 @@ class Sink
     public bool $gone = false;         // ub_write() reports the client gone
     public string $body = '';          // served by read_post()
     public array $info = [];           // returned by request_info()
+    public ?string $cookie = null;     // returned by read_cookies()
+    public array $server = [];         // returned by register_server_variables()
     public ?Closure $onWrite = null;   // runs before each ub_write() records (may suspend)
 
     public function ub_write(string $data): bool
@@ -32,4 +34,16 @@ class Sink
     }
 
     public function request_info(): array { return $this->info; }
+
+    public function read_cookies(): ?string { return $this->cookie; }
+
+    public function register_server_variables(): array { return $this->server; }
+
+    // A request whose Cookie header carries this session id.
+    public static function withSession(?string $id): static
+    {
+        $s = new static;
+        $s->cookie = $id === null ? null : "PHPSESSID=$id";
+        return $s;
+    }
 }

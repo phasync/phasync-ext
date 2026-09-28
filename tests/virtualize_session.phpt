@@ -27,7 +27,6 @@ function cookieOf(Sink $s): ?string {
 }
 
 // A visitor logs in; the request ends and its session is written.
-$_COOKIE = [];
 $s = new Sink;
 virtualize(function () { session_start(); $_SESSION['user'] = 'alice'; }, $s);
 $alice = cookieOf($s);
@@ -35,10 +34,8 @@ var_dump(strlen($alice) > 0, session_status() === PHP_SESSION_NONE);   // the wo
 
 // Yii: after session_id(''), the next visitor without a cookie got the previous
 // visitor's session. Every request now starts with none.
-$_COOKIE = [];
 $s = new Sink;
 virtualize(function () { session_id(''); }, $s);
-$_COOKIE = [];
 $s = new Sink;
 $seen = null;
 virtualize(function () use (&$seen) {
@@ -50,21 +47,18 @@ var_dump($seen, cookieOf($s) !== $alice);
 
 // Laminas: no reset trick needed; a request that starts a session and then
 // ends without closing it doesn't leave it open for the next.
-$_COOKIE = [];
 virtualize(function () { session_start(); $_SESSION['left'] = 'open'; }, new Sink);
 virtualize(function () use (&$seen) { $seen = [session_status(), session_id()]; }, new Sink);
 var_dump($seen);
 
 // CodeIgniter: the id from the request's cookie still finds the session.
-$_COOKIE = ['PHPSESSID' => $alice];
-virtualize(function () use (&$seen) { session_start(); $seen = [session_id(), $_SESSION]; }, $s = new Sink);
+virtualize(function () use (&$seen) { session_start(); $seen = [session_id(), $_SESSION]; }, Sink::withSession($alice));
 var_dump($seen[0] === $alice, $seen[1]);
 
 // Two requests interleaved, each with its own session. $_SESSION is a global
 // variable, which virtualize() leaves alone: phasync swaps globals per request,
 // keeping $_SESSION the reference ext/session holds; here each request keeps its own.
-$a = new Sink; $b = new Sink;
-$_COOKIE = ['PHPSESSID' => $alice];
+$a = Sink::withSession($alice); $b = new Sink;
 $fa = new Fiber(fn() => virtualize(function () {
     session_start();
     $session = &$_SESSION;
@@ -73,7 +67,6 @@ $fa = new Fiber(fn() => virtualize(function () {
     echo session_id() === $GLOBALS['alice'] ? "a: alice's session" : "a: WRONG session";
 }, $a));
 $fa->start();
-$_COOKIE = [];
 $fb = new Fiber(fn() => virtualize(function () {
     session_start();
     Fiber::suspend();
@@ -82,8 +75,7 @@ $fb = new Fiber(fn() => virtualize(function () {
 $fb->start();
 $fa->resume(); $fb->resume();
 echo $a->out, "\n", $b->out, "\n";
-$_COOKIE = ['PHPSESSID' => $alice];
-virtualize(function () use (&$seen) { session_start(); $seen = $_SESSION; }, new Sink);
+virtualize(function () use (&$seen) { session_start(); $seen = $_SESSION; }, Sink::withSession($alice));
 var_dump($seen);
 
 // A request's own save handler is its own; the next request uses the worker's.
@@ -96,11 +88,9 @@ class MemoryHandler implements SessionHandlerInterface {
     public function destroy(string $id): bool { unset(self::$data[$id]); return true; }
     public function gc(int $max): int|false { return 0; }
 }
-$_COOKIE = [];
 virtualize(function () { session_set_save_handler(new MemoryHandler); session_start(); $_SESSION['in'] = 'memory'; }, new Sink);
 var_dump(count(MemoryHandler::$data));
-$_COOKIE = ['PHPSESSID' => $alice];
-virtualize(function () use (&$seen) { session_start(); $seen = $_SESSION['user'] ?? null; }, new Sink);
+virtualize(function () use (&$seen) { session_start(); $seen = $_SESSION['user'] ?? null; }, Sink::withSession($alice));
 var_dump($seen);
 
 array_map('unlink', glob("$dir/sess_*"));

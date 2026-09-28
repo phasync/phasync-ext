@@ -1,5 +1,5 @@
 --TEST--
-virtualize(): php://input, request_parse_body() and uploads read the request's own body through read_post(); uploads not moved are deleted when it ends
+virtualize(): php://input, request_parse_body() and uploads ($_FILES) read the request's own body through read_post(); uploads not moved are deleted when it ends
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -24,7 +24,8 @@ $s->info = ['method' => 'PUT', 'content_type' => 'application/x-www-form-urlenco
 virtualize(function () use (&$got) { [$got] = request_parse_body(); }, $s);
 var_dump($got);
 
-// Multipart: move_uploaded_file() works; a file not moved is gone afterwards.
+// Multipart POST: $_FILES, as PHP parses it at the start of the request;
+// move_uploaded_file() works; a file not moved is gone afterwards.
 $bd = 'XyZ';
 $s = new Sink;
 $s->body = "--$bd\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\nfirst file\r\n"
@@ -33,7 +34,7 @@ $s->info = ['method' => 'POST', 'content_type' => "multipart/form-data; boundary
 $dest = sys_get_temp_dir() . '/phasync_upload_' . getmypid();
 $kept = null;
 virtualize(function () use ($dest, &$got, &$kept) {
-    [, $files] = request_parse_body();
+    $files = $_FILES;
     $kept = $files['g']['tmp_name'];
     $got = [is_uploaded_file($files['f']['tmp_name']), move_uploaded_file($files['f']['tmp_name'], $dest), file_exists($kept)];
 }, $s);

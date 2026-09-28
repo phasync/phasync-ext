@@ -102,8 +102,17 @@ function manage(\Closure $task, Poller $poller, \Closure $sleep, string $timeout
  * header_register_callback(), register_shutdown_function(), set_error_handler(),
  * set_exception_handler(), the session functions, php://input,
  * request_parse_body(), connection_aborted() and ignore_user_abort() work as they
- * do in a request of their own (INI settings, such as session_name(), stay shared). What would go to the client goes to $sapi,
- * as a SAPI would receive it:
+ * do in a request of their own (INI settings, such as session_name(), stay
+ * shared). $_GET, $_POST, $_COOKIE, $_SERVER, $_FILES and $_REQUEST (and what
+ * filter_input() reads) are the request's own, built at its start by PHP's own
+ * code from what $sapi supplies (request_info(), read_cookies(),
+ * register_server_variables(), read_post()),
+ * as PHP builds them from a SAPI: $_POST and $_FILES from a POST's
+ * application/x-www-form-urlencoded or multipart/form-data body (so
+ * move_uploaded_file() works), $_REQUEST by request_order/variables_order. A
+ * request without these methods gets empty arrays, but for the REQUEST_TIME and
+ * REQUEST_TIME_FLOAT PHP adds to $_SERVER itself. $_SERVER has no argv/argc.
+ * What would go to the client goes to $sapi, as a SAPI would receive it:
  *
  * - ub_write(string $data): bool (required): output leaving the output buffers.
  *   Return false if the client is gone: connection_aborted() becomes true, later
@@ -115,10 +124,18 @@ function manage(\Closure $task, Poller $poller, \Closure $sleep, string $timeout
  *   set by header('HTTP/1.1 ...').
  * - flush(): void: flush() was called.
  * - read_post(int $length): string: up to $length bytes of the request body,
- *   fewer only at its end. Without it the request has no body.
+ *   fewer only at its end. Without it the request has no body. A form POST's
+ *   body is read at the start (into $_POST/$_FILES); other bodies when the code
+ *   reads php://input.
  * - request_info(): array: called once at the start: 'method', 'content_type'
  *   and 'content_length' of the request, as php://input and
- *   request_parse_body() need them.
+ *   request_parse_body() need them, and 'query_string' ($_GET) and
+ *   'request_uri'.
+ * - read_cookies(): ?string: once at the start: the Cookie header, which PHP
+ *   parses into $_COOKIE (session_start() finds the session id there).
+ * - register_server_variables(): array: once at the start: $_SERVER's entries
+ *   (REQUEST_METHOD, QUERY_STRING, REQUEST_URI, HTTP_*, REMOTE_ADDR, ...),
+ *   registered as a SAPI registers them. The process environment is not added.
  * - exit(int|string $status): void: exit() or die() was called inside. In a fiber
  *   other than the one running virtualize(), that fiber ends quietly, and the
  *   server should cancel the rest of the request.
@@ -136,6 +153,6 @@ function manage(\Closure $task, Poller $poller, \Closure $sleep, string $timeout
  * exit() inside ends the request
  * without ending the worker; virtualize() then returns null. Fibers of the
  * request still running afterwards have their output discarded.
- * Global variables are not isolated. Nesting throws an Error.
+ * Other global variables are not isolated. Nesting throws an Error.
  */
 function virtualize(\Closure $code, object $sapi): mixed {}
