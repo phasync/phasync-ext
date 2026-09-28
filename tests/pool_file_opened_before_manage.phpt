@@ -4,6 +4,8 @@ A regular file opened before manage() is async inside the scope, and native agai
 phasync
 --SKIPIF--
 <?php if (!class_exists('Fiber')) die('skip requires Fibers'); ?>
+--INI--
+phasync.fs_offload=all
 --FILE--
 <?php
 require __DIR__ . '/loop.inc';

@@ -57,11 +57,11 @@ fiber-based async code — two things on **PHP 8.2+**, without patching PHP:
    - DNS: `gethostbyname()`, `gethostbynamel()`, `gethostbyaddr()`,
      `dns_get_record()`, `checkdnsrr()`/`dns_check_record()`, `getmxrr()`/`dns_get_mx()`
      (via a thread pool)
-   - regular-file reads and writes, via a thread pool: `fopen()`'d files (and FIFO
-     open), `file_get_contents()`, `file_put_contents()`, `file()`, `readfile()`,
+   - regular-file reads and writes on network/FUSE mounts, via a thread pool:
+     `fopen()`'d files, `file_get_contents()`, `file_put_contents()`, `file()`, `readfile()`,
      `fpassthru()`, `copy()`, `stream_copy_to_stream()`, `md5_file()`/`sha1_file()`/
-     `hash_file()`, `SplFileObject`, `fsync()`/`fdatasync()` — never
-     `include`/`require`, which must not suspend mid-compile
+     `hash_file()`, `SplFileObject` — never `include`/`require`, which must not
+     suspend mid-compile; and on any disk `fsync()`/`fdatasync()` and FIFO `open()`
    - filesystem metadata and namespace calls on network/FUSE mounts: `stat()`,
      `lstat()`, `file_exists()`, `is_file()`/`is_dir()`/`is_link()`/`is_readable()`/
      `is_writable()`/`is_executable()`, `filesize()`/`filemtime()` & co.,
@@ -252,7 +252,11 @@ autoloader. So by default only paths on network or FUSE mounts (NFS, SMB/CIFS, 9
 CephFS, virtiofs, sshfs and other `fuse.*` …, read from `/proc/self/mountinfo`) go
 through the pool, where a call can stall for a network round trip or longer. The
 `phasync.fs_offload` INI changes that: `network` (default), `all` (also for slow
-local disks), or `none`. Read-only calls stat or read the path on the pool, warming
+local disks), or `none`. Reads and writes of regular files follow the same policy,
+by the file's device: on a local disk they run inline, where a page-cache hit
+takes about a microsecond. The mount table is checked for changes at most once a
+second, so a new mount counts within a second and no filesystem call pays a
+syscall for the check. Read-only calls stat or read the path on the pool, warming
 the kernel's caches, and then run the original function, so results, PHP's stat
 cache and warnings are exactly native. `unlink()`/`rename()`/`mkdir()`/`rmdir()`
 run on the pool; if one fails, the original function runs and reports the error

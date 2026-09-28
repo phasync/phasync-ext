@@ -4,6 +4,8 @@ POOL-mode regular-file reads set EOF exactly like native (feof() trips; no spin)
 phasync
 --SKIPIF--
 <?php if (!class_exists('Fiber')) die('skip requires Fibers'); ?>
+--INI--
+phasync.fs_offload=all
 --FILE--
 <?php
 require __DIR__ . '/loop.inc';

@@ -83,6 +83,7 @@
 #include <dirent.h>
 #include <sys/wait.h>
 #include <sys/file.h>
+#include <sys/sysmacros.h>
 
 #ifndef SYS_pidfd_open
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
@@ -141,6 +142,7 @@ static const struct { const char *name; phasync_fs_op op; } phasync_fs_funcs[] =
 typedef struct {
 	char  *path;
 	size_t len;
+	dev_t  dev;
 	bool   slow;
 } phasync_mount;
 
@@ -367,6 +369,9 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	HashTable fs_hooks;           /* (uintptr_t)function_name -> index in phasync_fs_funcs */
 	int fs_offload;               /* INI: phasync.fs_offload */
 	int mountinfo_fd;             /* /proc/self/mountinfo, kept open to poll for changes */
+	time_t mounts_checked;        /* monotonic second of the last poll of it */
+	php_stream *fs_inline;        /* last stdio stream found to read inline: its later
+	                               * reads skip the fstat(); cleared when it closes */
 	phasync_mount *mounts;
 	int nmounts;
 	bool any_slow_mount;
@@ -744,6 +749,10 @@ static void phasync_reg_drop(phasync_poller *p, phasync_reg *r)
 static void phasync_stream_forget(php_stream *stream)
 {
 	php_socket_t fd = -2;
+
+	if (stream == PHASYNC_G(fs_inline)) {
+		PHASYNC_G(fs_inline) = NULL;
+	}
 
 	for (phasync_poller *p = phasync_pollers; p; p = p->next) {
 		phasync_reg *r;
@@ -2675,6 +2684,7 @@ static const char *phasync_ssl_schemes[] = {
 };
 
 static int phasync_fs_path(zval *z, char *out);
+static bool phasync_fs_fd_offloaded(php_socket_t fd);
 
 /* ---- proc_open() override: wrap the pipe streams it produces -------------- */
 
@@ -3355,14 +3365,14 @@ static ZEND_NAMED_FUNCTION(phasync_fopen_override)
 		return;
 	}
 
-	/* Not a FIFO: open normally, then POOL-wrap regular files. */
+	/* Not a FIFO: open normally, then POOL-wrap regular files that are offloaded. */
 	PHASYNC_G(orig_fopen)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 	if (Z_TYPE_P(return_value) == IS_RESOURCE) {
 		php_stream *s = NULL;
 		php_stream_from_zval_no_verify(s, return_value);
 		if (s) {
 			php_socket_t fd = phasync_stream_fd(s);
-			if (fd != -1 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+			if (fd != -1 && phasync_fs_fd_offloaded(fd)) {
 				phasync_wrap_stream(s, PHASYNC_MODE_POOL);
 			}
 		}
@@ -3450,8 +3460,9 @@ static ssize_t (*phasync_stdio_write_orig)(php_stream *stream, const char *buf, 
 static int (*phasync_stdio_set_option_orig)(php_stream *stream, int option, int value, void *ptrparam);
 
 /* Regular files opened internally (file_get_contents(), file_put_contents(),
- * file(), copy(), readfile(), md5_file() ...) bypass the fopen() override: their
- * reads/writes go to the pool (and mmap is declined) inside a scope, in a fiber.
+ * file(), copy(), readfile(), md5_file() ...) bypass the fopen() override: when
+ * phasync.fs_offload sends the file to the pool (phasync_fs_fd_offloaded()), its
+ * reads/writes go there (and mmap is declined) inside a scope, in a fiber.
  * The stream keeps the stdio ops: PHP checks php_stream_is(STDIO) on streams it
  * builds internally (php://temp's spill file, for one) and breaks if they change.
  * Never for a file being compiled: include/require (under a user frame) and the
@@ -3463,14 +3474,17 @@ static php_socket_t phasync_stdio_poolable(php_stream *stream)
 {
 	zend_execute_data *ex = EG(current_execute_data);
 	php_socket_t fd;
-	struct stat st;
 
 	if (!phasync_reading() || EG(active_fiber) == NULL
 	 || stream->ops != &php_stream_stdio_ops
 	 || ((stream->flags & PHP_STREAM_FLAG_NO_BUFFER) && stream->__exposed)
 	 || ex == NULL || ex->func == NULL || ZEND_USER_CODE(ex->func->type)
 	 || stream->readfilters.head || stream->writefilters.head
-	 || (fd = phasync_stream_fd(stream)) == -1 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+	 || stream == PHASYNC_G(fs_inline) || (fd = phasync_stream_fd(stream)) == -1) {
+		return -1;
+	}
+	if (!phasync_fs_fd_offloaded(fd)) {
+		PHASYNC_G(fs_inline) = stream;   /* a file stays on its filesystem */
 		return -1;
 	}
 	return fd;
@@ -3784,7 +3798,9 @@ static void phasync_mounts_free(void)
 }
 
 /* (Re)load the mount table when it changed: /proc/self/mountinfo polls POLLPRI
- * after a mount or unmount. Lines look like
+ * after a mount or unmount. Polled at most once a second (the clock is read in
+ * the vDSO, no syscall), so a filesystem call costs no extra syscall and a new
+ * mount is noticed within a second. Lines look like
  *   36 35 98:0 /mnt1 /mnt/parent rw,noatime master:1 - ext3 /dev/root rw */
 static void phasync_mounts_refresh(void)
 {
@@ -3804,6 +3820,12 @@ static void phasync_mounts_refresh(void)
 		PHASYNC_G(mountinfo_fd) = fd;
 	} else {
 		struct pollfd pfd = { fd, POLLPRI, 0 };
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC_COARSE, &now);
+		if (now.tv_sec == PHASYNC_G(mounts_checked)) {
+			return;                      /* polled this second already */
+		}
+		PHASYNC_G(mounts_checked) = now.tv_sec;
 		if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & (POLLPRI | POLLERR))) {
 			return;                      /* unchanged */
 		}
@@ -3826,6 +3848,7 @@ static void phasync_mounts_refresh(void)
 	phasync_mounts_free();
 	for (line = buf; *line; line = next) {
 		char *mnt = line, *end, *type, *o, *i;
+		unsigned int major = 0, minor = 0;
 		int field;
 
 		next = strchr(line, '\n');
@@ -3834,7 +3857,8 @@ static void phasync_mounts_refresh(void)
 			mnt = strchr(mnt, ' ');
 			mnt = mnt ? mnt + 1 : NULL;
 		}
-		if (!mnt || !(end = strchr(mnt, ' ')) || !(type = strstr(end, " - "))) {
+		if (!mnt || !(end = strchr(mnt, ' ')) || !(type = strstr(end, " - "))
+		 || sscanf(line, "%*s %*s %u:%u", &major, &minor) != 2) {
 			continue;
 		}
 		*end = '\0';
@@ -3861,10 +3885,30 @@ static void phasync_mounts_refresh(void)
 		phasync_mount *m = &PHASYNC_G(mounts)[PHASYNC_G(nmounts)++];
 		m->path = strdup(mnt);
 		m->len = strlen(mnt);
+		m->dev = makedev(major, minor);
 		m->slow = phasync_fs_slow_type(type);
 		PHASYNC_G(any_slow_mount) |= m->slow;
 	}
 	free(buf);
+
+	/* A lookup can only come out slow on a slow mount or one at or under it (that
+	 * shadows it): keep just those, in order, so a lookup scans a handful. */
+	int kept = 0;
+	for (int i = 0; i < PHASYNC_G(nmounts); i++) {
+		phasync_mount *m = &PHASYNC_G(mounts)[i];
+		bool keep = m->slow;
+		for (int j = 0; j < PHASYNC_G(nmounts) && !keep; j++) {
+			phasync_mount *s = &PHASYNC_G(mounts)[j];
+			keep = s->slow && strncmp(m->path, s->path, s->len) == 0
+				&& (m->path[s->len] == '/' || m->path[s->len] == '\0' || s->len == 1);
+		}
+		if (keep) {
+			PHASYNC_G(mounts)[kept++] = *m;
+		} else {
+			free(m->path);
+		}
+	}
+	PHASYNC_G(nmounts) = kept;
 }
 
 /* Is this absolute path offloaded? Under the network policy: when the mount it
@@ -3891,6 +3935,38 @@ static bool phasync_fs_offloaded(const char *path)
 		}
 	}
 	return best >= 0 && PHASYNC_G(mounts)[best].slow;
+}
+
+/* Do reads and writes on this descriptor go to the pool? It must be a regular
+ * file and, under the network policy, on a network/FUSE mount (matched by its
+ * device). A read of a file on a local disk runs inline like its metadata calls:
+ * served from the page cache it takes about a microsecond, a pool round trip
+ * tens. No syscall at all while no slow filesystem is mounted. */
+static bool phasync_fs_fd_offloaded(php_socket_t fd)
+{
+	struct stat st;
+
+	if (PHASYNC_G(fs_offload) == PHASYNC_FS_OFFLOAD_NONE) {
+		return false;
+	}
+	if (PHASYNC_G(fs_offload) == PHASYNC_FS_OFFLOAD_NETWORK) {
+		phasync_mounts_refresh();
+		if (!PHASYNC_G(any_slow_mount)) {
+			return false;
+		}
+	}
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+		return false;
+	}
+	if (PHASYNC_G(fs_offload) == PHASYNC_FS_OFFLOAD_ALL) {
+		return true;
+	}
+	for (int i = 0; i < PHASYNC_G(nmounts); i++) {
+		if (PHASYNC_G(mounts)[i].slow && PHASYNC_G(mounts)[i].dev == st.st_dev) {
+			return true;
+		}
+	}
+	return false;
 }
 
 /* Copy a plain local path argument into out (PATH_MAX), made absolute. Returns
@@ -6710,6 +6786,7 @@ static ZEND_INI_MH(phasync_update_fs_offload)
 	} else {
 		return FAILURE;
 	}
+	PHASYNC_G(fs_inline) = NULL;         /* decided under the old policy */
 	return SUCCESS;
 }
 
@@ -6871,7 +6948,8 @@ static void phasync_wrap_existing_streams(bool include_files)
 		}
 		if (S_ISSOCK(st.st_mode) || S_ISFIFO(st.st_mode) || S_ISCHR(st.st_mode)) {
 			phasync_wrap_stream(stream, PHASYNC_MODE_RAW);   /* idempotent */
-		} else if (include_files && S_ISREG(st.st_mode) && stream->ops == &php_stream_stdio_ops) {
+		} else if (include_files && S_ISREG(st.st_mode) && stream->ops == &php_stream_stdio_ops
+		        && phasync_fs_fd_offloaded(fd)) {
 			phasync_wrap_stream(stream, PHASYNC_MODE_POOL);
 		}
 	} ZEND_HASH_FOREACH_END();

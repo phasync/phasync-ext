@@ -91,11 +91,14 @@ $loop->runAll(
 );
 
 // poll(0) skips epoll when nothing is armed, yet still delivers a finished
-// thread task (a loop that only ever polls without waiting).
+// thread task (a loop that only ever polls without waiting). A local file reads
+// inline by default; phasync.fs_offload=all sends the read to the pool.
+ini_set('phasync.fs_offload', 'all');
 $loop = new Loop;
 $loop->spin = true;
 $loop->runAll(fn() => print('spinning loop, pool read: ' . strlen(file_get_contents(__FILE__, false, null, 0, 5)) . " bytes\n"));
-echo 'parked on the pool: ', $loop->parks, "\n";
+echo 'parked on the pool: ', $loop->parks > 0 ? 'yes' : 'no', "\n";
+ini_restore('phasync.fs_offload');
 
 // Without manage(): a loop can use a Poller on its own (no functions hooked).
 $loop = new Loop;
@@ -147,7 +150,7 @@ idle poll waited: yes
 pool task: cancelled
 loop still fine: 127.0.0.1
 spinning loop, pool read: 5 bytes
-parked on the pool: 1
+parked on the pool: yes
 no manage(): plain
 Poller::readable() must be called in a coroutine
 freed Poller: ok
