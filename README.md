@@ -12,7 +12,8 @@ libraries, no changes to your code:
   busy, waiting on them with epoll: at 50,000 connections a hello-world server handled 2 to 4
   times as many requests per second as with PHP's own `stream_select()`.
 
-`composer require phasync/phasync-ext` installs prebuilt binaries; nothing to compile.
+`composer require phasync/phasync-ext` installs prebuilt binaries; nothing to compile. MIT, no
+dependencies: [the Ennerd philosophy](PHILOSOPHY.md).
 
 ---
 
