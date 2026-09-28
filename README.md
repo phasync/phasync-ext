@@ -3,14 +3,14 @@
 [![CI](https://github.com/phasync/phasync-ext/actions/workflows/ci.yml/badge.svg)](https://github.com/phasync/phasync-ext/actions/workflows/ci.yml)
 
 **Make the PHP you already have cooperate.** Inside a [phasync](https://github.com/phasync/phasync)
-coroutine, a PDO query, a Guzzle request or a `file_get_contents()` call waits as a coroutine
+coroutine, a MySQL query through PDO, a Guzzle request or a `file_get_contents()` call waits as a coroutine
 instead of blocking the process, and returns exactly what PHP would have returned. No new client
 libraries, no changes to your code:
 
 - **Under PHP-FPM**, one request overlaps its database queries, API calls and file work.
 - **Under [swerve](https://github.com/phasync/swerve)**, a worker keeps thousands of connections
-  busy, waiting on them with epoll: at 50,000 connections a hello-world server handled 4 times
-  as many requests per second as with PHP's own `stream_select()`.
+  busy, waiting on them with epoll: at 50,000 connections a hello-world server handled 2 to 4
+  times as many requests per second as with PHP's own `stream_select()`.
 
 `composer require phasync/phasync-ext` installs prebuilt binaries; nothing to compile.
 
