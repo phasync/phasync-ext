@@ -55,6 +55,10 @@
 #endif
 #include "ext/standard/php_dns.h"
 #include "ext/standard/php_filestat.h"
+#include "ext/standard/basic_functions.h"
+#include "rfc1867.h"
+#include "zend_observer.h"
+#include "zend_fibers.h"
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -167,8 +171,68 @@ typedef struct phasync_scope {
 	struct phasync_scope *prev;
 } phasync_scope;
 
+/* The per-request state a virtualize() boundary gets its own copy of: PHP's
+ * output layer, the SAPI's response headers and request body, user-abort state
+ * and shutdown functions. Each entry is (field, the live global it mirrors); the
+ * field takes the global's type, so PHP versions differing in types need no
+ * #ifs, only the fields that exist differ. */
+#if PHP_VERSION_ID >= 80600
+# define PHASYNC_VSTATE_HEADER_CB(X) X(send_header_fcc, SG(send_header_fcc))
+#else
+# define PHASYNC_VSTATE_HEADER_CB(X) X(callback_func, SG(callback_func)) X(fci_cache, SG(fci_cache))
+#endif
+#if PHP_VERSION_ID >= 80400
+# define PHASYNC_VSTATE_PARSE_BODY(X) X(parse_body, SG(request_parse_body_context))
+#else
+# define PHASYNC_VSTATE_PARSE_BODY(X)
+#endif
+#define PHASYNC_VSTATE_FIELDS(X) \
+	X(ob_handlers,        OG(handlers)) \
+	X(ob_active,          OG(active)) \
+	X(ob_running,         OG(running)) \
+	X(ob_start_file,      OG(output_start_filename)) \
+	X(ob_start_line,      OG(output_start_lineno)) \
+	X(ob_flags,           OG(flags)) \
+	X(headers,            SG(sapi_headers)) \
+	X(headers_sent,       SG(headers_sent)) \
+	PHASYNC_VSTATE_HEADER_CB(X) \
+	X(read_post_bytes,    SG(read_post_bytes)) \
+	X(post_read,          SG(post_read)) \
+	X(uploaded_files,     SG(rfc1867_uploaded_files)) \
+	X(request_body,       SG(request_info).request_body) \
+	X(request_method,     SG(request_info).request_method) \
+	X(content_type,       SG(request_info).content_type) \
+	X(content_type_dup,   SG(request_info).content_type_dup) \
+	X(content_length,     SG(request_info).content_length) \
+	X(headers_only,       SG(request_info).headers_only) \
+	X(no_headers,         SG(request_info).no_headers) \
+	X(post_entry,         SG(request_info).post_entry) \
+	X(proto_num,          SG(request_info).proto_num) \
+	PHASYNC_VSTATE_PARSE_BODY(X) \
+	X(connection_status,  PG(connection_status)) \
+	X(ignore_user_abort,  PG(ignore_user_abort)) \
+	X(shutdown_functions, BG(user_shutdown_function_names)) \
+	X(error_handler,      EG(user_error_handler)) \
+	X(error_handler_mask, EG(user_error_handler_error_reporting)) \
+	X(error_handlers,     EG(user_error_handlers)) \
+	X(error_handlers_mask, EG(user_error_handlers_error_reporting)) \
+	X(exception_handler,  EG(user_exception_handler)) \
+	X(exception_handlers, EG(user_exception_handlers))
+
+typedef struct phasync_vstate {
+#define PHASYNC_VSTATE_DECL(name, live) __typeof__(live) name;
+	PHASYNC_VSTATE_FIELDS(PHASYNC_VSTATE_DECL)
+#undef PHASYNC_VSTATE_DECL
+} phasync_vstate;
+
+struct phasync_boundary;
+
 ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	phasync_scope *scope_top;     /* innermost active manage() scope, or NULL */
+	struct phasync_boundary *vb_cur; /* virtualize(): boundary whose state is live; NULL = the SAPI's */
+	phasync_vstate vroot;         /* the SAPI's own state while a boundary's is live */
+	HashTable vfibers;            /* (uintptr_t)zend_fiber_context -> its boundary (members only) */
+	uint32_t vcount;              /* live boundaries; 0 = the fiber observers return at once */
 	php_stream_transport_factory orig_tcp;
 	php_stream_transport_factory orig_unix;
 	php_stream_transport_factory orig_udp;
@@ -202,6 +266,9 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_sem_acquire)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_curl_exec)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_msg_receive)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_exit)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_connection_aborted)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_connection_status)(INTERNAL_FUNCTION_PARAMETERS);
 	zif_handler orig_sock[8];
 	HashTable sock_hooks;         /* (uintptr_t)zend_function -> index in phasync_sock_funcs */
 	phasync_spawn *spawn;         /* armed by an exec-family call until its pipe is seen */
@@ -4569,6 +4636,592 @@ cancelled:
 	zval_ptr_dtor(&mh);
 }
 
+/* ---- virtualize(): a per-request SAPI -------------------------------------
+ *
+ * A boundary gives the code it runs, and every fiber started inside it, its own
+ * copy of the per-request state PHP otherwise keeps once per process
+ * (PHASYNC_VSTATE_FIELDS): the output buffers, the response headers and status,
+ * header_register_callback(), the request body behind php://input, user-abort
+ * state and shutdown functions. The fiber observers swap that state in and out
+ * when execution moves between boundaries, so PHP's own functions (echo, ob_*,
+ * header(), headers_list(), request_parse_body(), ...) run unchanged. What
+ * leaves a boundary goes where a SAPI's would, through the SAPI callbacks, to
+ * the $sapi object: ub_write(), send_headers(), flush(), read_post().
+ *
+ * A fiber belongs to the boundary of the fiber that starts it (the init
+ * observer runs in Fiber::start()). The $sapi methods run with the SAPI's own
+ * state live, so their output and errors never re-enter the boundary; while one
+ * is suspended, its fiber counts as outside. */
+
+typedef struct phasync_boundary {
+	uint32_t refcount;            /* the virtualize() call + one per member fiber      */
+	bool finalizing;              /* the end sequence is running                       */
+	bool ended;                   /* over: stray fibers' output is discarded           */
+	zend_fiber_context *owner;    /* the context running the virtualize() call         */
+	int exit_status;              /* EG(exit_status) to restore: an exit() here is the */
+	                              /* request's, not the worker's                       */
+	zval sapi;
+	zend_function *m_ub_write, *m_send_headers, *m_flush, *m_read_post, *m_exit,
+		*m_connection_aborted;
+	php_stream *body_seen;        /* the body stream read_post() last filled...        */
+	HashTable *bodies_replaced;   /* ...and earlier ones PHP replaced (each            */
+	                              /* request_parse_body() starts a new one), to free   */
+	phasync_vstate st;            /* this boundary's state while it is not live        */
+} phasync_boundary;
+
+#define PHASYNC_VKEY(ctx) ((zend_ulong) (uintptr_t) (ctx))
+
+static zend_always_inline phasync_boundary *phasync_v_of(zend_fiber_context *ctx)
+{
+	return zend_hash_index_find_ptr(&PHASYNC_G(vfibers), PHASYNC_VKEY(ctx));
+}
+
+/* Make b's state (NULL: the SAPI's own) the live one. */
+static void phasync_v_install(phasync_boundary *b)
+{
+	phasync_boundary *cur = PHASYNC_G(vb_cur);
+	phasync_vstate *st;
+
+	if (b == cur) {
+		return;
+	}
+	st = cur ? &cur->st : &PHASYNC_G(vroot);
+#define PHASYNC_VSTATE_SAVE(name, live) st->name = live;
+	PHASYNC_VSTATE_FIELDS(PHASYNC_VSTATE_SAVE)
+#undef PHASYNC_VSTATE_SAVE
+	st = b ? &b->st : &PHASYNC_G(vroot);
+#define PHASYNC_VSTATE_LOAD(name, live) live = st->name;
+	PHASYNC_VSTATE_FIELDS(PHASYNC_VSTATE_LOAD)
+#undef PHASYNC_VSTATE_LOAD
+	PHASYNC_G(vb_cur) = b;
+}
+
+/* A fresh request's state, as sapi_activate() and php_output_activate() leave it. */
+static void phasync_vstate_init(phasync_vstate *st)
+{
+	memset(st, 0, sizeof(*st));
+	zend_stack_init(&st->ob_handlers, sizeof(php_output_handler *));
+	st->ob_flags = PHP_OUTPUT_ACTIVATED;
+	zend_llist_init(&st->headers.headers, sizeof(sapi_header_struct),
+		(void (*)(void *)) sapi_free_header, 0);
+	st->headers.http_response_code = 200;
+	st->headers.send_default_content_type = 1;
+#if PHP_VERSION_ID >= 80600
+	st->send_header_fcc = empty_fcall_info_cache;
+#else
+	ZVAL_UNDEF(&st->callback_func);
+	st->fci_cache = empty_fcall_info_cache;
+#endif
+	st->proto_num = 1000;
+	st->ignore_user_abort = PG(ignore_user_abort);   /* the ini setting */
+	ZVAL_UNDEF(&st->error_handler);
+	ZVAL_UNDEF(&st->exception_handler);
+	zend_stack_init(&st->error_handlers_mask, sizeof(int));
+	zend_stack_init(&st->error_handlers, sizeof(zval));
+	zend_stack_init(&st->exception_handlers, sizeof(zval));
+}
+
+/* php://input handles point at a body stream without a reference (its
+ * php_stream_input_t starts with that pointer): close the ones on this body
+ * before freeing it, so one kept past the request fails cleanly as a closed
+ * resource instead of reading freed memory. */
+static void phasync_v_free_body(php_stream *body)
+{
+	zend_resource *res;
+	int le = php_file_le_stream();
+
+	ZEND_HASH_FOREACH_PTR(&EG(regular_list), res) {
+		php_stream *s;
+		if (res && res->type == le && (s = res->ptr) && s->abstract && s->ops && s->ops->label
+		 && strcmp(s->ops->label, "Input") == 0 && *(php_stream **) s->abstract == body) {
+			php_stream_free(s, PHP_STREAM_FREE_CLOSE | PHP_STREAM_FREE_KEEP_RSRC);   /* as fclose() */
+		}
+	} ZEND_HASH_FOREACH_END();
+	php_stream_free(body, PHP_STREAM_FREE_CLOSE);
+}
+
+/* Free what a boundary's state owns. It is not live, so this works on the fields. */
+static void phasync_vstate_free(phasync_vstate *st)
+{
+	php_output_handler **h;
+
+	while ((h = zend_stack_top(&st->ob_handlers)) != NULL) {
+		php_output_handler_free(h);
+		zend_stack_del_top(&st->ob_handlers);
+	}
+	zend_stack_destroy(&st->ob_handlers);
+	if (st->ob_start_file) {
+		zend_string_release(st->ob_start_file);
+	}
+	zend_llist_destroy(&st->headers.headers);
+	if (st->headers.mimetype) {
+		efree(st->headers.mimetype);
+	}
+	if (st->headers.http_status_line) {
+		efree(st->headers.http_status_line);
+	}
+#if PHP_VERSION_ID >= 80600
+	if (ZEND_FCC_INITIALIZED(st->send_header_fcc)) {
+		zend_fcc_dtor(&st->send_header_fcc);
+	}
+#else
+	zval_ptr_dtor(&st->callback_func);
+#endif
+	if (st->shutdown_functions) {
+		zend_hash_destroy(st->shutdown_functions);
+		FREE_HASHTABLE(st->shutdown_functions);
+	}
+	zval_ptr_dtor(&st->error_handler);
+	zval_ptr_dtor(&st->exception_handler);
+	zend_stack_clean(&st->error_handlers_mask, NULL, 1);
+	zend_stack_clean(&st->error_handlers, (void (*)(void *)) ZVAL_PTR_DTOR, 1);
+	zend_stack_clean(&st->exception_handlers, (void (*)(void *)) ZVAL_PTR_DTOR, 1);
+	if (st->uploaded_files) {           /* deletes the temp files not moved away */
+		HashTable *live = SG(rfc1867_uploaded_files);
+		SG(rfc1867_uploaded_files) = st->uploaded_files;
+		destroy_uploaded_files_hash();
+		SG(rfc1867_uploaded_files) = live;
+	}
+	if (st->request_body) {
+		phasync_v_free_body(st->request_body);
+	}
+	if (st->content_type_dup) {
+		efree(st->content_type_dup);
+	}
+	/* Set from request_info(): owned copies. */
+	if (st->request_method) {
+		efree((char *) st->request_method);
+	}
+	if (st->content_type) {
+		efree((char *) st->content_type);
+	}
+}
+
+static void phasync_v_release(phasync_boundary *b)
+{
+	if (--b->refcount == 0) {
+		if (b->bodies_replaced) {
+			php_stream *body;
+			ZEND_HASH_FOREACH_PTR(b->bodies_replaced, body) {
+				phasync_v_free_body(body);
+			} ZEND_HASH_FOREACH_END();
+			zend_hash_destroy(b->bodies_replaced);
+			FREE_HASHTABLE(b->bodies_replaced);
+		}
+		phasync_vstate_free(&b->st);
+		zval_ptr_dtor(&b->sapi);
+		efree(b);
+		PHASYNC_G(vcount)--;
+	}
+}
+
+/* Call a $sapi method with the SAPI's own state live. A pending exception (output
+ * during unwinding) is set aside for the call and chained after it. */
+static void phasync_v_call(phasync_boundary *b, zend_function *fn, zval *rv, uint32_t argc, zval *argv)
+{
+	zend_ulong key = PHASYNC_VKEY(EG(current_fiber_context));
+	zend_object *ex = EG(exception);
+	bool member = zend_hash_index_del(&PHASYNC_G(vfibers), key) == SUCCESS;
+
+	EG(exception) = NULL;
+	phasync_v_install(NULL);
+	ZVAL_UNDEF(rv);
+	zend_call_known_instance_method(fn, Z_OBJ(b->sapi), rv, argc, argv);
+	if (member) {
+		zend_hash_index_add_new_ptr(&PHASYNC_G(vfibers), key, b);
+		phasync_v_install(b);
+	}
+	if (ex) {
+		if (EG(exception)) {
+			zend_exception_set_previous(EG(exception), ex);
+		} else {
+			EG(exception) = ex;
+		}
+	}
+}
+
+/* ---- fiber observers ---- */
+
+static void phasync_v_fiber_init(zend_fiber_context *ctx)
+{
+	phasync_boundary *b;
+	if (PHASYNC_G(vcount) && (b = phasync_v_of(EG(current_fiber_context)))) {
+		zend_hash_index_add_new_ptr(&PHASYNC_G(vfibers), PHASYNC_VKEY(ctx), b);
+		b->refcount++;
+	}
+}
+
+static void phasync_v_fiber_switch(zend_fiber_context *from, zend_fiber_context *to)
+{
+	if (PHASYNC_G(vcount)) {
+		phasync_v_install(phasync_v_of(to));
+		/* A fiber that ended by exit() (phasync_v_before_exit()) leaves no result;
+		 * make getReturn() give null, as for a fiber that returned nothing. */
+		if (from->status == ZEND_FIBER_STATUS_DEAD && from->kind == zend_ce_fiber) {
+			zend_fiber *f = (zend_fiber *) ((char *) from - XtOffsetOf(zend_fiber, context));
+			if ((f->flags & ZEND_FIBER_FLAG_DESTROYED) && Z_ISUNDEF(f->result)) {
+				ZVAL_NULL(&f->result);
+			}
+		}
+	}
+}
+
+static void phasync_v_fiber_destroy(zend_fiber_context *ctx)
+{
+	phasync_boundary *b;
+	if (PHASYNC_G(vcount) && (b = phasync_v_of(ctx))) {
+		zend_hash_index_del(&PHASYNC_G(vfibers), PHASYNC_VKEY(ctx));
+		phasync_v_release(b);
+	}
+}
+
+/* ---- SAPI callbacks, routed to the live boundary's $sapi ---- */
+
+static size_t (*phasync_v_ub_write_prev)(const char *str, size_t len);
+static int (*phasync_v_send_headers_prev)(sapi_headers_struct *h);
+static void (*phasync_v_flush_prev)(void *server_context);
+static size_t (*phasync_v_read_post_prev)(char *buf, size_t len);
+static int (*phasync_v_header_handler_prev)(sapi_header_struct *h, sapi_header_op_enum op, sapi_headers_struct *hs);
+
+static void phasync_v_before_exit(zval *status);
+
+/* The client is gone: what php_handle_aborted_connection() does, except that
+ * ending the request ends only the boundary (through exit()) and not the worker. */
+static void phasync_v_aborted(void)
+{
+	PG(connection_status) = PHP_CONNECTION_ABORTED;
+	php_output_set_status(PHP_OUTPUT_DISABLED);
+	if (!PG(ignore_user_abort) && !EG(exception)) {
+		phasync_v_before_exit(NULL);
+		zend_throw_unwind_exit();
+	}
+}
+
+static size_t phasync_v_ub_write(const char *str, size_t len)
+{
+	phasync_boundary *b = PHASYNC_G(vb_cur);
+	zval arg, rv;
+
+	if (!b) {
+		return phasync_v_ub_write_prev(str, len);
+	}
+	if (b->ended) {
+		return len;
+	}
+	ZVAL_STRINGL(&arg, str, len);
+	phasync_v_call(b, b->m_ub_write, &rv, 1, &arg);
+	zval_ptr_dtor(&arg);
+	if (Z_TYPE(rv) == IS_FALSE) {
+		phasync_v_aborted();
+	}
+	zval_ptr_dtor(&rv);
+	return len;
+}
+
+static int phasync_v_send_headers(sapi_headers_struct *h)
+{
+	phasync_boundary *b = PHASYNC_G(vb_cur);
+	zend_llist_position pos;
+	sapi_header_struct *hdr;
+	zval args[3], rv;
+
+	if (!b) {
+		return phasync_v_send_headers_prev ? phasync_v_send_headers_prev(h) : SAPI_HEADER_DO_SEND;
+	}
+	if (b->ended) {
+		return SAPI_HEADER_SENT_SUCCESSFULLY;
+	}
+	ZVAL_LONG(&args[0], h->http_response_code);
+	if (h->http_status_line) {
+		ZVAL_STRING(&args[1], h->http_status_line);
+	} else {
+		ZVAL_NULL(&args[1]);
+	}
+	array_init_size(&args[2], zend_llist_count(&h->headers));
+	for (hdr = zend_llist_get_first_ex(&h->headers, &pos); hdr; hdr = zend_llist_get_next_ex(&h->headers, &pos)) {
+		add_next_index_stringl(&args[2], hdr->header, hdr->header_len);
+	}
+	phasync_v_call(b, b->m_send_headers, &rv, 3, args);
+	zval_ptr_dtor(&args[1]);
+	zval_ptr_dtor(&args[2]);
+	zval_ptr_dtor(&rv);
+	return SAPI_HEADER_SENT_SUCCESSFULLY;
+}
+
+static void phasync_v_flush(void *server_context)
+{
+	phasync_boundary *b = PHASYNC_G(vb_cur);
+	zval rv;
+
+	if (!b) {
+		if (phasync_v_flush_prev) {
+			phasync_v_flush_prev(server_context);
+		}
+		return;
+	}
+	if (b->m_flush && !b->ended) {
+		phasync_v_call(b, b->m_flush, &rv, 0, NULL);
+		zval_ptr_dtor(&rv);
+	}
+}
+
+/* Like a SAPI's read_post: up to len bytes, fewer only at the end of the body. */
+static size_t phasync_v_read_post(char *buf, size_t len)
+{
+	phasync_boundary *b = PHASYNC_G(vb_cur);
+	size_t n = 0;
+	zval arg, rv;
+
+	if (!b) {
+		return phasync_v_read_post_prev ? phasync_v_read_post_prev(buf, len) : 0;
+	}
+	if (!b->m_read_post || b->ended) {
+		return 0;
+	}
+	if (b->body_seen != SG(request_info).request_body) {
+		if (b->body_seen) {
+			if (!b->bodies_replaced) {
+				ALLOC_HASHTABLE(b->bodies_replaced);
+				zend_hash_init(b->bodies_replaced, 2, NULL, NULL, 0);
+			}
+			zend_hash_next_index_insert_ptr(b->bodies_replaced, b->body_seen);
+		}
+		b->body_seen = SG(request_info).request_body;
+	}
+	ZVAL_LONG(&arg, (zend_long) len);
+	phasync_v_call(b, b->m_read_post, &rv, 1, &arg);
+	if (Z_TYPE(rv) == IS_STRING) {
+		n = MIN(len, Z_STRLEN(rv));
+		memcpy(buf, Z_STRVAL(rv), n);
+	}
+	zval_ptr_dtor(&rv);
+	return n;
+}
+
+/* Installed only if the SAPI has one: headers set in a boundary are the
+ * boundary's, so the SAPI's own handler doesn't see them. */
+static int phasync_v_header_handler(sapi_header_struct *h, sapi_header_op_enum op, sapi_headers_struct *hs)
+{
+	return PHASYNC_G(vb_cur) ? SAPI_HEADER_ADD : phasync_v_header_handler_prev(h, op, hs);
+}
+
+/* ---- exit(), die(), connection_aborted(), connection_status() ---- */
+
+/* An exit() inside a boundary ends the request, not the worker. PHP unwinds it as
+ * an uncatchable exception; in the fiber running virtualize(), virtualize()
+ * stops it. In a fiber started inside the boundary it would reach whoever resumed
+ * that fiber (the event loop), so the fiber is marked as being destroyed, which
+ * makes it end quietly (zend_fiber_execute() drops an exit unwinding a destroyed
+ * fiber), and $sapi->exit() is told, so the server can cancel the request. */
+static void phasync_v_before_exit(zval *status)
+{
+	phasync_boundary *b = PHASYNC_G(vb_cur);
+	zval arg, rv;
+
+	if (!b || b->finalizing || b->ended) {
+		return;
+	}
+	if (b->m_exit) {
+		if (status && (Z_TYPE_P(status) == IS_STRING || Z_TYPE_P(status) == IS_LONG)) {
+			ZVAL_COPY(&arg, status);
+		} else {
+			ZVAL_LONG(&arg, 0);
+		}
+		phasync_v_call(b, b->m_exit, &rv, 1, &arg);
+		zval_ptr_dtor(&arg);
+		zval_ptr_dtor(&rv);
+	}
+	if (EG(current_fiber_context) != b->owner && EG(active_fiber)) {
+		EG(active_fiber)->flags |= ZEND_FIBER_FLAG_DESTROYED;
+	}
+}
+
+#if PHP_VERSION_ID >= 80400
+static ZEND_NAMED_FUNCTION(phasync_exit_override)
+{
+	if (PHASYNC_G(vb_cur)) {
+		phasync_v_before_exit(ZEND_CALL_NUM_ARGS(execute_data) ? ZEND_CALL_ARG(execute_data, 1) : NULL);
+	}
+	PHASYNC_G(orig_exit)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+#else
+/* Before 8.4, exit is the ZEND_EXIT opcode. */
+static user_opcode_handler_t phasync_exit_opcode_prev;
+
+static int phasync_exit_opcode(zend_execute_data *execute_data)
+{
+	if (PHASYNC_G(vb_cur)) {
+		const zend_op *opline = EX(opline);
+		phasync_v_before_exit(opline->op1_type == IS_UNUSED ? NULL
+			: zend_get_zval_ptr(opline, opline->op1_type, &opline->op1, execute_data));
+	}
+	return phasync_exit_opcode_prev ? phasync_exit_opcode_prev(execute_data) : ZEND_USER_OPCODE_DISPATCH;
+}
+#endif
+
+/* A server may know the client left before any write fails. */
+static void phasync_v_ask_aborted(void)
+{
+	phasync_boundary *b = PHASYNC_G(vb_cur);
+	zval rv;
+
+	if (b && b->m_connection_aborted && !b->ended && !(PG(connection_status) & PHP_CONNECTION_ABORTED)) {
+		phasync_v_call(b, b->m_connection_aborted, &rv, 0, NULL);
+		if (zend_is_true(&rv)) {
+			PG(connection_status) |= PHP_CONNECTION_ABORTED;
+		}
+		zval_ptr_dtor(&rv);
+	}
+}
+
+static ZEND_NAMED_FUNCTION(phasync_connection_aborted_override)
+{
+	phasync_v_ask_aborted();
+	PHASYNC_G(orig_connection_aborted)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+static ZEND_NAMED_FUNCTION(phasync_connection_status_override)
+{
+	phasync_v_ask_aborted();
+	PHASYNC_G(orig_connection_status)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+/* ---- virtualize() ---- */
+
+/* request_info(): ['method' => ..., 'content_type' => ..., 'content_length' => ...]
+ * describes the request body, as a SAPI's request_info does. */
+static void phasync_v_request_info(phasync_boundary *b, zend_function *fn)
+{
+	zval rv, *v;
+
+	phasync_v_call(b, fn, &rv, 0, NULL);
+	if (Z_TYPE(rv) == IS_ARRAY) {
+		if ((v = zend_hash_str_find_deref(Z_ARRVAL(rv), ZEND_STRL("method"))) && Z_TYPE_P(v) == IS_STRING) {
+			b->st.request_method = estrndup(Z_STRVAL_P(v), Z_STRLEN_P(v));
+			b->st.headers_only = strcasecmp(b->st.request_method, "HEAD") == 0;
+		}
+		if ((v = zend_hash_str_find_deref(Z_ARRVAL(rv), ZEND_STRL("content_type"))) && Z_TYPE_P(v) == IS_STRING) {
+			b->st.content_type = estrndup(Z_STRVAL_P(v), Z_STRLEN_P(v));
+		}
+		if ((v = zend_hash_str_find_deref(Z_ARRVAL(rv), ZEND_STRL("content_length"))) && Z_TYPE_P(v) == IS_LONG) {
+			b->st.content_length = Z_LVAL_P(v);
+		}
+	}
+	zval_ptr_dtor(&rv);
+}
+
+/* The end of a request, in php_request_shutdown()'s order: shutdown functions,
+ * the output buffers flushed (removable or not), then the headers if no output
+ * sent them. Runs with the boundary live, in the virtualize() call's fiber. */
+static void phasync_v_finalize(phasync_boundary *b)
+{
+	zend_object *ex = EG(exception);
+
+	EG(exception) = NULL;
+	b->finalizing = true;
+	php_call_shutdown_functions();
+	if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+		zend_clear_exception();       /* exit() in a shutdown function */
+	}
+	php_free_shutdown_functions();
+	if (!EG(exception)) {
+		php_output_end_all();
+	}
+	if (!EG(exception) && !SG(headers_sent)) {
+		sapi_send_headers();
+	}
+	php_output_set_status(PHP_OUTPUT_DISABLED);
+	b->ended = true;
+	EG(exit_status) = b->exit_status;
+	if (ex) {
+		if (EG(exception)) {
+			zend_exception_set_previous(EG(exception), ex);
+		} else {
+			EG(exception) = ex;
+		}
+	}
+}
+
+ZEND_FUNCTION(phasync_ext_virtualize)
+{
+	zval *code, *sapi, retval;
+	zend_class_entry *ce;
+	phasync_boundary *b;
+	zend_fiber_context *ctx = EG(current_fiber_context);
+	zend_function *m_request_info;
+	bool bailout = false;
+
+	ZEND_PARSE_PARAMETERS_START(2, 2)
+		Z_PARAM_OBJECT_OF_CLASS(code, zend_ce_closure)
+		Z_PARAM_OBJECT(sapi)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (PHASYNC_G(vb_cur)) {
+		zend_throw_error(NULL, "phasync\\ext\\virtualize() cannot be nested");
+		RETURN_THROWS();
+	}
+	ce = Z_OBJCE_P(sapi);
+	b = ecalloc(1, sizeof(*b));
+#define PHASYNC_V_METHOD(name) zend_hash_str_find_ptr_lc(&ce->function_table, ZEND_STRL(name))
+	b->m_ub_write = PHASYNC_V_METHOD("ub_write");
+	b->m_send_headers = PHASYNC_V_METHOD("send_headers");
+	b->m_flush = PHASYNC_V_METHOD("flush");
+	b->m_read_post = PHASYNC_V_METHOD("read_post");
+	b->m_exit = PHASYNC_V_METHOD("exit");
+	b->m_connection_aborted = PHASYNC_V_METHOD("connection_aborted");
+	m_request_info = PHASYNC_V_METHOD("request_info");
+#undef PHASYNC_V_METHOD
+	if (!b->m_ub_write || !b->m_send_headers) {
+		efree(b);
+		zend_argument_value_error(2, "must have the methods ub_write() and send_headers()");
+		RETURN_THROWS();
+	}
+	b->refcount = 2;                  /* this call + the calling fiber's membership */
+	b->owner = ctx;
+	b->exit_status = EG(exit_status);
+	ZVAL_COPY(&b->sapi, sapi);
+	phasync_vstate_init(&b->st);
+	PHASYNC_G(vcount)++;
+	if (m_request_info) {
+		phasync_v_request_info(b, m_request_info);
+	}
+	zend_hash_index_add_new_ptr(&PHASYNC_G(vfibers), PHASYNC_VKEY(ctx), b);
+
+	ZVAL_UNDEF(&retval);
+	if (!EG(exception)) {
+		phasync_v_install(b);
+		zend_try {
+			call_user_function(NULL, NULL, code, &retval, 0, NULL);
+			if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+				zend_clear_exception();   /* exit(): the request ends here */
+			} else if (EG(exception) && !zend_is_graceful_exit(EG(exception))
+			        && Z_TYPE(EG(user_exception_handler)) != IS_UNDEF) {
+				zend_user_exception_handler();   /* uncaught, as at the top of a script */
+			}
+			phasync_v_finalize(b);
+		} zend_catch {
+			bailout = true;
+		} zend_end_try();
+	}
+
+	zend_hash_index_del(&PHASYNC_G(vfibers), PHASYNC_VKEY(ctx));
+	phasync_v_install(NULL);
+	b->ended = true;
+	phasync_v_release(b);             /* membership */
+	phasync_v_release(b);             /* this call */
+	if (bailout) {
+		zend_bailout();
+	}
+	if (EG(exception)) {
+		zval_ptr_dtor(&retval);
+		RETURN_THROWS();
+	}
+	if (Z_TYPE(retval) == IS_UNDEF) {
+		RETURN_NULL();
+	}
+	RETURN_COPY_VALUE(&retval);
+}
+
 /* ---- enable_hooks / disable_hooks ---------------------------------------- */
 
 static zend_internal_function *phasync_find_ifunc(const char *name, size_t len)
@@ -4751,6 +5404,24 @@ static void phasync_install_hooks(void)
 		PHASYNC_G(orig_fopen) = f->handler;
 		f->handler = phasync_fopen_override;
 	}
+#if PHP_VERSION_ID >= 80400
+	/* die is an alias: its own entry, the same handler. */
+	if ((f = phasync_find_ifunc("exit", sizeof("exit") - 1))) {
+		PHASYNC_G(orig_exit) = f->handler;
+		f->handler = phasync_exit_override;
+	}
+	if ((f = phasync_find_ifunc("die", sizeof("die") - 1)) && f->handler == PHASYNC_G(orig_exit)) {
+		f->handler = phasync_exit_override;
+	}
+#endif
+	if ((f = phasync_find_ifunc("connection_aborted", sizeof("connection_aborted") - 1))) {
+		PHASYNC_G(orig_connection_aborted) = f->handler;
+		f->handler = phasync_connection_aborted_override;
+	}
+	if ((f = phasync_find_ifunc("connection_status", sizeof("connection_status") - 1))) {
+		PHASYNC_G(orig_connection_status) = f->handler;
+		f->handler = phasync_connection_status_override;
+	}
 	PHASYNC_G(hooks_installed) = 1;
 }
 
@@ -4873,6 +5544,22 @@ static void phasync_restore_hooks(void)
 #endif
 	if (PHASYNC_G(orig_fopen) && (f = phasync_find_ifunc("fopen", sizeof("fopen") - 1))) {
 		f->handler = PHASYNC_G(orig_fopen);
+	}
+#if PHP_VERSION_ID >= 80400
+	if (PHASYNC_G(orig_exit)) {
+		if ((f = phasync_find_ifunc("exit", sizeof("exit") - 1))) {
+			f->handler = PHASYNC_G(orig_exit);
+		}
+		if ((f = phasync_find_ifunc("die", sizeof("die") - 1)) && f->handler == phasync_exit_override) {
+			f->handler = PHASYNC_G(orig_exit);
+		}
+	}
+#endif
+	if (PHASYNC_G(orig_connection_aborted) && (f = phasync_find_ifunc("connection_aborted", sizeof("connection_aborted") - 1))) {
+		f->handler = PHASYNC_G(orig_connection_aborted);
+	}
+	if (PHASYNC_G(orig_connection_status) && (f = phasync_find_ifunc("connection_status", sizeof("connection_status") - 1))) {
+		f->handler = PHASYNC_G(orig_connection_status);
 	}
 	PHASYNC_G(hooks_installed) = 0;
 }
@@ -5520,6 +6207,28 @@ static PHP_MINIT_FUNCTION(phasync)
 		phasync_ub_write_orig = sapi_module.ub_write;
 		sapi_module.ub_write = phasync_ub_write;
 	}
+	/* virtualize(): route the SAPI callbacks to the live boundary, if any. A
+	 * missing send_headers/flush/read_post behaves as it did (the router falls
+	 * back to what PHP does without one); header_handler is only wrapped if the
+	 * SAPI has one, since PHP checks it for NULL. */
+	phasync_v_ub_write_prev = sapi_module.ub_write;
+	sapi_module.ub_write = phasync_v_ub_write;
+	phasync_v_send_headers_prev = sapi_module.send_headers;
+	sapi_module.send_headers = phasync_v_send_headers;
+	phasync_v_flush_prev = sapi_module.flush;
+	sapi_module.flush = phasync_v_flush;
+	phasync_v_read_post_prev = sapi_module.read_post;
+	sapi_module.read_post = phasync_v_read_post;
+	if ((phasync_v_header_handler_prev = sapi_module.header_handler)) {
+		sapi_module.header_handler = phasync_v_header_handler;
+	}
+	zend_observer_fiber_init_register(phasync_v_fiber_init);
+	zend_observer_fiber_switch_register(phasync_v_fiber_switch);
+	zend_observer_fiber_destroy_register(phasync_v_fiber_destroy);
+#if PHP_VERSION_ID < 80400
+	phasync_exit_opcode_prev = zend_get_user_opcode_handler(ZEND_EXIT);
+	zend_set_user_opcode_handler(ZEND_EXIT, phasync_exit_opcode);
+#endif
 	return SUCCESS;
 }
 
@@ -5542,6 +6251,7 @@ static PHP_GINIT_FUNCTION(phasync)
 	zend_hash_init(&phasync_globals->wrapped_ops_cache, 8, NULL, phasync_ops_dtor, 1);
 	zend_hash_init(&phasync_globals->fs_hooks, 32, NULL, NULL, 1);
 	zend_hash_init(&phasync_globals->sock_hooks, 8, NULL, NULL, 1);
+	zend_hash_init(&phasync_globals->vfibers, 8, NULL, NULL, 1);
 	phasync_globals->mountinfo_fd = -1;
 }
 
@@ -5551,6 +6261,7 @@ static PHP_GSHUTDOWN_FUNCTION(phasync)
 	zend_hash_destroy(&phasync_globals->wrapped_ops_cache);
 	zend_hash_destroy(&phasync_globals->fs_hooks);
 	zend_hash_destroy(&phasync_globals->sock_hooks);
+	zend_hash_destroy(&phasync_globals->vfibers);
 	for (int i = 0; i < phasync_globals->nmounts; i++) {
 		free(phasync_globals->mounts[i].path);
 	}
@@ -5567,6 +6278,16 @@ static PHP_MSHUTDOWN_FUNCTION(phasync)
 	php_stream_stdio_ops.write = phasync_stdio_write_orig;
 	php_stream_stdio_ops.set_option = phasync_stdio_set_option_orig;
 	php_stream_stdio_ops.close = phasync_stdio_close_orig;
+	sapi_module.ub_write = phasync_v_ub_write_prev;
+	sapi_module.send_headers = phasync_v_send_headers_prev;
+	sapi_module.flush = phasync_v_flush_prev;
+	sapi_module.read_post = phasync_v_read_post_prev;
+	if (phasync_v_header_handler_prev) {
+		sapi_module.header_handler = phasync_v_header_handler_prev;
+	}
+#if PHP_VERSION_ID < 80400
+	zend_set_user_opcode_handler(ZEND_EXIT, phasync_exit_opcode_prev);
+#endif
 	if (phasync_ub_write_orig) {
 		sapi_module.ub_write = phasync_ub_write_orig;
 	}
@@ -5619,6 +6340,9 @@ static void phasync_wrap_existing_streams(bool include_files)
 static PHP_RINIT_FUNCTION(phasync)
 {
 	PHASYNC_G(scope_top) = NULL;
+	PHASYNC_G(vb_cur) = NULL;
+	PHASYNC_G(vcount) = 0;
+	zend_hash_clean(&PHASYNC_G(vfibers));
 	PHASYNC_G(spawn) = NULL;
 	PHASYNC_G(ub_writing) = false;
 	PHASYNC_G(no_suspend) = 0;

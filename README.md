@@ -164,6 +164,11 @@ function manage(
     \Closure $sleep,            // (int $microseconds) — wait that long (a timer)
     string   $timeoutException, // what park() throws when its $timeout ran out
 ): mixed;
+
+function virtualize(
+    \Closure $code,             // one request; its return value is returned
+    object   $sapi,             // where its response goes: ub_write(), send_headers(), ...
+): mixed;
 ```
 
 **Waiting.** A coroutine waits by parking in a slot of the event loop: the
@@ -261,6 +266,63 @@ coroutine rendezvous concurrently. After the open, a FIFO honours `O_NONBLOCK`, 
 its reads/writes use the ordinary readiness path. If phasync times out or cancels
 the coroutine, the extension `pthread_cancel`s the thread stuck in `open()`
 (cancellation is scoped to that one syscall) and reaps it, so nothing leaks.
+
+### One request per boundary: `virtualize()`
+
+A server running many requests concurrently in one worker can let ordinary PHP
+code use `echo`, `header()` and friends: `virtualize($code, $sapi)` runs `$code`
+as a request of its own. It, and every fiber started from inside it (a fiber
+belongs to the boundary of the fiber that calls its `start()`; phasync starts a
+coroutine from the fiber creating it), get their own copy of the per-request
+state PHP otherwise keeps once per process:
+
+| Functions | State |
+|---|---|
+| `echo`, `print`, `ob_*()` | the output buffers |
+| `header()`, `header_remove()`, `headers_list()`, `headers_sent()`, `http_response_code()`, `setcookie()`, session cookies | the response headers and status |
+| `header_register_callback()` | the header callback |
+| `php://input`, `request_parse_body()`, `is_uploaded_file()`, `move_uploaded_file()` | the request body and uploads |
+| `connection_aborted()`, `connection_status()`, `ignore_user_abort()` | user-abort state |
+| `register_shutdown_function()` | the shutdown functions |
+| `set_error_handler()`, `set_exception_handler()`, `restore_*()` | the error and exception handlers |
+
+The fiber observers swap that state when execution moves between boundaries, so
+these functions run PHP's own code, with no override and no cost outside a
+boundary. What leaves the boundary goes to `$sapi` the way a SAPI receives it,
+through PHP's SAPI callbacks:
+
+| Method | |
+|---|---|
+| `ub_write(string $data): bool` | required: output leaving the buffers; `false` = the client is gone |
+| `send_headers(int $status, ?string $statusLine, array $headers): void` | required: once, before the first output or when the request ends without any; raw lines as `headers_list()` gives them, with PHP's default `Content-type` |
+| `flush(): void` | `flush()` was called |
+| `read_post(int $length): string` | the request body: up to `$length` bytes, fewer only at its end |
+| `request_info(): array` | once at the start: `method`, `content_type`, `content_length` |
+| `exit(int\|string $status): void` | `exit()`/`die()` was called inside |
+| `connection_aborted(): bool` | for a server that knows the client left before a write fails |
+
+The object is duck-typed: the extension declares no PHP type, looks the methods
+up by name and uses the optional ones only if present, so the extension and a
+server can be upgraded independently. The methods run outside the boundary
+(their own output and warnings go where they would without `virtualize()`) and
+may suspend: a `ub_write()` writing to the client's socket parks the coroutine
+through the `Poller` like any other write.
+
+The request ends as PHP ends one when `$code` returns or throws: shutdown
+functions run, the output buffers are flushed (removable or not), and the headers
+are sent if no output sent them. An uncaught exception goes to the request's
+exception handler if it set one, and otherwise propagates from `virtualize()`.
+`exit()` inside ends the request, not the worker, and doesn't change the
+worker's exit status: in the fiber running `virtualize()`, `virtualize()`
+returns null; in a fiber started inside, that fiber ends quietly and
+`$sapi->exit()` lets the server cancel the rest. A client that is gone
+(`ub_write()` returning `false`) aborts the request as PHP does: output stops,
+and unless `ignore_user_abort(true)`, the request ends as by `exit()`. Fibers
+of a request still running after it ended have their output discarded.
+
+Global variables are not isolated, and a fatal error still ends the worker
+(after being displayed in the request's output, as natively). Nesting
+`virtualize()` throws.
 
 ## Status
 

@@ -1,5 +1,5 @@
 /* This is a generated file, edit the .stub.php file instead.
- * Stub hash: dddaeefbe4432572233e67f1db4fc84f2ade0f36 */
+ * Stub hash: 73bc7f41856d38e3447a138d714d48cd4609defe */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_phasync_ext_stream_select, 0, 4, MAY_BE_LONG|MAY_BE_FALSE)
 	ZEND_ARG_TYPE_INFO(1, read, IS_ARRAY, 1)
@@ -14,6 +14,11 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_phasync_ext_manage, 0, 4, IS_MIX
 	ZEND_ARG_OBJ_INFO(0, poller, phasync\\ext\\Poller, 0)
 	ZEND_ARG_OBJ_INFO(0, sleep, Closure, 0)
 	ZEND_ARG_TYPE_INFO(0, timeoutException, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_phasync_ext_virtualize, 0, 2, IS_MIXED, 0)
+	ZEND_ARG_OBJ_INFO(0, code, Closure, 0)
+	ZEND_ARG_TYPE_INFO(0, sapi, IS_OBJECT, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_class_phasync_ext_Poller___construct, 0, 0, 3)
@@ -35,6 +40,7 @@ ZEND_END_ARG_INFO()
 
 ZEND_FUNCTION(phasync_ext_stream_select);
 ZEND_FUNCTION(phasync_ext_manage);
+ZEND_FUNCTION(phasync_ext_virtualize);
 ZEND_METHOD(phasync_ext_Poller, __construct);
 ZEND_METHOD(phasync_ext_Poller, poll);
 ZEND_METHOD(phasync_ext_Poller, readable);
@@ -43,6 +49,7 @@ ZEND_METHOD(phasync_ext_Poller, writable);
 static const zend_function_entry ext_functions[] = {
 	ZEND_RAW_FENTRY(ZEND_NS_NAME("phasync\\ext", "stream_select"), zif_phasync_ext_stream_select, arginfo_phasync_ext_stream_select, 0, NULL, NULL)
 	ZEND_RAW_FENTRY(ZEND_NS_NAME("phasync\\ext", "manage"), zif_phasync_ext_manage, arginfo_phasync_ext_manage, 0, NULL, NULL)
+	ZEND_RAW_FENTRY(ZEND_NS_NAME("phasync\\ext", "virtualize"), zif_phasync_ext_virtualize, arginfo_phasync_ext_virtualize, 0, NULL, NULL)
 	ZEND_FE_END
 };
 
