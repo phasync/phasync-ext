@@ -166,12 +166,15 @@ function manage(
 ```
 
 **Waiting.** A coroutine waits by parking in a slot of the event loop: the
-`Poller` takes a fresh `getSlot()` for every wait and calls `park($slot,
-$timeout)`; the loop suspends the coroutine and resumes it when `unpark($slot)`
-is called. The `Poller` unparks **only on PHP's thread, inside `poll()`**:
-waiting for a descriptor arms a one-shot epoll registration (a level-triggered one
-with nobody waiting would make every `epoll_wait()` return at once while unread
-data sits in a socket), and worker threads never call PHP — the thread-pool work
+`Poller` calls `park($slot, $timeout)` with a slot from `getSlot()`; the loop
+suspends the coroutine and resumes it when `unpark($slot)` is called. The
+`Poller` unparks **only on PHP's thread, inside `poll()`**. A stream keeps its
+epoll registration, level-triggered and left armed after a wait, and one slot
+per direction: in request/response I/O nothing arrives while the coroutine is
+busy, so a wait costs no syscall besides the batched `epoll_wait()`. An event
+that finds nobody waiting disarms its direction then and there, so unread data
+with nobody waiting costs one wake-up, never a busy loop. Worker threads never
+call PHP — the thread-pool work
 of hooked operations (file operations, DNS) started under a `manage()` given this
 `Poller` queues the slot and writes to an eventfd in its epoll set, which `poll()`
 drains. So `poll($maxTime)` replaces the loop's `stream_select()` and idle
