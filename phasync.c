@@ -374,6 +374,7 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_pcntl_waitpid)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_pcntl_wait)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_socket_connect)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_socket_close)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_curl_multi_select)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_sem_acquire)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_curl_exec)(INTERNAL_FUNCTION_PARAMETERS);
@@ -405,6 +406,7 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	zend_long thread_pool_size;   /* INI: phasync.thread_pool_size */
 	bool hooks_installed;         /* transports + fn overrides physically in place */
 	HashTable hooked;             /* (uintptr_t)stream    -> phasync_hook_entry* */
+	HashTable inflight;           /* (uintptr_t)stream    -> phasync_inflight*   */
 	HashTable wrapped_ops_cache;  /* (uintptr_t)orig_ops  -> php_stream_ops*     */
 ZEND_END_MODULE_GLOBALS(phasync)
 
@@ -449,6 +451,7 @@ static php_socket_t phasync_stream_fd(php_stream *stream)
 #define PHASYNC_WAIT_READY    0    /* ready (or closed/failed) -> retry the op       */
 #define PHASYNC_WAIT_TIMEOUT  1    /* native timeout ran out   -> finish like native */
 #define PHASYNC_WAIT_ERROR    (-1) /* exception pending (a cancellation) -> propagate */
+#define PHASYNC_WAIT_CLOSED   2    /* another coroutine closed the stream (EBADF)    */
 
 /* Call the sleep handler as handler(int $microseconds). Returns -1 if it threw. */
 static int phasync_call_sleep(zval *handler, zend_long usec)
@@ -914,12 +917,114 @@ done:
 	return rc;
 }
 
+/* ---- a stream closed under a suspended coroutine (#14) --------------------
+ *
+ * A coroutine suspended inside an operation on a stream still has the stream on
+ * its C stack: in our op, in PHP's stream layer, in mysqlnd. Another coroutine
+ * closing the stream then must not free it before they have left: its close op
+ * wakes them, parks the closer until the last one is out, and only then lets the
+ * close go on. A woken operation fails as on a closed descriptor (EBADF), and so
+ * does any later one that would wait on the closing stream. */
+typedef struct {
+	uint32_t        waiters;      /* coroutines suspended in an op on the stream */
+	bool            closing;      /* its close op waits for them to leave        */
+	phasync_poller *closer;       /* where the closer is parked, and its slot    */
+	zend_long       closer_slot;
+} phasync_inflight;
+
+/* Before suspending in an op on the stream. False (errno EBADF) if it is closing. */
+static bool phasync_inflight_enter(php_stream *stream)
+{
+	phasync_inflight *f = zend_hash_index_find_ptr(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
+
+	if (f == NULL) {
+		f = pecalloc(1, sizeof(*f), 1);
+		zend_hash_index_add_new_ptr(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream, f);
+	} else if (f->closing) {
+		errno = EBADF;
+		return false;
+	}
+	f->waiters++;
+	return true;
+}
+
+/* Back from the suspension. True (errno EBADF) if the stream is closing: the op
+ * fails, and the last one out lets the closer go on. */
+static bool phasync_inflight_leave(php_stream *stream)
+{
+	phasync_inflight *f = zend_hash_index_find_ptr(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
+
+	if (--f->waiters == 0) {
+		if (!f->closing) {
+			zend_hash_index_del(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
+			return false;
+		}
+		phasync_chan_push(f->closer->chan, f->closer_slot);
+	}
+	if (f->closing) {
+		errno = EBADF;
+		return true;
+	}
+	return false;
+}
+
+/* From a close op, before the stream goes: wake whoever waits on it and wait until
+ * every coroutine suspended in an op on it has left. The closer can only wait in
+ * a coroutine; anywhere else it would free the stream under them, so that is a
+ * fatal error. A cancellation of the wait is held until they are out. */
+static void phasync_inflight_close(php_stream *stream)
+{
+	phasync_inflight *f = zend_hash_index_find_ptr(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
+	phasync_scope *s = PHASYNC_G(scope_top);
+	zend_object *held = NULL;
+
+	phasync_stream_forget(stream);
+	if (f == NULL) {
+		return;
+	}
+	if (s == NULL || EG(active_fiber) == NULL) {
+		zend_error_noreturn(E_ERROR, "phasync: a stream was closed outside a coroutine while %u coroutine(s) wait on it",
+			f->waiters);
+	}
+	f->closing = true;
+	f->closer = s->poller;
+	GC_ADDREF(&s->poller->std);
+	while (f->waiters) {
+		if ((f->closer_slot = phasync_get_slot(s->poller)) < 0
+		 || phasync_park(s->poller, f->closer_slot, INFINITY, NULL) != PHASYNC_WAIT_READY) {
+			if (EG(exception) == NULL) {
+				zend_error_noreturn(E_ERROR, "phasync: unable to wait for the coroutines using a stream being closed");
+			}
+			if (held == NULL) {
+				held = EG(exception);
+				GC_ADDREF(held);
+			}
+			zend_clear_exception();
+		}
+	}
+	OBJ_RELEASE(&s->poller->std);
+	zend_hash_index_del(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
+	if (held) {
+		zend_throw_exception_internal(held);
+	}
+}
+
 /* The hooked operations wait through the manage() scope's Poller, with its
- * timeout class. */
+ * timeout class. A wait on a stream fails with CLOSED if another coroutine
+ * closes it meanwhile. */
 static int phasync_wait_fd(int dir, php_stream *stream, php_socket_t fd, double timeout)
 {
 	phasync_scope *s = PHASYNC_G(scope_top);
-	return phasync_poller_wait(s->poller, dir, stream, fd, timeout, s->timeout_ce);
+	int rc;
+
+	if (stream == NULL) {
+		return phasync_poller_wait(s->poller, dir, stream, fd, timeout, s->timeout_ce);
+	}
+	if (!phasync_inflight_enter(stream)) {
+		return PHASYNC_WAIT_CLOSED;
+	}
+	rc = phasync_poller_wait(s->poller, dir, stream, fd, timeout, s->timeout_ce);
+	return phasync_inflight_leave(stream) && rc != PHASYNC_WAIT_ERROR ? PHASYNC_WAIT_CLOSED : rc;
 }
 
 #define PHASYNC_COOP_ERROR    0   /* stop: exception pending          */
@@ -1910,7 +2015,11 @@ static ssize_t phasync_pool_read_fd(php_stream *stream, php_socket_t fd, char *b
 	t.fd = fd;
 	t.buf = buf;
 	t.count = count;
-	phasync_pool_run(&t);
+	if (!phasync_inflight_enter(stream)) {
+		return -1;
+	}
+	phasync_pool_run(&t);   /* a close meanwhile waits for it: the read is done */
+	phasync_inflight_leave(stream);
 	errno = t.err;
 	if (t.result == 0) {
 		stream->eof = 1;   /* a 0-byte read on a regular file is EOF (as plain
@@ -1921,7 +2030,7 @@ static ssize_t phasync_pool_read_fd(php_stream *stream, php_socket_t fd, char *b
 	return t.result;
 }
 
-static ssize_t phasync_pool_write_fd(php_socket_t fd, const char *buf, size_t count)
+static ssize_t phasync_pool_write_fd(php_stream *stream, php_socket_t fd, const char *buf, size_t count)
 {
 	phasync_task t;
 
@@ -1930,7 +2039,11 @@ static ssize_t phasync_pool_write_fd(php_socket_t fd, const char *buf, size_t co
 	t.fd = fd;
 	t.buf = (char *) buf;
 	t.count = count;
+	if (!phasync_inflight_enter(stream)) {
+		return -1;
+	}
 	phasync_pool_run(&t);
+	phasync_inflight_leave(stream);
 	errno = t.err;
 	return t.result;
 }
@@ -1954,7 +2067,7 @@ static ssize_t phasync_wrapped_write_pool(php_stream *stream, const char *buf, s
 	if (fd == -1 || !phasync_reading() || EG(active_fiber) == NULL) {
 		return PHASYNC_ORIG(stream)->write(stream, buf, count);
 	}
-	return phasync_pool_write_fd(fd, buf, count);
+	return phasync_pool_write_fd(stream, fd, buf, count);
 }
 
 /* ---- wrapped stream ops (shared across socket + pipe originals) ----------- */
@@ -2217,10 +2330,16 @@ static int phasync_accept_cooperative(php_stream *stream, php_stream_xport_param
 			}
 			return PHP_STREAM_OPTION_RETURN_OK;
 		}
-		if (w == PHASYNC_WAIT_ERROR) {
+		if (w == PHASYNC_WAIT_ERROR || w == PHASYNC_WAIT_CLOSED) {
 			xp->outputs.client = NULL;
 			xp->outputs.returncode = -1;
-			return PHP_STREAM_OPTION_RETURN_OK;   /* exception pending: propagates */
+			if (w == PHASYNC_WAIT_CLOSED) {
+				xp->outputs.error_code = EBADF;
+				if (xp->want_errortext) {
+					xp->outputs.error_text = php_socket_error_str(EBADF);
+				}
+			}
+			return PHP_STREAM_OPTION_RETURN_OK;   /* an exception pending propagates */
 		}
 		xp->inputs.timeout = &zero;
 		r = phasync_orig_set_option(stream, PHP_STREAM_OPTION_XPORT_API, 0, xp);
@@ -2554,9 +2673,10 @@ static int phasync_wrapped_set_option_inner(php_stream *stream, int option, int 
 static int phasync_wrapped_close(php_stream *stream, int close_handle)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
-	phasync_hook_entry *e = phasync_entry(stream);
+	phasync_hook_entry *e;
 
-	phasync_stream_forget(stream);
+	phasync_inflight_close(stream);
+	e = phasync_entry(stream);
 
 	if (e) {
 		if (e->pidfd != -1) {
@@ -3479,9 +3599,11 @@ static bool phasync_has_close_hook(php_stream *stream)
 		|| stream->ops->read == phasync_wrapped_read_pool;
 }
 
+static void phasync_inflight_close(php_stream *stream);
+
 static int phasync_stdio_close(php_stream *stream, int close_handle)
 {
-	phasync_stream_forget(stream);
+	phasync_inflight_close(stream);
 	return phasync_stdio_close_orig(stream, close_handle);
 }
 static ssize_t (*phasync_stdio_write_orig)(php_stream *stream, const char *buf, size_t count);
@@ -3544,7 +3666,11 @@ static int phasync_stdio_set_option(php_stream *stream, int option, int value, v
 		t.type = PHASYNC_OP_FS;
 		t.fsop = value == PHP_STREAM_SYNC_FSYNC ? PHASYNC_FS_FSYNC : PHASYNC_FS_FDATASYNC;
 		t.fd = ((phasync_stdio_head *) stream->abstract)->fd;
+		if (!phasync_inflight_enter(stream)) {
+			return PHP_STREAM_OPTION_RETURN_ERR;
+		}
 		phasync_pool_run(&t);
+		phasync_inflight_leave(stream);
 		if (EG(exception)) {
 			return PHP_STREAM_OPTION_RETURN_ERR;
 		}
@@ -3563,8 +3689,12 @@ static int phasync_stdio_set_option(php_stream *stream, int option, int value, v
 		int rc;
 		while ((rc = phasync_stdio_set_option_orig(stream, option, value | LOCK_NB, NULL)) != 0
 		       && errno == EWOULDBLOCK) {
-			if (phasync_call_sleep(phasync_sleep_handler(), usec) < 0) {
-				return -1;               /* exception pending */
+			if (!phasync_inflight_enter(stream)) {
+				return -1;
+			}
+			rc = phasync_call_sleep(phasync_sleep_handler(), usec);
+			if (phasync_inflight_leave(stream) || rc < 0) {
+				return -1;               /* closed meanwhile, or exception pending */
 			}
 			usec = MIN(usec * 2, 20000);
 		}
@@ -3586,7 +3716,7 @@ static ssize_t phasync_stdio_write(php_stream *stream, const char *buf, size_t c
 	 * RWF_NOWAIT would refuse any write that allocates blocks: only a pool file
 	 * writes on the pool. */
 	if (phasync_stdio_mode(stream, &fd) == PHASYNC_FS_POOL) {
-		return phasync_pool_write_fd(fd, buf, count);
+		return phasync_pool_write_fd(stream, fd, buf, count);
 	}
 	return phasync_stdio_write_orig(stream, buf, count);
 }
@@ -4586,6 +4716,33 @@ static void phasync_socket_error(phasync_php_socket *ps, const char *msg, int er
 	if (err != EAGAIN && err != EWOULDBLOCK && err != EINPROGRESS) {
 		php_error_docref(NULL, E_WARNING, "%s [%d]: %s", msg, err, strerror(err));
 	}
+}
+
+/* socket_close() while another coroutine waits on the socket: epoll forgets a
+ * closed descriptor, so wake the waiters first (as a stream's close op does);
+ * their retry finds the Socket closed, as PHP reports it. */
+static ZEND_NAMED_FUNCTION(phasync_socket_close_override)
+{
+	zval *z = ZEND_NUM_ARGS() >= 1 ? ZEND_CALL_ARG(execute_data, 1) : NULL;
+	php_socket_t fd;
+
+	if (z && (fd = phasync_select_fd_socket(z)) != -1) {
+		for (phasync_poller *p = phasync_pollers; p; p = p->next) {
+			phasync_reg *r = p->fork_gen == phasync_fork_gen ? zend_hash_index_find_ptr(&p->regs, (zend_ulong) fd) : NULL;
+			if (r == NULL || r->stream != NULL) {
+				continue;
+			}
+			for (int i = 0; i < 2; i++) {
+				if (r->slot[i] >= 0) {
+					phasync_chan_push(p->chan, r->slot[i]);
+					r->slot[i] = -1;
+					p->armed--;
+				}
+			}
+			phasync_reg_drop(p, r);
+		}
+	}
+	PHASYNC_G(orig_socket_close)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
 /* socket_connect() to a numeric IPv4/IPv6 address or a unix path: connect
@@ -6058,6 +6215,10 @@ static void phasync_install_hooks(void)
 		PHASYNC_G(orig_socket_connect) = f->handler;
 		f->handler = phasync_socket_connect_override;
 	}
+	if ((f = phasync_find_ifunc("socket_close", sizeof("socket_close") - 1))) {
+		PHASYNC_G(orig_socket_close) = f->handler;
+		f->handler = phasync_socket_close_override;
+	}
 	for (zend_long i = 0; i < (zend_long) PHASYNC_SOCK_NFUNCS; i++) {
 		if ((f = phasync_find_ifunc(phasync_sock_funcs[i].name, strlen(phasync_sock_funcs[i].name)))) {
 			zval zi;
@@ -6223,6 +6384,9 @@ static void phasync_restore_hooks(void)
 	}
 	if (PHASYNC_G(orig_socket_connect) && (f = phasync_find_ifunc("socket_connect", sizeof("socket_connect") - 1))) {
 		f->handler = PHASYNC_G(orig_socket_connect);
+	}
+	if (PHASYNC_G(orig_socket_close) && (f = phasync_find_ifunc("socket_close", sizeof("socket_close") - 1))) {
+		f->handler = PHASYNC_G(orig_socket_close);
 	}
 	for (size_t i = 0; i < PHASYNC_SOCK_NFUNCS; i++) {
 		if (PHASYNC_G(orig_sock)[i] && (f = phasync_find_ifunc(phasync_sock_funcs[i].name, strlen(phasync_sock_funcs[i].name)))) {
@@ -7008,6 +7172,7 @@ static PHP_GINIT_FUNCTION(phasync)
 #endif
 	memset(phasync_globals, 0, sizeof(*phasync_globals));
 	zend_hash_init(&phasync_globals->hooked, 8, NULL, phasync_hook_entry_dtor, 1);
+	zend_hash_init(&phasync_globals->inflight, 8, NULL, phasync_hook_entry_dtor, 1);
 	zend_hash_init(&phasync_globals->wrapped_ops_cache, 8, NULL, phasync_ops_dtor, 1);
 	zend_hash_init(&phasync_globals->fs_hooks, 32, NULL, NULL, 1);
 	zend_hash_init(&phasync_globals->sock_hooks, 8, NULL, NULL, 1);
@@ -7018,6 +7183,7 @@ static PHP_GINIT_FUNCTION(phasync)
 static PHP_GSHUTDOWN_FUNCTION(phasync)
 {
 	zend_hash_destroy(&phasync_globals->hooked);
+	zend_hash_destroy(&phasync_globals->inflight);
 	zend_hash_destroy(&phasync_globals->wrapped_ops_cache);
 	zend_hash_destroy(&phasync_globals->fs_hooks);
 	zend_hash_destroy(&phasync_globals->sock_hooks);
@@ -7110,6 +7276,7 @@ static PHP_RINIT_FUNCTION(phasync)
 	PHASYNC_G(no_suspend) = 0;
 	PHASYNC_G(hooks_installed) = 0;
 	zend_hash_clean(&PHASYNC_G(hooked));
+	zend_hash_clean(&PHASYNC_G(inflight));
 	/* Always-on: the transport factories and function overrides go in at the
 	 * start of every request (they are inert while no manage() scope is active),
 	 * and streams that predate them get wrapped now. */

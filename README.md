@@ -188,8 +188,12 @@ drains. So `poll($maxTime)` replaces the loop's `stream_select()` and idle
 queued, else the time until its next timer), costing work per ready event, never
 a scan of everything registered; `poll(0)` with nothing waited on and no finished
 thread task queued returns without a syscall. A registration lives as long as its stream and is
-removed in the stream's close op; a coroutine waiting on a stream that is closed is
-woken, and its next use of the stream finds it closed.
+removed in the stream's close op. A coroutine suspended in an operation on a stream
+(`fread()`, `stream_socket_accept()`, `flock()`, a mysqli query, a read on the thread
+pool ...) that another coroutine closes has that operation fail as on a closed
+descriptor (EBADF); the close waits in its coroutine until the operation has let go
+of the stream. Closing it outside a coroutine meanwhile is a fatal error.
+`socket_close()` likewise wakes a coroutine waiting on the `Socket`.
 
 The loop keeps its `Poller` alive: waiters parked through a `Poller` that is freed
 are never unparked, so their waits run to their timeouts. A `Poller` belongs to the
