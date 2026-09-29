@@ -215,6 +215,13 @@ and `writable()` pass the loop's exceptions through as they are. phasync gives t
 `Poller` its loop's `getSlot`/`park`/`unpark`, and `manage()` its sleep and
 `phasync\TimeoutException::class`.
 
+A coroutine **destroyed while it waits** (dropped, or torn down by phasync) ends
+its operation safely: its wait is disarmed, a pool thread still working on its
+buffers is waited for, and a stream it was closing is left to its last reference.
+What the operation returns is moot, since the fiber is unwinding; its `finally`
+blocks run, and there a wait fails with the `FiberError` PHP throws for
+`Fiber::suspend()`, while pool operations run inline.
+
 `manage()` scopes are **automatic and stacking**: they apply only while `$task`
 runs, and a nested `manage()` sends hooked I/O to its own `Poller` until it
 returns. Waits only

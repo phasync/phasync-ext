@@ -355,6 +355,7 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	void (*orig_dns_get_record)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_dns_get_mx)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_fopen)(INTERNAL_FUNCTION_PARAMETERS);
+	void (*orig_fclose)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_stream_socket_pair)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_stream_select)(INTERNAL_FUNCTION_PARAMETERS);
 	void (*orig_socket_select)(INTERNAL_FUNCTION_PARAMETERS);
@@ -446,12 +447,42 @@ static php_socket_t phasync_stream_fd(php_stream *stream)
 #define PHASYNC_WAIT_ERROR    (-1) /* exception pending (a cancellation) -> propagate */
 #define PHASYNC_WAIT_CLOSED   2    /* another coroutine closed the stream (EBADF)    */
 
+/* PHP destroys a fiber dropped while suspended by resuming it once to unwind it:
+ * its finally blocks and destructors run, and it can no longer suspend
+ * (Fiber::suspend() throws). A wait there must not reach the loop at all. */
+static zend_always_inline bool phasync_unwinding(void)
+{
+	return EG(active_fiber) && (EG(active_fiber)->flags & ZEND_FIBER_FLAG_DESTROYED);
+}
+
+/* Fail a wait in a fiber being destroyed as Fiber::suspend() would, unless the
+ * unwind (or another exception) is already pending. */
+static void phasync_throw_force_closed(void)
+{
+	if (!EG(exception)) {
+		zend_throw_error(zend_hash_str_find_ptr(CG(class_table), ZEND_STRL("fibererror")),
+			"Cannot suspend in a force-closed fiber");
+	}
+}
+
+static bool phasync_cannot_suspend(void)
+{
+	if (!phasync_unwinding()) {
+		return false;
+	}
+	phasync_throw_force_closed();
+	return true;
+}
+
 /* Call the sleep handler as handler(int $microseconds). Returns -1 if it threw. */
 static int phasync_call_sleep(zval *handler, zend_long usec)
 {
 	zval arg, retval;
 	int rc = 0;
 
+	if (phasync_cannot_suspend()) {
+		return -1;
+	}
 	ZVAL_LONG(&arg, usec);
 	ZVAL_UNDEF(&retval);
 	if (call_user_function(NULL, NULL, handler, &retval, 1, &arg) == FAILURE || EG(exception)) {
@@ -704,6 +735,9 @@ static int phasync_park(phasync_poller *p, zend_long slot, double timeout, zend_
 	double deadline = isinf(timeout) ? INFINITY : phasync_now() + timeout;
 	int rc = PHASYNC_WAIT_READY;
 
+	if (phasync_cannot_suspend()) {
+		return PHASYNC_WAIT_ERROR;
+	}
 	ZVAL_LONG(&args[0], slot);
 	ZVAL_DOUBLE(&args[1], isinf(timeout) ? DBL_MAX : timeout);
 	ZVAL_UNDEF(&retval);
@@ -917,11 +951,16 @@ done:
  * closing the stream then must not free it before they have left: its close op
  * wakes them, parks the closer until the last one is out, and only then lets the
  * close go on. A woken operation fails as on a closed descriptor (EBADF), and so
- * does any later one that would wait on the closing stream. */
+ * does any later one that would wait on the closing stream.
+ *
+ * A closer being destroyed (dropped while it waits) can no longer park. Once in
+ * a close op it cannot stop the stream being freed either, so fclose() waits
+ * before closing: a closer destroyed there leaves the stream closing, to be freed
+ * with its last reference (the coroutines inside hold one). */
 typedef struct {
 	uint32_t        waiters;      /* coroutines suspended in an op on the stream */
-	bool            closing;      /* its close op waits for them to leave        */
-	phasync_poller *closer;       /* where the closer is parked, and its slot    */
+	bool            closing;      /* a close woke them; ops on it fail (EBADF)   */
+	phasync_poller *closer;       /* where the closer is parked (NULL: none), and its slot */
 	zend_long       closer_slot;
 } phasync_inflight;
 
@@ -952,7 +991,9 @@ static bool phasync_inflight_leave(php_stream *stream)
 			zend_hash_index_del(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
 			return false;
 		}
-		phasync_chan_push(f->closer->chan, f->closer_slot);
+		if (f->closer) {
+			phasync_chan_push(f->closer->chan, f->closer_slot);
+		}
 	}
 	if (f->closing) {
 		errno = EBADF;
@@ -961,32 +1002,30 @@ static bool phasync_inflight_leave(php_stream *stream)
 	return false;
 }
 
-/* From a close op, before the stream goes: wake whoever waits on it and wait until
- * every coroutine suspended in an op on it has left. The closer can only wait in
- * a coroutine; anywhere else it would free the stream under them, so that is a
- * fatal error. A cancellation of the wait is held until they are out. */
-static void phasync_inflight_close(php_stream *stream)
+/* Wake whoever waits on the closing stream and park until every coroutine
+ * suspended in an op on it has left. A cancellation of the wait is held until
+ * they are out. False if the closer is being destroyed while they are still in:
+ * it cannot wait, and the unwind is pending. */
+static bool phasync_inflight_drain(php_stream *stream, phasync_inflight *f)
 {
-	phasync_inflight *f = zend_hash_index_find_ptr(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
-	phasync_scope *s = PHASYNC_G(scope_top);
+	phasync_poller *p = PHASYNC_G(scope_top)->poller;
 	zend_object *held = NULL;
 
 	phasync_stream_forget(stream);
-	if (f == NULL) {
-		return;
-	}
-	if (s == NULL || EG(active_fiber) == NULL) {
-		zend_error_noreturn(E_ERROR, "phasync: a stream was closed outside a coroutine while %u coroutine(s) wait on it",
-			f->waiters);
-	}
 	f->closing = true;
-	f->closer = s->poller;
-	GC_ADDREF(&s->poller->std);
+	f->closer = p;
+	GC_ADDREF(&p->std);
 	while (f->waiters) {
-		if ((f->closer_slot = phasync_get_slot(s->poller)) < 0
-		 || phasync_park(s->poller, f->closer_slot, INFINITY, NULL) != PHASYNC_WAIT_READY) {
+		if (phasync_unwinding()) {
+			break;
+		}
+		if ((f->closer_slot = phasync_get_slot(p)) < 0
+		 || phasync_park(p, f->closer_slot, INFINITY, NULL) != PHASYNC_WAIT_READY) {
 			if (EG(exception) == NULL) {
 				zend_error_noreturn(E_ERROR, "phasync: unable to wait for the coroutines using a stream being closed");
+			}
+			if (phasync_unwinding()) {
+				break;               /* the unwind stays pending */
 			}
 			if (held == NULL) {
 				held = EG(exception);
@@ -995,11 +1034,43 @@ static void phasync_inflight_close(php_stream *stream)
 			zend_clear_exception();
 		}
 	}
-	OBJ_RELEASE(&s->poller->std);
-	zend_hash_index_del(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
+	f->closer = NULL;
+	OBJ_RELEASE(&p->std);
+	if (f->waiters) {
+		if (held) {
+			OBJ_RELEASE(held);
+		}
+		phasync_throw_force_closed();
+		return false;
+	}
 	if (held) {
 		zend_throw_exception_internal(held);
 	}
+	return true;
+}
+
+/* From a close op, before the stream goes: wait until no coroutine is inside an op
+ * on it (see phasync_inflight_drain()). The closer can only wait in a coroutine;
+ * anywhere else it would free the stream under them, so that is a fatal error. */
+static void phasync_inflight_close(php_stream *stream)
+{
+	phasync_inflight *f = zend_hash_index_find_ptr(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
+
+	phasync_stream_forget(stream);
+	if (f == NULL) {
+		return;
+	}
+	if (f->waiters) {
+		if (PHASYNC_G(scope_top) == NULL || EG(active_fiber) == NULL) {
+			zend_error_noreturn(E_ERROR, "phasync: a stream was closed outside a coroutine while %u coroutine(s) wait on it",
+				f->waiters);
+		}
+		if (!phasync_inflight_drain(stream, f)) {
+			zend_error_noreturn(E_ERROR, "phasync: a stream was closed by a coroutine being destroyed while %u coroutine(s) wait on it",
+				f->waiters);
+		}
+	}
+	zend_hash_index_del(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
 }
 
 /* The hooked operations wait through the manage() scope's Poller, with its
@@ -1894,9 +1965,10 @@ static void phasync_pool_run(phasync_task *t)
 	phasync_chan *ch;
 	int rc;
 
-	if (!p || EG(active_fiber) == NULL || PHASYNC_G(no_suspend) || p->fork_gen != phasync_fork_gen
-	 || !phasync_pool_ensure() || (t->slot = phasync_get_slot(p)) < 0) {
-		/* No coroutine to park (or no worker, or getSlot() threw): run inline. */
+	if (!p || EG(active_fiber) == NULL || PHASYNC_G(no_suspend) || phasync_unwinding()
+	 || p->fork_gen != phasync_fork_gen || !phasync_pool_ensure() || (t->slot = phasync_get_slot(p)) < 0) {
+		/* No coroutine to park (a fiber being destroyed cannot), or no worker, or
+		 * getSlot() threw: run inline. A pool task always ends. */
 		phasync_task_exec(t);
 		return;
 	}
@@ -2324,15 +2396,15 @@ static int phasync_accept_cooperative(php_stream *stream, php_stream_xport_param
 			return PHP_STREAM_OPTION_RETURN_OK;
 		}
 		if (w == PHASYNC_WAIT_ERROR || w == PHASYNC_WAIT_CLOSED) {
+			/* Closed meanwhile (EBADF), or the wait cancelled or its coroutine
+			 * destroyed (ECANCELED, the exception pending propagates). */
 			xp->outputs.client = NULL;
 			xp->outputs.returncode = -1;
-			if (w == PHASYNC_WAIT_CLOSED) {
-				xp->outputs.error_code = EBADF;
-				if (xp->want_errortext) {
-					xp->outputs.error_text = php_socket_error_str(EBADF);
-				}
+			xp->outputs.error_code = w == PHASYNC_WAIT_CLOSED ? EBADF : ECANCELED;
+			if (xp->want_errortext) {
+				xp->outputs.error_text = php_socket_error_str(xp->outputs.error_code);
 			}
-			return PHP_STREAM_OPTION_RETURN_OK;   /* an exception pending propagates */
+			return PHP_STREAM_OPTION_RETURN_OK;
 		}
 		xp->inputs.timeout = &zero;
 		r = phasync_orig_set_option(stream, PHP_STREAM_OPTION_XPORT_API, 0, xp);
@@ -5502,8 +5574,27 @@ static void phasync_v_release(phasync_boundary *b)
 	}
 }
 
+/* Put back an exception set aside around a call: the call's own exception is
+ * chained before it, unless it is exit()'s or the unwind of a coroutine being
+ * destroyed, which go on, and what failed on their way is lost (a SAPI's output
+ * errors never throw). */
+static void phasync_v_restore_exception(zend_object *ex)
+{
+	if (ex == NULL) {
+		return;
+	}
+	if (EG(exception) && !zend_is_unwind_exit(ex) && !zend_is_graceful_exit(ex)) {
+		zend_exception_set_previous(EG(exception), ex);
+		return;
+	}
+	if (EG(exception)) {
+		OBJ_RELEASE(EG(exception));
+	}
+	EG(exception) = ex;
+}
+
 /* Call a $sapi method with the SAPI's own state live. A pending exception (output
- * during unwinding) is set aside for the call and chained after it. */
+ * during unwinding) is set aside for the call and put back after it. */
 static void phasync_v_call(phasync_boundary *b, zend_function *fn, zval *rv, uint32_t argc, zval *argv)
 {
 	zend_ulong key = PHASYNC_VKEY(EG(current_fiber_context));
@@ -5518,13 +5609,7 @@ static void phasync_v_call(phasync_boundary *b, zend_function *fn, zval *rv, uin
 		zend_hash_index_add_new_ptr(&PHASYNC_G(vfibers), key, b);
 		phasync_v_install(b);
 	}
-	if (ex) {
-		if (EG(exception)) {
-			zend_exception_set_previous(EG(exception), ex);
-		} else {
-			EG(exception) = ex;
-		}
-	}
+	phasync_v_restore_exception(ex);
 }
 
 /* ---- fiber observers ---- */
@@ -5949,13 +6034,7 @@ static void phasync_v_finalize(phasync_boundary *b)
 	php_output_set_status(PHP_OUTPUT_DISABLED);
 	b->ended = true;
 	EG(exit_status) = b->exit_status;
-	if (ex) {
-		if (EG(exception)) {
-			zend_exception_set_previous(EG(exception), ex);
-		} else {
-			EG(exception) = ex;
-		}
-	}
+	phasync_v_restore_exception(ex);
 }
 
 ZEND_FUNCTION(phasync_ext_virtualize)
@@ -6067,6 +6146,32 @@ ZEND_FUNCTION(phasync_ext_virtualize)
 		RETURN_NULL();
 	}
 	RETURN_COPY_VALUE(&retval);
+}
+
+/* fclose() of a stream other coroutines are suspended in an op on: wait for them
+ * before closing, where a closer being destroyed meanwhile can still give up
+ * (see phasync_inflight_drain()). Past this point the close op waits. */
+static ZEND_NAMED_FUNCTION(phasync_fclose_override)
+{
+	zval *res;
+	php_stream *stream;
+	phasync_inflight *f;
+
+	if (ZEND_NUM_ARGS() == 1 && PHASYNC_G(scope_top) && EG(active_fiber)
+	 && Z_TYPE_P(res = ZEND_CALL_ARG(execute_data, 1)) == IS_RESOURCE
+	 && (stream = zend_fetch_resource2(Z_RES_P(res), NULL, php_file_le_stream(), php_file_le_pstream()))
+	 && !(stream->flags & PHP_STREAM_FLAG_NO_FCLOSE)
+	 && (f = zend_hash_index_find_ptr(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream))) {
+		if (f->closer) {
+			RETURN_TRUE;                 /* another coroutine is closing it */
+		}
+		if (f->waiters && !phasync_inflight_drain(stream, f)) {
+			RETURN_THROWS();             /* destroyed: the stream goes with its last reference */
+		}
+		/* Nobody inside: the close may write (a filter's tail) and wait itself. */
+		zend_hash_index_del(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
+	}
+	PHASYNC_G(orig_fclose)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
 /* ---- enable_hooks / disable_hooks ---------------------------------------- */
@@ -6255,6 +6360,10 @@ static void phasync_install_hooks(void)
 		PHASYNC_G(orig_fopen) = f->handler;
 		f->handler = phasync_fopen_override;
 	}
+	if ((f = phasync_find_ifunc("fclose", sizeof("fclose") - 1))) {
+		PHASYNC_G(orig_fclose) = f->handler;
+		f->handler = phasync_fclose_override;
+	}
 #if PHP_VERSION_ID >= 80400
 	/* die is an alias: its own entry, the same handler. */
 	if ((f = phasync_find_ifunc("exit", sizeof("exit") - 1))) {
@@ -6398,6 +6507,9 @@ static void phasync_restore_hooks(void)
 #endif
 	if (PHASYNC_G(orig_fopen) && (f = phasync_find_ifunc("fopen", sizeof("fopen") - 1))) {
 		f->handler = PHASYNC_G(orig_fopen);
+	}
+	if (PHASYNC_G(orig_fclose) && (f = phasync_find_ifunc("fclose", sizeof("fclose") - 1))) {
+		f->handler = PHASYNC_G(orig_fclose);
 	}
 #if PHP_VERSION_ID >= 80400
 	if (PHASYNC_G(orig_exit)) {

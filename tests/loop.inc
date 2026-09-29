@@ -93,6 +93,22 @@ final class Loop
         $this->ready[] = [$fiber, $e];
     }
 
+    /** Forget a coroutine, as a loop dropping it does: its last reference may be the caller's. */
+    public function drop(Fiber $fiber): void
+    {
+        foreach ($this->parked as $slot => $f) {
+            if ($f === $fiber) {
+                unset($this->parked[$slot], $this->deadlines[$slot]);
+            }
+        }
+        foreach ($this->timers as $k => [, $f]) {
+            if ($f === $fiber) {
+                unset($this->timers[$k]);
+            }
+        }
+        $this->ready = array_values(array_filter($this->ready, fn($r) => $r[0] !== $fiber));
+    }
+
     public function go(Closure|Fiber $fn): Fiber
     {
         $fiber = $fn instanceof Fiber ? $fn : new Fiber($fn);
