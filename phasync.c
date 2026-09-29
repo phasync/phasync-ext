@@ -103,8 +103,6 @@
 #define PHP_PHASYNC_VERSION "0.5.0-alpha21"
 
 typedef struct {
-	bool want_block;    /* caller's intended blocking mode (the fd's real mode when first seen) */
-	signed char applied; /* fd mode we last forced: -1 unknown, 0 blocking, 1 non-blocking */
 	int pidfd;          /* process pipe: pidfd of its child (the taint), or -1 */
 } phasync_hook_entry;
 
@@ -2413,83 +2411,68 @@ static phasync_hook_entry *phasync_entry(php_stream *stream)
 	return zend_hash_index_find_ptr(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream);
 }
 
-/* fd's real O_NONBLOCK state at the moment we start tracking this stream: usually
- * blocking (a freshly made socket/pipe), but a stream wrapped after the fact
- * (STDIN/STDOUT/STDERR, or anything opened before the extension loaded or before
- * the first manage() scope) may already have been set non-blocking natively, and
- * our want_block must agree, or a would-block write/read that should return at
- * once (as it does natively) instead cooperates and waits forever. */
-static phasync_hook_entry *phasync_entry_ensure(php_stream *stream, php_socket_t fd)
+static phasync_hook_entry *phasync_entry_ensure(php_stream *stream)
 {
 	phasync_hook_entry *e = phasync_entry(stream);
 	if (e == NULL) {
-		int flags = fd == -1 ? -1 : fcntl(fd, F_GETFL, 0);
 		e = pemalloc(sizeof(*e), 1);
-		e->want_block  = !(flags != -1 && (flags & O_NONBLOCK));
-		e->applied     = -1;      /* fd mode not forced yet */
-		e->pidfd       = -1;
+		e->pidfd = -1;
 		zend_hash_index_add_ptr(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream, e);
 	}
 	return e;
 }
 
-/* Force the fd (and, for a delegate/TLS stream, the stream layer) into the given
- * blocking mode, but only when it differs from what we last applied — so the hot
- * path (repeated cooperative reads on an already-non-blocking fd) does no syscall.
- * We go through the ORIGINAL set_option, never php_stream_set_option, to avoid
- * re-entering our own BLOCKING interception. */
-static void phasync_apply_mode(php_stream *stream, php_socket_t fd,
-                               phasync_hook_entry *e, bool nonblock, bool tls)
+/* Nothing about a stream's blocking mode is cached: every hooked op reads the
+ * fd's real O_NONBLOCK state fresh, with fcntl(F_GETFL), right before deciding
+ * whether to cooperate. Returns -1 (treat as "can't tell, do the native op") when
+ * fd is -1 or F_GETFL fails. */
+static int phasync_fd_flags(php_socket_t fd)
 {
-	int flags;
-
-	if (fd == -1 || e->applied == (signed char) (nonblock ? 1 : 0)) {
-		return;
-	}
-	if (tls) {
-		const php_stream_ops *orig = PHASYNC_ORIG(stream);
-		if (orig->set_option) {
-			orig->set_option(stream, PHP_STREAM_OPTION_BLOCKING, nonblock ? 0 : 1, NULL);
-		}
-	}
-	flags = fcntl(fd, F_GETFL, 0);
-	if (flags != -1) {
-		if (nonblock) {
-			flags |= O_NONBLOCK;
-		} else {
-			flags &= ~O_NONBLOCK;
-		}
-		fcntl(fd, F_SETFL, flags);
-	}
-	e->applied = nonblock ? 1 : 0;
+	return fd == -1 ? -1 : fcntl(fd, F_GETFL, 0);
 }
 
 /* The wrapped read/write ops emulate the caller's intended semantics:
  *   - outside a manage() scope                  -> exactly the native op;
  *   - an explicitly non-blocking stream          -> exactly the native op;
- *   - a blocking stream inside a scope           -> cooperate: drive the fd
- *     non-blocking and suspend the fiber on would-block instead of blocking.
+ *   - a blocking stream inside a scope           -> cooperate: wait for
+ *     readiness, then do ONE non-blocking attempt at the syscall, without ever
+ *     leaving O_NONBLOCK set on the fd afterwards. A socket fd gets this via
+ *     MSG_DONTWAIT on recv()/send() (no flag touched at all, since the fd is
+ *     shared with every other holder of the same open file description); a
+ *     pipe/TTY/FIFO fd (no per-call non-blocking flag exists for plain
+ *     read()/write()) gets O_NONBLOCK set immediately before that one syscall
+ *     and restored immediately after, so the window in which another process
+ *     sharing the descriptor could observe it changed is just that syscall,
+ *     never the wait.
  * So a wrapped stream is indistinguishable from an unwrapped one whenever no
- * scope is driving it. */
+ * scope is driving it, and never leaves the fd's mode different from how it
+ * found it. */
 static ssize_t phasync_wrapped_read(php_stream *stream, char *buf, size_t count)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
 	int dir = phasync_reading();
-	phasync_hook_entry *e;
+	int flags;
+	bool is_sock;
 
 	if (fd == -1) {
 		return orig->read(stream, buf, count);
 	}
-	e = phasync_entry_ensure(stream, fd);
-	if (!e->want_block || !dir) {
-		phasync_apply_mode(stream, fd, e, !e->want_block, false);
+	flags = phasync_fd_flags(fd);
+	if (flags == -1 || (flags & O_NONBLOCK) || !dir) {
 		return orig->read(stream, buf, count);
 	}
+	is_sock = phasync_sock_data(stream) != NULL;
 	double deadline = -1;              /* per op call = per fill */
-	phasync_apply_mode(stream, fd, e, true, false);
 	for (;;) {
-		ssize_t n = read(fd, buf, count);
+		ssize_t n;
+		if (is_sock) {
+			n = recv(fd, buf, count, MSG_DONTWAIT);
+		} else {
+			fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+			n = read(fd, buf, count);
+			fcntl(fd, F_SETFL, flags);
+		}
 		if (n > 0) {
 			return n;
 		}
@@ -2518,21 +2501,28 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
 	int dir = phasync_writing();
-	phasync_hook_entry *e;
+	int flags;
+	bool is_sock;
 
 	if (fd == -1) {
 		return orig->write(stream, buf, count);
 	}
-	e = phasync_entry_ensure(stream, fd);
-	if (!e->want_block || !dir) {
-		phasync_apply_mode(stream, fd, e, !e->want_block, false);
+	flags = phasync_fd_flags(fd);
+	if (flags == -1 || (flags & O_NONBLOCK) || !dir) {
 		return orig->write(stream, buf, count);
 	}
+	is_sock = phasync_sock_data(stream) != NULL;
 	double deadline = -1;              /* per op call = per fill */
-	phasync_apply_mode(stream, fd, e, true, false);
 	for (;;) {
-		ssize_t n = write(fd, buf, count);
+		ssize_t n;
 		int err, c;
+		if (is_sock) {
+			n = send(fd, buf, count, MSG_DONTWAIT | MSG_NOSIGNAL);
+		} else {
+			fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+			n = write(fd, buf, count);
+			fcntl(fd, F_SETFL, flags);
+		}
 		if (n >= 0) {
 			return n;
 		}
@@ -2555,37 +2545,46 @@ static ssize_t phasync_wrapped_write(php_stream *stream, const char *buf, size_t
 }
 
 /* Delegate-mode ops for streams whose bytes must go through the original op
- * (e.g. TLS: SSL_read/SSL_write). We can't raw read/write the fd, so inside a
- * scope we drive the stream non-blocking and let the original op report
- * would-block (0 without eof), then wait and retry. Read/write intent is
- * approximated (a read waits for readability); TLS renegotiation wanting the
+ * (e.g. TLS: SSL_read/SSL_write). We can't raw read/write the fd (OpenSSL's own
+ * BIO does the actual recv/send), so inside a scope we tell the stream layer to
+ * go non-blocking for the duration of this one op (so the original op reports
+ * would-block as 0 without eof instead of blocking), wait and retry, then put it
+ * back exactly as found before returning — one op call is the unit a plain
+ * blocking stream_socket_enable_crypto()-driven read/write is native's
+ * equivalent of one syscall, so this is the same "restore right after" rule, just
+ * scoped to the whole delegate call instead of one recv/send. Read/write intent
+ * is approximated (a read waits for readability); TLS renegotiation wanting the
  * opposite direction is a known limitation. */
 static ssize_t phasync_wrapped_read_tls(php_stream *stream, char *buf, size_t count)
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
 	int dir = phasync_reading();
-	phasync_hook_entry *e = phasync_entry_ensure(stream, fd);
+	int flags = phasync_fd_flags(fd);
+	ssize_t n;
 
-	if (!e->want_block || !dir) {
-		phasync_apply_mode(stream, fd, e, !e->want_block, true);
+	if (flags == -1 || (flags & O_NONBLOCK) || !dir) {
 		return orig->read(stream, buf, count);
 	}
 	double deadline = -1;              /* per op call = per fill */
-	phasync_apply_mode(stream, fd, e, true, true);
+	if (orig->set_option) {
+		orig->set_option(stream, PHP_STREAM_OPTION_BLOCKING, 0, NULL);
+	}
 	for (;;) {
-		ssize_t n = orig->read(stream, buf, count);
-		if (n > 0) {
-			return n;
-		}
-		if (n < 0 || stream->eof) {
-			return n;                    /* error or real EOF */
+		n = orig->read(stream, buf, count);
+		if (n > 0 || n < 0 || stream->eof) {
+			break;                        /* data, error, or real EOF */
 		}
 		fd = phasync_stream_fd(stream);  /* n == 0, not eof -> would block */
 		if (fd == -1 || phasync_cooperate(dir, stream, fd, &deadline) != PHASYNC_COOP_RETRY) {
-			return -1;
+			n = -1;
+			break;
 		}
 	}
+	if (orig->set_option) {
+		orig->set_option(stream, PHP_STREAM_OPTION_BLOCKING, 1, NULL);
+	}
+	return n;
 }
 
 static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, size_t count)
@@ -2593,27 +2592,31 @@ static ssize_t phasync_wrapped_write_tls(php_stream *stream, const char *buf, si
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
 	int dir = phasync_writing();
-	phasync_hook_entry *e = phasync_entry_ensure(stream, fd);
+	int flags = phasync_fd_flags(fd);
+	ssize_t n;
 
-	if (!e->want_block || !dir) {
-		phasync_apply_mode(stream, fd, e, !e->want_block, true);
+	if (flags == -1 || (flags & O_NONBLOCK) || !dir) {
 		return orig->write(stream, buf, count);
 	}
 	double deadline = -1;              /* per op call = per fill */
-	phasync_apply_mode(stream, fd, e, true, true);
+	if (orig->set_option) {
+		orig->set_option(stream, PHP_STREAM_OPTION_BLOCKING, 0, NULL);
+	}
 	for (;;) {
-		ssize_t n = orig->write(stream, buf, count);
-		if (n > 0) {
-			return n;
-		}
-		if (n < 0) {
-			return n;
+		n = orig->write(stream, buf, count);
+		if (n > 0 || n < 0) {
+			break;
 		}
 		fd = phasync_stream_fd(stream);  /* 0 -> would block */
 		if (fd == -1 || phasync_cooperate(dir, stream, fd, &deadline) != PHASYNC_COOP_RETRY) {
-			return -1;
+			n = -1;
+			break;
 		}
 	}
+	if (orig->set_option) {
+		orig->set_option(stream, PHP_STREAM_OPTION_BLOCKING, 1, NULL);
+	}
+	return n;
 }
 
 /* Delegate a set_option call to the original ops. xport ops (bind/connect/listen/
@@ -2733,7 +2736,6 @@ static int phasync_connect_cooperative(php_stream *stream, php_stream_xport_para
 	double deadline;
 	struct addrinfo hints, *res = NULL, *ai;
 	unsigned char bin[sizeof(struct in6_addr)];
-	phasync_hook_entry *e;
 	int attempted = 0;
 
 	if (sock == NULL || name == NULL || namelen == 0) {
@@ -2872,9 +2874,6 @@ static int phasync_connect_cooperative(php_stream *stream, php_stream_xport_para
 				zend_string_release(xp->outputs.error_text);
 				xp->outputs.error_text = NULL;
 			}
-			if ((e = phasync_entry(stream))) {
-				e->applied = -1;       /* a new fd: re-apply our mode on next I/O */
-			}
 			freeaddrinfo(res);
 			return PHP_STREAM_OPTION_RETURN_OK;
 		}
@@ -2896,17 +2895,19 @@ static int phasync_connect_cooperative(php_stream *stream, php_stream_xport_para
 static int phasync_xport_io_cooperative(php_stream *stream, php_stream_xport_param *xp, int option, int value)
 {
 	php_socket_t fd = phasync_stream_fd(stream);
-	phasync_hook_entry *e = phasync_entry_ensure(stream, fd);
+	int flags = phasync_fd_flags(fd);
 	int dir = xp->op == STREAM_XPORT_OP_RECV ? PHASYNC_READ : PHASYNC_WRITE;
 
-	if (e->want_block && fd != -1 && !(xp->inputs.flags & STREAM_OOB)) {
+	if (flags != -1 && !(flags & O_NONBLOCK) && !(xp->inputs.flags & STREAM_OOB)) {
 		struct pollfd pfd = { fd, dir == PHASYNC_READ ? POLLIN : POLLOUT, 0 };
 		while (poll(&pfd, 1, 0) == 0) {
 			if (phasync_wait_fd(dir, stream, fd, INFINITY) != PHASYNC_WAIT_READY) {
 				return PHP_STREAM_OPTION_RETURN_ERR;   /* exception pending */
 			}
 		}
-		phasync_apply_mode(stream, fd, e, false, false);
+		/* fd is still blocking (we never touched it): the original's own
+		 * recvfrom()/sendto() call below won't actually block now that we know
+		 * it's ready. */
 	}
 	return phasync_orig_set_option(stream, option, value, xp);
 }
@@ -2925,10 +2926,11 @@ static int phasync_crypto_enable(php_stream *stream, int option, int value, php_
 {
 	const php_stream_ops *orig = PHASYNC_ORIG(stream);
 	php_socket_t fd = phasync_stream_fd(stream);
-	phasync_hook_entry *e = phasync_entry_ensure(stream, fd);
+	int flags = phasync_fd_flags(fd);
+	bool is_blocking = flags != -1 && !(flags & O_NONBLOCK);
 	int rc;
 
-	if (cp->inputs.activate && e->want_block && fd != -1 && phasync_reading() && EG(active_fiber) != NULL) {
+	if (cp->inputs.activate && is_blocking && phasync_reading() && EG(active_fiber) != NULL) {
 		orig->set_option(stream, PHP_STREAM_OPTION_BLOCKING, 0, NULL);
 		for (;;) {
 			struct pollfd pfd = { fd, POLLOUT, 0 };
@@ -2943,7 +2945,6 @@ static int phasync_crypto_enable(php_stream *stream, int option, int value, php_
 			}
 		}
 		orig->set_option(stream, PHP_STREAM_OPTION_BLOCKING, 1, NULL);
-		e->applied = 0;
 	} else {
 		rc = orig->set_option(stream, option, value, cp);
 	}
@@ -2978,11 +2979,7 @@ static int phasync_wrapped_set_option(php_stream *stream, int option, int value,
 
 static int phasync_wrapped_set_option_inner(php_stream *stream, int option, int value, void *ptrparam)
 {
-	if (option == PHP_STREAM_OPTION_BLOCKING) {
-		phasync_hook_entry *e = phasync_entry_ensure(stream, phasync_stream_fd(stream));
-		e->want_block = (value != 0);
-		e->applied    = -1;   /* orig is about to change the fd; re-apply on next I/O */
-	} else if (option == PHP_STREAM_OPTION_CRYPTO_API && ptrparam
+	if (option == PHP_STREAM_OPTION_CRYPTO_API && ptrparam
 	        && ((php_stream_xport_crypto_param *) ptrparam)->op == STREAM_XPORT_CRYPTO_OP_ENABLE) {
 		return phasync_crypto_enable(stream, option, value, (php_stream_xport_crypto_param *) ptrparam);
 	} else if (option == PHP_STREAM_OPTION_MMAP_API && value == PHP_STREAM_MMAP_SUPPORTED
@@ -3041,17 +3038,8 @@ static int phasync_wrapped_close(php_stream *stream, int close_handle)
 			}
 			close(e->pidfd);
 		}
-		/* If we forced a detached fd non-blocking but the caller wanted blocking,
-		 * hand it back the way they left it. */
-		if (!close_handle && e->applied == 1 && e->want_block) {
-			php_socket_t fd = phasync_stream_fd(stream);
-			if (fd != -1) {
-				int flags = fcntl(fd, F_GETFL, 0);
-				if (flags != -1) {
-					fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-				}
-			}
-		}
+		/* Nothing to hand back here: we never leave a stream's fd mode changed
+		 * after an op, so there is nothing to restore on close. */
 		zend_hash_index_del(&PHASYNC_G(hooked), (zend_ulong) (uintptr_t) stream);
 	}
 	return orig->close(stream, close_handle);
@@ -4079,7 +4067,7 @@ static ssize_t phasync_stdio_read(php_stream *stream, char *buf, size_t count)
 	if (sp && stream->ops == &php_stream_stdio_ops
 	 && (fd = phasync_stream_fd(stream)) != -1 && fstat(fd, &st) == 0 && S_ISFIFO(st.st_mode)) {
 		PHASYNC_G(spawn) = NULL;
-		phasync_entry_ensure(stream, fd)->pidfd = phasync_new_child_pidfd(sp);
+		phasync_entry_ensure(stream)->pidfd = phasync_new_child_pidfd(sp);
 		phasync_wrap_stream(stream, PHASYNC_MODE_RAW);
 		return stream->ops->read(stream, buf, count);
 	}
@@ -4168,7 +4156,7 @@ static ZEND_NAMED_FUNCTION(phasync_popen_override)
 	}
 	php_stream_from_zval_no_verify(s, return_value);
 	if (s) {
-		phasync_entry_ensure(s, phasync_stream_fd(s))->pidfd = phasync_new_child_pidfd(&sp);
+		phasync_entry_ensure(s)->pidfd = phasync_new_child_pidfd(&sp);
 		phasync_wrap_stream(s, PHASYNC_MODE_RAW);
 	}
 }
