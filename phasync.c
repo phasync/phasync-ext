@@ -4744,7 +4744,11 @@ static ZEND_NAMED_FUNCTION(phasync_stream_socket_pair_override)
  *   3. probes again; a handler timeout means the select timed out (native: 0, all
  *      arrays emptied). */
 
-static php_socket_t phasync_select_fd_stream(zval *elem)
+/* *stream_out is this element's close-tracking key: the php_stream* for
+ * stream_select() (matching phasync_stream_forget()), always NULL for
+ * socket_select() (matching phasync_socket_close_override()'s bare-fd
+ * registrations) -- see phasync_select_watch_add(). */
+static php_socket_t phasync_select_fd_stream(zval *elem, php_stream **stream_out)
 {
 	php_stream *s = NULL;
 	php_socket_t fd = -1;
@@ -4758,6 +4762,7 @@ static php_socket_t phasync_select_fd_stream(zval *elem)
 			(void *) &fd, 0) != SUCCESS) {
 		return -1;
 	}
+	*stream_out = s;
 	return fd;
 }
 
@@ -4788,9 +4793,20 @@ static php_socket_t phasync_select_fd_socket(zval *elem)
 	return (fd >= 0 && fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode)) ? fd : -1;
 }
 
+/* phasync_select_fd_socket(), plus the close-tracking key (always NULL: a
+ * socket is never a php_stream, see phasync_select_fd_stream()). */
+static php_socket_t phasync_select_fd_socket_ex(zval *elem, php_stream **stream_out)
+{
+	php_socket_t fd = phasync_select_fd_socket(elem);
+	if (fd >= 0) {
+		*stream_out = NULL;
+	}
+	return fd;
+}
+
 /* An epoll fd watching every descriptor in the three sets (read/write/except),
  * or -1 if none could be registered. */
-static int phasync_select_epoll(zval *sets[3], php_socket_t (*fd_of)(zval *))
+static int phasync_select_epoll(zval *sets[3], php_socket_t (*fd_of)(zval *, php_stream **))
 {
 	static const uint32_t ev[3] = { EPOLLIN, EPOLLOUT, EPOLLPRI };
 	HashTable events;
@@ -4803,7 +4819,8 @@ static int phasync_select_epoll(zval *sets[3], php_socket_t (*fd_of)(zval *))
 			continue;
 		}
 		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(sets[i]), elem) {
-			php_socket_t fd = fd_of(elem);
+			php_stream *s;
+			php_socket_t fd = fd_of(elem, &s);
 			zval *cur;
 			if (fd < 0) {
 				continue;
@@ -4836,8 +4853,185 @@ static int phasync_select_epoll(zval *sets[3], php_socket_t (*fd_of)(zval *))
 	return epfd;
 }
 
+/* ---- stream_select()/socket_select(): waking on a close mid-wait (#16) ----
+ *
+ * phasync_select_epoll()'s epfd is private to this call and unknown to any
+ * Poller, so a watched stream's own descriptor closing -- by another
+ * coroutine, while we wait -- never reaches it: Linux drops a closed fd from
+ * epoll silently (there is no "the peer closed its end" event when OUR OWN
+ * process is the one that closed it), so without more the wait only ever
+ * ends at its timeout (or never, with none).
+ *
+ * A close already wakes an ordinary read/write wait on that stream, through
+ * its Poller registration (phasync_stream_forget() for a php_stream,
+ * phasync_socket_close_override() for a bare socket fd). select() gets the
+ * same wake by registering each watched stream there too -- one phasync_reg
+ * slot per stream, under the SAME slot number as the epfd wait, so a close
+ * pushes it exactly like a ready epfd would; phasync_park() only ever needs
+ * one slot to return. Best-effort: a stream already claimed in both
+ * directions by another coroutine's real, concurrent wait keeps today's
+ * behavior for that one stream (it is not watched for a fast close; the call
+ * still wakes, natively, at the timeout). */
+typedef struct {
+	php_socket_t fd;
+	php_stream  *stream;   /* the close-tracking key: NULL for a socket */
+	int          idx;      /* the direction slot claimed: 0 read, 1 write */
+} phasync_select_watch;
+
+/* Claim close-notice on (stream, fd) under slot, in whichever direction is
+ * free. False (nothing claimed: both directions already belong to a real,
+ * concurrent waiter) leaves *w untouched. */
+static bool phasync_select_watch_add(phasync_poller *p, php_stream *stream, php_socket_t fd,
+                                     zend_long slot, phasync_select_watch *w)
+{
+	phasync_reg *r = zend_hash_index_find_ptr(&p->regs, (zend_ulong) fd);
+
+	if (r != NULL && r->stream != stream) {
+		return false;   /* owned by a different, still-live registration */
+	}
+	if (r == NULL) {
+		r = pecalloc(1, sizeof(*r), 1);
+		r->fd = fd;
+		r->stream = stream;
+		r->slot[0] = r->slot[1] = -1;
+		r->sid[0] = r->sid[1] = -1;
+		r->hooked = stream != NULL && phasync_has_close_hook(stream);
+		zend_hash_index_add_new_ptr(&p->regs, (zend_ulong) fd, r);
+	}
+	if (r->slot[0] >= 0 && r->slot[1] >= 0) {
+		return false;   /* both directions already belong to a real waiter */
+	}
+	w->idx = r->slot[0] < 0 ? 0 : 1;
+	r->slot[w->idx] = slot;
+	w->fd = fd;
+	w->stream = stream;
+	return true;
+}
+
+/* True once phasync_stream_forget()/phasync_socket_close_override() has found
+ * and dropped this registration: a close of its stream. Never dereferences
+ * the stream itself -- by the time this runs, w->stream may already be
+ * freed; it is only ever used as a hash key. */
+static bool phasync_select_watch_closed(phasync_poller *p, const phasync_select_watch *w)
+{
+	phasync_reg *r = zend_hash_index_find_ptr(&p->regs, (zend_ulong) w->fd);
+	return r == NULL || r->stream != w->stream;
+}
+
+/* Not closed: let go of our slot claim, leaving the registration (it may be a
+ * hooked stream's, reused by its next real op) exactly as an ordinary wait's
+ * phasync_wait_settle() would. */
+static void phasync_select_watch_release(phasync_poller *p, const phasync_select_watch *w)
+{
+	phasync_reg *r = zend_hash_index_find_ptr(&p->regs, (zend_ulong) w->fd);
+	if (r != NULL && r->stream == w->stream) {
+		r->slot[w->idx] = -1;
+	}
+}
+
+/* One descriptor named in the select's sets, found while phasync_select_epoll()'s
+ * caller made its own pass (so fd_of() is never called again once we might be
+ * waiting: safe against a watched stream closing under us mid-wait, and cheaper
+ * than a second pass). elem points into saved[] (our own copy of the caller's
+ * arrays), stable and safe to copy from regardless of what its resource does
+ * meanwhile. */
+typedef struct {
+	php_socket_t fd;
+	php_stream  *stream;
+	int          set;      /* 0 read, 1 write, 2 except: which of saved[] */
+	zval        *elem;
+	zend_string *key_str;  /* this element's original array key: */
+	zend_ulong   key_idx;  /* key_str, else key_idx (key_str == NULL) */
+} phasync_select_cand;
+
+/* Wait for the select's private epfd to be readable, or for a close of one of
+ * the candidates -- whichever comes first. PHASYNC_WAIT_READY: the epfd is
+ * readable, probe the sets again as usual. PHASYNC_WAIT_CLOSED: *closed is the
+ * index (into cands) of one candidate that closed; the caller reports every
+ * candidate sharing its fd directly, as native PHP would once the caller's own
+ * next op on the same descriptor fails. PHASYNC_WAIT_TIMEOUT/_ERROR as
+ * phasync_wait_fd(). */
+static int phasync_select_wait(phasync_poller *p, int epfd, phasync_select_cand *cands, int ncands,
+                               double timeout, zend_class_entry *timeout_ce, int *closed)
+{
+	phasync_select_watch *watches = ncands ? safe_emalloc(ncands, sizeof(*watches), 0) : NULL;
+	int *widx = ncands ? safe_emalloc(ncands, sizeof(*widx), 0) : NULL;   /* cands[i] -> watches[], or -1 */
+	int i, n = 0;
+	zend_long slot;
+	int rc = PHASYNC_WAIT_READY;
+	phasync_reg *er;
+
+	if ((slot = phasync_get_slot(p)) < 0) {
+		if (watches) { efree(watches); efree(widx); }
+		return PHASYNC_WAIT_ERROR;
+	}
+	for (i = 0; i < ncands; i++) {
+		widx[i] = phasync_select_watch_add(p, cands[i].stream, cands[i].fd, slot, &watches[n]) ? n++ : -1;
+	}
+
+	/* The epfd itself, transient (stream == NULL, like any bare-fd wait), under
+	 * the same slot: phasync_reg_arm() below (oneshot) is what actually makes
+	 * poll() wake us for it; the watches above only ever wake us for a close. */
+	er = zend_hash_index_find_ptr(&p->regs, (zend_ulong) epfd);
+	if (er == NULL) {
+		er = pecalloc(1, sizeof(*er), 1);
+		er->fd = epfd;
+		er->slot[0] = er->slot[1] = -1;
+		er->sid[0] = er->sid[1] = -1;
+		er->transient = true;
+		zend_hash_index_add_new_ptr(&p->regs, (zend_ulong) epfd, er);
+	}
+	er->slot[0] = slot;
+	p->armed++;
+	if (phasync_reg_arm(p, er) != 0) {
+		er->slot[0] = -1;
+		p->armed--;
+		zend_throw_error(NULL, "Unable to wait on the select() epoll instance: %s", strerror(errno));
+		rc = PHASYNC_WAIT_ERROR;
+	} else {
+		GC_ADDREF(&p->std);
+		rc = phasync_park(p, slot, timeout, timeout_ce);
+		OBJ_RELEASE(&p->std);
+	}
+
+	/* Settle: the epfd's own registration first (as phasync_wait_settle() does
+	 * for a transient bare-fd wait), then every watch that is not what woke
+	 * us. A close leaves its watch's registration already gone (dropped by
+	 * whichever of phasync_stream_forget()/phasync_socket_close_override() found
+	 * it); anything else here is released, never dropped -- it may be a hooked
+	 * stream's persistent registration, reused by its next real op. */
+	er = zend_hash_index_find_ptr(&p->regs, (zend_ulong) epfd);
+	if (er != NULL && er->slot[0] == slot) {
+		er->slot[0] = -1;
+		p->armed--;
+	}
+	if (er != NULL && er->transient && er->slot[0] < 0 && er->slot[1] < 0) {
+		phasync_reg_drop(p, er);
+	}
+
+	*closed = -1;
+	for (i = 0; i < ncands; i++) {
+		if (widx[i] < 0) {
+			continue;
+		}
+		if (phasync_select_watch_closed(p, &watches[widx[i]])) {
+			if (*closed < 0 && (rc == PHASYNC_WAIT_READY || rc == PHASYNC_WAIT_TIMEOUT)) {
+				*closed = i;
+				rc = PHASYNC_WAIT_CLOSED;
+			}
+		} else {
+			phasync_select_watch_release(p, &watches[widx[i]]);
+		}
+	}
+	if (watches) {
+		efree(watches);
+		efree(widx);
+	}
+	return rc;
+}
+
 static void phasync_select_common(INTERNAL_FUNCTION_PARAMETERS, const char *fname,
-		void (*orig)(INTERNAL_FUNCTION_PARAMETERS), php_socket_t (*fd_of)(zval *))
+		void (*orig)(INTERNAL_FUNCTION_PARAMETERS), php_socket_t (*fd_of)(zval *, php_stream **))
 {
 	zval *sets[3], saved[3], fn;
 	zend_long sec = 0, usec = 0;
@@ -4920,7 +5114,13 @@ static void phasync_select_common(INTERNAL_FUNCTION_PARAMETERS, const char *fnam
 		if (remaining <= 0) {
 			w = PHASYNC_WAIT_TIMEOUT;
 		} else {
-			/* 2. wait for any of them via one pollable epoll fd */
+			/* 2. wait for any of them via one pollable epoll fd, or for a close of
+			 * one of them (#16): a single safe pass builds both the epoll set and
+			 * the candidates phasync_select_wait() watches for a close, so a
+			 * watched stream's fd is never touched again once we might wait on it. */
+			phasync_select_cand *cands;
+			int ncands = 0, cap = 0, closed = -1;
+
 			epfd = phasync_select_epoll(savedp, fd_of);
 			if (epfd < 0) {
 				/* nothing pollable to wait on: fall back to the native call */
@@ -4929,8 +5129,70 @@ static void phasync_select_common(INTERNAL_FUNCTION_PARAMETERS, const char *fnam
 				orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 				return;
 			}
-			w = phasync_wait_fd(PHASYNC_READ, NULL, epfd, remaining);
+			for (i = 0; i < 3; i++) {
+				if (Z_TYPE_P(savedp[i]) == IS_ARRAY) {
+					cap += zend_hash_num_elements(Z_ARRVAL_P(savedp[i]));
+				}
+			}
+			cands = cap ? safe_emalloc(cap, sizeof(*cands), 0) : NULL;
+			for (i = 0; i < 3; i++) {
+				zval *elem;
+				if (Z_TYPE_P(savedp[i]) != IS_ARRAY) {
+					continue;
+				}
+				zend_string *key_str;
+				zend_ulong key_idx;
+				ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(savedp[i]), key_idx, key_str, elem) {
+					php_stream *s;
+					php_socket_t fd = fd_of(elem, &s);
+					if (fd < 0) {
+						continue;
+					}
+					cands[ncands].fd      = fd;
+					cands[ncands].stream  = s;
+					cands[ncands].set     = i;
+					cands[ncands].elem    = elem;
+					cands[ncands].key_str = key_str;
+					cands[ncands].key_idx = key_idx;
+					ncands++;
+				} ZEND_HASH_FOREACH_END();
+			}
+			w = phasync_select_wait(PHASYNC_G(scope_top)->poller, epfd, cands, ncands, remaining,
+				PHASYNC_G(scope_top)->timeout_ce, &closed);
 			close(epfd);
+			if (w == PHASYNC_WAIT_CLOSED) {
+				/* The closed descriptor is reported ready in whichever sets it was
+				 * in (so the caller's next op on it fails as it would natively);
+				 * everything else is dropped, exactly as a native timeout drops
+				 * everything -- we do not know it is ready, only that it is not
+				 * the one that closed. */
+				php_socket_t cfd = cands[closed].fd;
+				int n = 0;
+				for (i = 0; i < 3; i++) {
+					if (sets[i]) {
+						zval_ptr_dtor(sets[i]);
+						array_init(sets[i]);
+					}
+				}
+				for (i = 0; i < ncands; i++) {
+					if (cands[i].fd == cfd && sets[cands[i].set]) {
+						HashTable *dst = Z_ARRVAL_P(sets[cands[i].set]);
+						Z_TRY_ADDREF_P(cands[i].elem);
+						if (cands[i].key_str) {
+							zend_hash_update(dst, cands[i].key_str, cands[i].elem);
+						} else {
+							zend_hash_index_update(dst, cands[i].key_idx, cands[i].elem);
+						}
+						n++;
+					}
+				}
+				RETVAL_LONG(n);
+				efree(cands);
+				break;
+			}
+			if (cands) {
+				efree(cands);
+			}
 		}
 		if (w == PHASYNC_WAIT_TIMEOUT) {
 			for (i = 0; i < 3; i++) {       /* native timeout: 0, every array emptied */
@@ -4960,7 +5222,7 @@ static ZEND_NAMED_FUNCTION(phasync_stream_select_override)
 static ZEND_NAMED_FUNCTION(phasync_socket_select_override)
 {
 	phasync_select_common(INTERNAL_FUNCTION_PARAM_PASSTHRU, "socket_select",
-		PHASYNC_G(orig_socket_select), phasync_select_fd_socket);
+		PHASYNC_G(orig_socket_select), phasync_select_fd_socket_ex);
 }
 
 /* ---- ext/sockets: socket_read() & co. -------------------------------------
