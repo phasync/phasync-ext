@@ -1,5 +1,5 @@
 --TEST--
-virtualize(): $_GET, $_POST, $_COOKIE, $_SERVER, $_FILES and $_REQUEST are the boundary's own, built from $sapi as PHP builds them per request, across suspensions and in fibers started inside
+virtualize(): $_GET, $_POST, $_COOKIE, $_SERVER, $_FILES and $_REQUEST are built from $sapi as PHP builds them per request; a server swapping the global variables around resuming a request's fibers keeps them the request's across suspensions and in fibers started inside
 --EXTENSIONS--
 phasync
 filter
@@ -65,10 +65,12 @@ $request = function (string $who) use (&$log, $moved) {
 };
 $fa = new Fiber(fn() => virtualize($request('a'), $a));
 $fb = new Fiber(fn() => virtualize($request('b'), $b));
-$fa->start(); $fb->start();
+// The worker swaps each request's global variables in around resuming it (sink.inc).
+$ga = new RequestGlobals; $gb = new RequestGlobals;
+$ga->run($fa); $gb->run($fb);
 $log[] = 'worker between: ' . json_encode([$worker === [$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST], filter_input(INPUT_GET, 'q')]);
-$fb->resume(); $fa->resume();
-$fa->resume(); $fb->resume();
+$gb->run($fb); $ga->run($fa);
+$ga->run($fa); $gb->run($fb);
 echo implode("\n", $log), "\n";
 echo file_get_contents($moved), "\n";
 unlink($moved);
@@ -76,9 +78,12 @@ var_dump($worker === [$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST]);
 
 // $_SERVER: PHP's own REQUEST_TIME, no argv of the worker's command line.
 $s = new Sink;
+$g = new RequestGlobals;
+$g->enter();
 virtualize(function () use (&$got) {
     $got = [isset($_SERVER['argv']), is_int($_SERVER['REQUEST_TIME']), is_float($_SERVER['REQUEST_TIME_FLOAT'])];
 }, $s);
+$g->leave();
 var_dump($got, isset($_SERVER['argv']));
 
 // Without the optional methods: empty, but for PHP's REQUEST_TIME entries.
@@ -90,9 +95,15 @@ virtualize(function () use (&$got) {
     $got = [$_GET, $_POST, $_COOKIE, $_FILES, $_REQUEST, array_keys($_SERVER), filter_input(INPUT_COOKIE, 'sid')];
 }, $plain);
 echo json_encode($got), "\n";
+// Not swapped, the request's superglobals are left in the global variables.
+var_dump($worker === [$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST], $_GET === [] && !isset($_SERVER['argv']));
+[$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST] = $worker;
 
 // A request assigning a superglobal changes its own only.
-virtualize(function () { $_GET['added'] = 1; $_SERVER = []; unset($_COOKIE); }, new Sink);
+$g = new RequestGlobals;
+$g->enter();
+virtualize(function () { $_GET['added'] = 1; $_SERVER = []; $_COOKIE = null; }, new Sink);
+$g->leave();
 var_dump(isset($_GET['added']), $_SERVER === $worker[3], isset($_COOKIE));
 ?>
 --EXPECTF--
@@ -116,6 +127,8 @@ array(3) {
 }
 bool(true)
 [[],[],[],[],[],["REQUEST_TIME_FLOAT","REQUEST_TIME"],null]
+bool(false)
+bool(true)
 bool(false)
 bool(true)
 bool(true)

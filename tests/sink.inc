@@ -47,3 +47,46 @@ class Sink
         return $s;
     }
 }
+
+// A request's own global variables: the superglobals and $_SESSION. virtualize()
+// leaves global variables to the server, which swaps them around each resume of
+// the request's fibers, as here: enter() before, leave() after.
+final class RequestGlobals
+{
+    private array $own = [];       // the request's, while it isn't running
+    private array $outer = [];     // what it replaced, while it is
+
+    public function enter(): void
+    {
+        $this->outer = [$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST, &$_SESSION];
+        unset($_SESSION);          // $_SESSION: undefined, not null, without a session
+        if ($this->own) {
+            [$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST] = $this->own;
+            if (isset($this->own[6])) {
+                $_SESSION = &$this->own[6];   // the reference ext/session holds
+            }
+        }
+    }
+
+    public function leave(): void
+    {
+        $this->own = [$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST, &$_SESSION];
+        unset($_SESSION);
+        [$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST] = $this->outer;
+        if (isset($this->outer[6])) {
+            $_SESSION = &$this->outer[6];
+        }
+        $this->outer = [];
+    }
+
+    /** $fiber->start() or ->resume(), with the request's globals. */
+    public function run(Fiber $fiber): void
+    {
+        $this->enter();
+        try {
+            $fiber->isStarted() ? $fiber->resume() : $fiber->start();
+        } finally {
+            $this->leave();
+        }
+    }
+}

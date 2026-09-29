@@ -306,11 +306,11 @@ state PHP otherwise keeps once per process:
 | `header()`, `header_remove()`, `headers_list()`, `headers_sent()`, `http_response_code()`, `setcookie()`, session cookies | the response headers and status |
 | `header_register_callback()` | the header callback |
 | `php://input`, `request_parse_body()`, `is_uploaded_file()`, `move_uploaded_file()` | the request body and uploads |
-| `$_GET`, `$_POST`, `$_COOKIE`, `$_SERVER`, `$_FILES`, `$_REQUEST`, `filter_input()` | the request's input |
+| `filter_input()`, and the superglobals as the request starts | the request's input |
 | `connection_aborted()`, `connection_status()`, `ignore_user_abort()` | user-abort state |
 | `register_shutdown_function()` | the shutdown functions |
 | `set_error_handler()`, `set_exception_handler()`, `restore_*()` | the error and exception handlers |
-| `$_SESSION`, `session_start()`, `session_id()`, `session_status()`, `session_set_save_handler()`, ... | the session: its id, status, save handler and data |
+| `session_start()`, `session_id()`, `session_status()`, `session_set_save_handler()`, ... | the session: its id, status, save handler and data |
 
 The fiber observers swap that state when execution moves between boundaries, so
 these functions run PHP's own code, with no override and no cost outside a
@@ -355,20 +355,54 @@ plus PHP's `REQUEST_TIME` entries (no `argv`, and not the process environment),
 `$_POST` and `$_FILES` from a POST's urlencoded or multipart body (read through
 `read_post()` before the code runs, as PHP does; `move_uploaded_file()` works),
 and `$_REQUEST` by `request_order`. Without the optional methods they are empty
-arrays. Other bodies are read only when the code reads `php://input`. A
-`session_start()` finds the session id in the request's own `$_COOKIE`.
+arrays. Other bodies are read only when the code reads `php://input`.
 
-Each request starts with the session state of a fresh request (no session, no
-`$_SESSION`, the worker's save handler) and ends by writing and closing its session, as PHP ends a
+Each request starts with the session state of a fresh request (no session, the
+worker's save handler) and ends by writing and closing its session, as PHP ends a
 request. Two concurrent requests on the same session take turns on its lock, as
 under php-fpm: with the files handler, inside `manage()`, the second waits
 cooperatively instead of blocking the worker. Settings behind INI entries, such
 as `session_name()` and the cookie parameters, stay shared by the worker's
 requests, like any `ini_set()`.
 
-Other global variables are not isolated, and a fatal error still ends the worker
-(after being displayed in the request's output, as natively). Nesting
-`virtualize()` throws.
+Global variables are not isolated, the superglobals and `$_SESSION` included:
+PHP builds the request's superglobals into them as it starts, and
+`session_start()` sets `$_SESSION`. A server running requests concurrently swaps
+them itself around each resume of a request's fibers:
+
+```php
+final class RequestGlobals
+{
+    private array $own = [], $outer = [];
+
+    public function enter(): void   // before the request's code runs or resumes
+    {
+        $this->outer = [$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST, &$_SESSION];
+        unset($_SESSION);
+        if ($this->own) {
+            [$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST] = $this->own;
+            if (isset($this->own[6])) $_SESSION = &$this->own[6];
+        }
+    }
+
+    public function leave(): void   // once it suspends or ends
+    {
+        $this->own = [$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST, &$_SESSION];
+        unset($_SESSION);
+        [$_GET, $_POST, $_COOKIE, $_SERVER, $_FILES, $_REQUEST] = $this->outer;
+        if (isset($this->outer[6])) $_SESSION = &$this->outer[6];
+    }
+}
+```
+
+`$_SESSION` is rebound by reference, so it stays the reference ext/session saves
+from; the other arrays by value, as some of PHP's C code (`SoapServer`, the URL
+rewriter) reads `$_SERVER` without dereferencing a reference. Any other state a
+server keeps per request (static properties, `date_default_timezone_set()`, ...)
+swaps the same way.
+
+A fatal error still ends the worker (after being displayed in the request's
+output, as natively). Nesting `virtualize()` throws.
 
 ## Status
 

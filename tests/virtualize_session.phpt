@@ -55,22 +55,24 @@ var_dump($seen);
 virtualize(function () use (&$seen) { session_start(); $seen = [session_id(), $_SESSION]; }, Sink::withSession($alice));
 var_dump($seen[0] === $alice, $seen[1]);
 
-// Two requests interleaved, each with its own session and $_SESSION.
+// Two requests interleaved, each with its own session, and its own $_SESSION as
+// the server swaps the global variables (RequestGlobals, sink.inc).
 $a = Sink::withSession($alice); $b = new Sink;
+$ga = new RequestGlobals; $gb = new RequestGlobals;
 $fa = new Fiber(fn() => virtualize(function () {
     session_start();
     Fiber::suspend();
     $_SESSION['visits'] = ($_SESSION['visits'] ?? 0) + 1;
     echo session_id() === $GLOBALS['alice'] ? "a: alice's session" : "a: WRONG session";
 }, $a));
-$fa->start();
+$ga->run($fa);
 $fb = new Fiber(fn() => virtualize(function () {
     session_start();
     Fiber::suspend();
     echo session_id() !== $GLOBALS['alice'] ? "b: a new session" : "b: WRONG session";
 }, $b));
-$fb->start();
-$fa->resume(); $fb->resume();
+$gb->run($fb);
+$ga->run($fa); $gb->run($fb);
 echo $a->out, "\n", $b->out, "\n";
 virtualize(function () use (&$seen) { session_start(); $seen = $_SESSION; }, Sink::withSession($alice));
 var_dump($seen);

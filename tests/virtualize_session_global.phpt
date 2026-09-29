@@ -1,5 +1,5 @@
 --TEST--
-virtualize(): $_SESSION is per request, as the session it belongs to (#13)
+virtualize(): a server swapping $_SESSION with the other global variables around resuming a request's fibers gives each request its own, still the reference ext/session holds (#13)
 --EXTENSIONS--
 phasync
 session
@@ -21,20 +21,22 @@ $dir = sys_get_temp_dir() . '/phasync_sessg_' . getmypid();
 ini_set('session.save_path', $dir);
 $saved = fn(string $id) => @file_get_contents("$dir/sess_$id");
 
-// The worker's own $_SESSION, a plain global here: boundaries leave it alone.
+// The worker's own $_SESSION, a plain global here.
 $_SESSION = ['worker' => true];
 
-// Runs each closure as a request in its own fiber, resuming them in turn until all end.
+// Runs each closure as a request in its own fiber, resuming them in turn until all
+// end, each with its own global variables (RequestGlobals, sink.inc).
 function interleave(array $requests): void {
-    $fibers = [];
+    $fibers = $globals = [];
     foreach ($requests as $name => [$code, $sapi]) {
         $fibers[$name] = new Fiber(fn() => virtualize($code, $sapi));
-        $fibers[$name]->start();
+        $globals[$name] = new RequestGlobals;
+        $globals[$name]->run($fibers[$name]);
     }
     while ($fibers) {
         echo "worker: ", json_encode($_SESSION), "\n";
         foreach ($fibers as $name => $f) {
-            if ($f->isTerminated()) unset($fibers[$name]); else $f->resume();
+            if ($f->isTerminated()) unset($fibers[$name]); else $globals[$name]->run($f);
         }
     }
     foreach ($requests as [, $sapi]) echo $sapi->out;   // what each request echoed
