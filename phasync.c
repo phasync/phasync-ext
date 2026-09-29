@@ -8016,6 +8016,21 @@ static const zend_function_entry phasync_checkpoint_functions[] = {
 };
 static zend_string *phasync_checkpoint_name;
 static zend_string *phasync_preempt_due_name;
+#if PHP_VERSION_ID >= 80400
+static zend_result (*phasync_prev_post_startup_cb)(void);
+
+/* Chained onto zend_post_startup_cb (see phasync_checkpoint_startup()): hides
+ * checkpoint() from CG(function_table) once it is safe to. */
+static zend_result phasync_checkpoint_hide(void)
+{
+	dtor_func_t dtor = CG(function_table)->pDestructor;
+
+	CG(function_table)->pDestructor = NULL;
+	zend_hash_del(CG(function_table), phasync_checkpoint_name);
+	CG(function_table)->pDestructor = dtor;
+	return phasync_prev_post_startup_cb ? phasync_prev_post_startup_cb() : SUCCESS;
+}
+#endif
 
 /* Compile time, before opcache optimizes and caches the op_array: pass_two()
  * calls this first, while jump targets are still opline numbers and break,
@@ -8313,15 +8328,21 @@ static void phasync_checkpoint_startup(void)
 		}
 	}
 	/* Frameless calls reach it through zend_flf_handlers/zend_flf_functions, not
-	 * by name: take it out of the function table (without freeing it, MSHUTDOWN
-	 * does), so PHP code can neither see nor call it. */
-	{
-		dtor_func_t dtor = CG(function_table)->pDestructor;
-
-		CG(function_table)->pDestructor = NULL;
-		zend_hash_del(CG(function_table), phasync_checkpoint_name);
-		CG(function_table)->pDestructor = dtor;
-	}
+	 * by name, so it can come out of the function table (without freeing it,
+	 * MSHUTDOWN does) -- but not yet. zend_observer_post_startup() (main.c,
+	 * called after every module's MINIT, including this one) walks every
+	 * function still in CG(function_table) and gives it the extra call-frame
+	 * temp (common.T) an observed function needs to link its caller's observed
+	 * frame (zend_observer.c's prev_observed_frame()). Removed here already,
+	 * checkpoint's T stays 0; a checkpoint() call that Xdebug's observer sees
+	 * then has prev_observed_frame() index the frame at (uint32_t) -1 and write
+	 * through it, corrupting memory near the call. zend_post_startup_cb runs
+	 * right after zend_observer_post_startup(), while the function table is
+	 * still the writable one MINIT used (zend_post_startup() only freezes a
+	 * read-only copy for ZTS afterward): chain onto it to hide checkpoint()
+	 * once its T is set. */
+	phasync_prev_post_startup_cb = zend_post_startup_cb;
+	zend_post_startup_cb = phasync_checkpoint_hide;
 #endif
 	zend_register_extension(&phasync_zend_extension, NULL);
 }
