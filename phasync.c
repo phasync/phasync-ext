@@ -7630,6 +7630,41 @@ static bool phasync_condition_op(const zend_op *op)
 	}
 }
 
+/* Whether every way on from opline c runs only condition ops until it jumps
+ * back (to a loop head) or returns: the rest of the iteration is its loop's
+ * condition. Paths only go forward; *steps bounds the work. */
+static bool phasync_ends_iteration(const zend_op_array *op_array, uint32_t c, uint32_t *steps)
+{
+	for (; c < op_array->last && (*steps)-- > 0; c++) {
+		const zend_op *op = &op_array->opcodes[c];
+		uint32_t target;
+
+		switch (op->opcode) {
+			case ZEND_RETURN:
+				return true;
+			case ZEND_JMP:
+				target = (uint32_t) (OP_JMP_ADDR(op, op->op1) - op_array->opcodes);
+				if (target <= c) {
+					return true;
+				}
+				c = target - 1;
+				continue;
+			case ZEND_JMPZ:
+			case ZEND_JMPNZ:
+				target = (uint32_t) (OP_JMP_ADDR(op, op->op2) - op_array->opcodes);
+				if (target > c && !phasync_ends_iteration(op_array, target, steps)) {
+					return false;
+				}
+				continue;
+			default:
+				if (!phasync_condition_op(op)) {
+					return false;
+				}
+		}
+	}
+	return false;
+}
+
 static phasync_loop_info *phasync_loop_info_of(const zend_op_array *op_array)
 {
 	phasync_loop_info *info = ZEND_OP_ARRAY_EXTENSION(op_array, phasync_preempt_handle);
@@ -7675,9 +7710,10 @@ static phasync_loop_info *phasync_loop_info_of(const zend_op_array *op_array)
 			}
 		}
 		/* A condition the loop starts or ends with, however it was written (a
-		 * do-while's, a leading or trailing `if (...) break;`), from after the
-		 * head up to its conditional jump, and from after the body up to the
-		 * backward jump: the tracing JIT may check only after a call in it. */
+		 * do-while's, a leading or trailing `if (...) break;`): from after the
+		 * head up to its conditional jump, and from after the body on. The
+		 * tracing JIT may check only after a call in it, and PHP < 8.4 checks
+		 * after a C call and then not at the head. */
 		for (uint32_t c = t; c < i && phasync_condition_op(&op_array->opcodes[c]); c++) {
 			uint8_t next = op_array->opcodes[c + 1].opcode;
 
@@ -7688,11 +7724,12 @@ static phasync_loop_info *phasync_loop_info_of(const zend_op_array *op_array)
 				break;
 			}
 		}
-		for (uint32_t c = i; ; c--) {
-			info->heads[c / 32] |= 1u << (c % 32);
-			if (c <= t + 1 || !phasync_condition_op(&op_array->opcodes[c - 1])) {
+		for (uint32_t c = i, steps; c > t; c--) {
+			steps = 32;
+			if (!phasync_ends_iteration(op_array, c, &steps)) {
 				break;
 			}
+			info->heads[c / 32] |= 1u << (c % 32);
 		}
 	}
 	ZEND_OP_ARRAY_EXTENSION(op_array, phasync_preempt_handle) = info;

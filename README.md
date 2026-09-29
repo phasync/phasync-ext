@@ -487,7 +487,8 @@ does not check at a loop head, a loop is interrupted later or not at all:
   none (the function JIT and the interpreter check every loop).
 - On PHP < 8.4 without JIT, the check after a C call can't be followed by one
   at the loop head, so a `do`-`while`, or a loop left by `break`, whose time
-  goes mostly into calls is interrupted later than the interval.
+  goes mostly into C calls outside its condition is interrupted later than
+  the interval.
 
 ## Status
 
