@@ -7607,6 +7607,29 @@ static void phasync_preempt_fork_child(void)
  * loops, their condition, from where their entry JMP jumps to up to the backward
  * jump: the function JIT checks at its start (the CFG's loop header), and the
  * engine after an internal call in it (PHP < 8.4, the tracing JIT). */
+/* An op a loop condition is made of: it computes a temporary (a comparison,
+ * arithmetic, a constant, a function call's result) or passes a call's
+ * argument, and writes no variable, property or element. */
+static bool phasync_condition_op(const zend_op *op)
+{
+	switch (op->opcode) {
+		case ZEND_INIT_FCALL: case ZEND_INIT_FCALL_BY_NAME: case ZEND_INIT_NS_FCALL_BY_NAME:
+		case ZEND_SEND_VAL: case ZEND_SEND_VAL_EX: case ZEND_SEND_VAR: case ZEND_SEND_VAR_EX:
+			return true;
+		case ZEND_DO_ICALL: case ZEND_DO_FCALL_BY_NAME:
+		case ZEND_IS_IDENTICAL: case ZEND_IS_NOT_IDENTICAL:
+		case ZEND_IS_EQUAL: case ZEND_IS_NOT_EQUAL:
+		case ZEND_IS_SMALLER: case ZEND_IS_SMALLER_OR_EQUAL:
+		case ZEND_BOOL: case ZEND_BOOL_NOT: case ZEND_BOOL_XOR:
+		case ZEND_ADD: case ZEND_SUB: case ZEND_MUL: case ZEND_DIV: case ZEND_MOD:
+		case ZEND_BW_AND: case ZEND_BW_OR: case ZEND_BW_XOR:
+		case ZEND_QM_ASSIGN: case ZEND_TYPE_CHECK: case ZEND_FETCH_CONSTANT:
+			return (op->result_type & (IS_TMP_VAR | IS_VAR)) != 0;
+		default:
+			return false;
+	}
+}
+
 static phasync_loop_info *phasync_loop_info_of(const zend_op_array *op_array)
 {
 	phasync_loop_info *info = ZEND_OP_ARRAY_EXTENSION(op_array, phasync_preempt_handle);
@@ -7649,6 +7672,26 @@ static phasync_loop_info *phasync_loop_info_of(const zend_op_array *op_array)
 
 			for (; c > t && c <= i; c++) {
 				info->heads[c / 32] |= 1u << (c % 32);
+			}
+		}
+		/* A condition the loop starts or ends with, however it was written (a
+		 * do-while's, a leading or trailing `if (...) break;`), from after the
+		 * head up to its conditional jump, and from after the body up to the
+		 * backward jump: the tracing JIT may check only after a call in it. */
+		for (uint32_t c = t; c < i && phasync_condition_op(&op_array->opcodes[c]); c++) {
+			uint8_t next = op_array->opcodes[c + 1].opcode;
+
+			if (next == ZEND_JMPZ || next == ZEND_JMPNZ) {
+				for (uint32_t h = t + 1; h <= c + 1; h++) {
+					info->heads[h / 32] |= 1u << (h % 32);
+				}
+				break;
+			}
+		}
+		for (uint32_t c = i; ; c--) {
+			info->heads[c / 32] |= 1u << (c % 32);
+			if (c <= t + 1 || !phasync_condition_op(&op_array->opcodes[c - 1])) {
+				break;
 			}
 		}
 	}

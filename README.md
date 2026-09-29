@@ -452,7 +452,9 @@ frame (outside fibers, to the script's own code).
 - A timer thread, not a signal, asks the engine to interrupt, so no syscall
   fails with `EINTR`. `$fn` runs once, without arguments, where execution next
   continues at a loop head (the start of a `while`, `for`, `do`-`while` or
-  `foreach` iteration, or a `while`/`for` condition) and the stack allows it.
+  `foreach` iteration, or a loop's condition: a `while`/`for`/`do`-`while`
+  condition, or an `if (...) break;` a loop starts or ends with, from where
+  it holds only calls and temporaries) and the stack allows it.
   A backward `goto` compiles to the same jump as a loop and counts as one: the
   attribute is the way to make such code uninterruptible. Code without a loop
   (straight-line code, recursion) is never interrupted. A long C call delays it
@@ -480,8 +482,9 @@ measuring noise (a recursive `fib()`, interpreter and JIT). Where the engine
 does not check at a loop head, a loop is interrupted later or not at all:
 
 - Under opcache's tracing JIT, a loop whose trace links into the trace of a
-  function it calls may have no check at its head, and is then not interrupted
-  (the function JIT and the interpreter check every loop).
+  function it calls has no check at its head: it is interrupted after a C call
+  in its condition (`hrtime()`, say), and possibly not at all if its condition calls
+  none (the function JIT and the interpreter check every loop).
 - On PHP < 8.4 without JIT, the check after a C call can't be followed by one
   at the loop head, so a `do`-`while`, or a loop left by `break`, whose time
   goes mostly into calls is interrupted later than the interval.
