@@ -331,7 +331,7 @@ struct phasync_preempt;
 ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	struct phasync_preempt *preempt; /* set_preempt_function()'s timer, NULL = none */
 	zval preempt_fn;              /* its closure, UNDEF = none                     */
-	zend_atomic_bool checkpoint;  /* raised by the timer: the next checkpoint looks */
+	zval *preempt_due;            /* phasync\ext\PREEMPT_DUE's value: true = a checkpoint calls */
 	phasync_scope *scope_top;     /* innermost active manage() scope, or NULL */
 	struct phasync_boundary *vb_cur; /* virtualize(): boundary whose state is live; NULL = the SAPI's */
 	phasync_vstate vroot;         /* the SAPI's own state while a boundary's is live */
@@ -7438,22 +7438,39 @@ static void phasync_ops_dtor(zval *zv)
 
 
 /* set_preempt_function(): every backward jump (a loop's back-edge, a backward
- * goto, foreach's continue) is compiled with a call to phasync_checkpoint()
- * right before it (phasync_inject_checkpoints()). A timer thread raises
- * PHASYNC_G(checkpoint) at most every interval; the next checkpoint that runs
- * calls the closure if the stack allows it. The interval counts from the moment
- * the closure is due there: the thread raises one request at a time.
+ * goto, foreach's continue) is compiled with
+ *     if (\phasync\ext\PREEMPT_DUE) \phasync\ext\checkpoint();
+ * right before it (phasync_inject_checkpoints()). The constant is registered
+ * per request, without CONST_PERSISTENT, so neither the compiler nor opcache
+ * substitutes it; FETCH_CONSTANT reads it through its run-time cache slot, and
+ * both JITs compile that into loads and a compare of its type byte, without a
+ * call. A timer thread raises it at most every interval by storing IS_TRUE into
+ * its type_info (an aligned 32-bit store, single-copy atomic on x86-64 and
+ * aarch64; no data is published through it, so relaxed ordering is enough: the
+ * checkpoint re-checks `pending` and takes the mutex). The next checkpoint that
+ * runs calls the closure if the stack allows it. The interval counts from the
+ * moment the closure is due there: the thread raises one request at a time.
  *
  * A checkpoint the stack rules reject lowers the flag (so the checkpoints that
  * follow cost a load again) and the thread raises it again after
  * PHASYNC_PREEMPT_RETRY. */
 #define PHASYNC_PREEMPT_RETRY_NS 250000L    /* 0.25 ms */
 
+static zend_always_inline void phasync_flag_store(uint32_t *flag, uint32_t type)
+{
+	__atomic_store_n(flag, type, __ATOMIC_RELAXED);
+}
+
+static zend_always_inline bool phasync_flag_raised(void)
+{
+	return __atomic_load_n(&Z_TYPE_INFO_P(PHASYNC_G(preempt_due)), __ATOMIC_RELAXED) == IS_TRUE;
+}
+
 typedef struct phasync_preempt {
 	pthread_mutex_t   mutex;
 	pthread_cond_t    cond;
 	pthread_t         thread;
-	zend_atomic_bool *flag;           /* PHASYNC_G(checkpoint) of the owning PHP thread */
+	uint32_t         *flag;           /* type_info of the owning PHP thread's PREEMPT_DUE */
 	zend_atomic_bool  pending;        /* raised, not yet taken at a checkpoint    */
 	bool              stop;
 	double            interval;
@@ -7493,7 +7510,7 @@ static void *phasync_preempt_main(void *arg)
 			phasync_ts_add_ns(&deadline, PHASYNC_PREEMPT_RETRY_NS);
 			if (pthread_cond_timedwait(&p->cond, &p->mutex, &deadline) == ETIMEDOUT
 			 && zend_atomic_bool_load_ex(&p->pending)) {
-				zend_atomic_bool_store(p->flag, true);
+				phasync_flag_store(p->flag, IS_TRUE);
 			}
 			continue;
 		}
@@ -7503,7 +7520,7 @@ static void *phasync_preempt_main(void *arg)
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
 			zend_atomic_bool_store_ex(&p->pending, true);
-			zend_atomic_bool_store(p->flag, true);
+			phasync_flag_store(p->flag, IS_TRUE);
 			continue;
 		}
 		pthread_cond_timedwait(&p->cond, &p->mutex, &deadline);
@@ -7530,7 +7547,7 @@ static phasync_preempt *phasync_preempt_start(double interval)
 	pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
 	pthread_cond_init(&p->cond, &ca);
 	pthread_condattr_destroy(&ca);
-	p->flag = &PHASYNC_G(checkpoint);
+	p->flag = &Z_TYPE_INFO_P(PHASYNC_G(preempt_due));
 	zend_atomic_bool_init(&p->pending, false);
 	p->interval = interval;
 	clock_gettime(CLOCK_MONOTONIC, &p->since);
@@ -7557,7 +7574,7 @@ static void phasync_preempt_stop(phasync_preempt *p)
 	pthread_cond_destroy(&p->cond);
 	pthread_mutex_destroy(&p->mutex);
 	free(p);
-	zend_atomic_bool_store(&PHASYNC_G(checkpoint), false);
+	phasync_flag_store(&Z_TYPE_INFO_P(PHASYNC_G(preempt_due)), IS_FALSE);
 }
 
 /* fork(): the child has no timer thread. It gets one of its own, with the same
@@ -7662,7 +7679,7 @@ static zend_never_inline void phasync_checkpoint_hit(zend_execute_data *ex, bool
 	const zend_op *saved_op;
 	zval fn, retval;
 
-	zend_atomic_bool_store_ex(&PHASYNC_G(checkpoint), false);
+	phasync_flag_store(&Z_TYPE_INFO_P(PHASYNC_G(preempt_due)), IS_FALSE);
 	if (!p || !zend_atomic_bool_load_ex(&p->pending)) {
 		return;
 	}
@@ -7702,11 +7719,11 @@ static zend_never_inline void phasync_checkpoint_hit(zend_execute_data *ex, bool
 	}
 }
 
-/* The checkpoint: a load and a compare while no preemption is due. PHP 8.4+
- * calls it frameless (the JIT calls it directly); older PHP with a frame. */
+/* The checkpoint, called when PREEMPT_DUE was seen raised (or by user code,
+ * hence the check). PHP 8.4+ calls it frameless; older PHP with a frame. */
 ZEND_FUNCTION(phasync_checkpoint)
 {
-	if (EXPECTED(!zend_atomic_bool_load_ex(&PHASYNC_G(checkpoint)))) {
+	if (EXPECTED(!phasync_flag_raised())) {
 		return;
 	}
 	phasync_checkpoint_hit(execute_data->prev_execute_data, true);
@@ -7715,7 +7732,7 @@ ZEND_FUNCTION(phasync_checkpoint)
 #if PHP_VERSION_ID >= 80400
 ZEND_FRAMELESS_FUNCTION(phasync_checkpoint, 0)
 {
-	if (EXPECTED(!zend_atomic_bool_load_ex(&PHASYNC_G(checkpoint)))) {
+	if (EXPECTED(!phasync_flag_raised())) {
 		return;
 	}
 	phasync_checkpoint_hit(EG(current_execute_data), false);
@@ -7743,6 +7760,7 @@ static const zend_function_entry phasync_checkpoint_functions[] = {
 	ZEND_FE_END
 };
 static zend_string *phasync_checkpoint_name;
+static zend_string *phasync_preempt_due_name;
 
 /* Compile time, before opcache optimizes and caches the op_array: pass_two()
  * calls this first, while jump targets are still opline numbers and break,
@@ -7896,11 +7914,24 @@ static uint32_t phasync_shift_target(uint32_t t, void *arg)
 	return t + lo * s->k;
 }
 
-#if PHP_VERSION_ID >= 80400
-# define PHASYNC_CHECKPOINT_OPS 2   /* FRAMELESS_ICALL_0, FREE */
-#else
-# define PHASYNC_CHECKPOINT_OPS 2   /* INIT_FCALL, DO_ICALL */
-#endif
+/* FETCH_CONSTANT PREEMPT_DUE, JMPZ past the call, then the call:
+ * FRAMELESS_ICALL_0 + FREE on PHP 8.4+, INIT_FCALL + DO_ICALL before. */
+#define PHASYNC_CHECKPOINT_OPS 4
+
+/* Append a literal (a string interned for the process) to a raw op_array. */
+static uint32_t phasync_add_literal(zend_op_array *op_array, zend_string *str)
+{
+	uint32_t lit = op_array->last_literal;
+
+	if (lit >= CG(context).literals_size) {
+		CG(context).literals_size += 16;
+		op_array->literals = erealloc(op_array->literals, CG(context).literals_size * sizeof(zval));
+	}
+	ZVAL_INTERNED_STR(&op_array->literals[lit], str);
+	Z_EXTRA(op_array->literals[lit]) = 0;
+	op_array->last_literal++;
+	return lit;
+}
 
 static void phasync_inject_checkpoints(zend_op_array *op_array)
 {
@@ -7956,33 +7987,37 @@ static void phasync_inject_checkpoints(zend_op_array *op_array)
 				SET_UNUSED(cp[c].result);
 				cp[c].lineno = jump->lineno;
 			}
-#if PHP_VERSION_ID >= 80400
-			cp[0].opcode = ZEND_FRAMELESS_ICALL_0;
-			cp[0].extended_value = phasync_checkpoint_flf_offset;
+			/* FETCH_CONSTANT expects two literals: the name as written and the
+			 * one to look up (namespace lowercased), the same here. */
+			cp[0].opcode = ZEND_FETCH_CONSTANT;
+			cp[0].op1.num = 0;              /* a fully qualified name */
+			cp[0].op2_type = IS_CONST;
+			cp[0].op2.constant = phasync_add_literal(op_array, phasync_preempt_due_name);
+			phasync_add_literal(op_array, phasync_preempt_due_name);
 			cp[0].result_type = IS_TMP_VAR;
 			cp[0].result.var = op_array->T;
-			cp[1].opcode = ZEND_FREE;
+			cp[0].extended_value = op_array->cache_size;
+			op_array->cache_size += sizeof(void *);
+			cp[1].opcode = ZEND_JMPZ;
 			cp[1].op1_type = IS_TMP_VAR;
 			cp[1].op1.var = op_array->T++;
+			cp[1].op2.opline_num = o + k;   /* the jump itself */
+#if PHP_VERSION_ID >= 80400
+			cp[2].opcode = ZEND_FRAMELESS_ICALL_0;
+			cp[2].extended_value = phasync_checkpoint_flf_offset;
+			cp[2].result_type = IS_TMP_VAR;
+			cp[2].result.var = op_array->T;
+			cp[3].opcode = ZEND_FREE;
+			cp[3].op1_type = IS_TMP_VAR;
+			cp[3].op1.var = op_array->T++;
 #else
-			{
-				uint32_t lit = op_array->last_literal;
-
-				if (lit >= CG(context).literals_size) {
-					CG(context).literals_size += 16;
-					op_array->literals = erealloc(op_array->literals, CG(context).literals_size * sizeof(zval));
-				}
-				ZVAL_INTERNED_STR(&op_array->literals[lit], phasync_checkpoint_name);
-				Z_EXTRA(op_array->literals[lit]) = 0;
-				op_array->last_literal++;
-				cp[0].opcode = ZEND_INIT_FCALL;
-				cp[0].op1.num = zend_vm_calc_used_stack(0, phasync_checkpoint_func);
-				cp[0].op2_type = IS_CONST;
-				cp[0].op2.constant = lit;
-				cp[0].result.num = op_array->cache_size;
-				op_array->cache_size += sizeof(void *);
-				cp[1].opcode = ZEND_DO_ICALL;
-			}
+			cp[2].opcode = ZEND_INIT_FCALL;
+			cp[2].op1.num = zend_vm_calc_used_stack(0, phasync_checkpoint_func);
+			cp[2].op2_type = IS_CONST;
+			cp[2].op2.constant = phasync_add_literal(op_array, phasync_checkpoint_name);
+			cp[2].result.num = op_array->cache_size;
+			op_array->cache_size += sizeof(void *);
+			cp[3].opcode = ZEND_DO_ICALL;
 #endif
 			o += k;
 			j++;
@@ -8014,6 +8049,7 @@ static void phasync_checkpoint_startup(void)
 {
 	zend_register_functions(NULL, phasync_checkpoint_functions, NULL, MODULE_PERSISTENT);
 	phasync_checkpoint_name = zend_string_init_interned(ZEND_STRL("phasync\\ext\\checkpoint"), 1);
+	phasync_preempt_due_name = zend_string_init_interned(ZEND_STRL("phasync\\ext\\PREEMPT_DUE"), 1);
 #if PHP_VERSION_ID >= 80400
 	for (uint32_t i = 0; zend_flf_handlers[i]; i++) {
 		if (zend_flf_handlers[i] == (void *) ZEND_FRAMELESS_FUNCTION_NAME(phasync_checkpoint, 0)) {
@@ -8314,6 +8350,9 @@ static PHP_RINIT_FUNCTION(phasync)
 	 * and streams that predate them get wrapped now. */
 	phasync_install_hooks();
 	phasync_wrap_existing_streams(false);
+	/* Per request, so opcache never substitutes it (see set_preempt_function()). */
+	zend_register_bool_constant(ZEND_STRL("phasync\\ext\\PREEMPT_DUE"), false, 0, module_number);
+	PHASYNC_G(preempt_due) = &((zend_constant *) zend_hash_find_ptr(EG(zend_constants), phasync_preempt_due_name))->value;
 	return SUCCESS;
 }
 

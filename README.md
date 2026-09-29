@@ -445,10 +445,12 @@ functions and what they call. The stack is checked down to the fiber's first
 frame (outside fibers, to the script's own code).
 
 - Every backward jump (a loop's back-edge, a `foreach` `continue`, a backward
-  `goto`) is compiled with a checkpoint before it: a call the JIT makes
-  directly on PHP 8.4+ (frameless), an internal call before. It costs a load
-  and a compare while nothing is due, and shows in no backtrace. A timer
-  thread, not a signal, raises the checkpoints' flag, so no syscall fails with
+  `goto`) is compiled with a checkpoint before it:
+  `if (\phasync\ext\PREEMPT_DUE) \phasync\ext\checkpoint();`. The constant is
+  registered per request, so opcache never folds it, and both JITs compile its
+  read into loads and a compare, without a call; the call runs only when due
+  and shows in no backtrace. A timer
+  thread, not a signal, raises the flag, so no syscall fails with
   `EINTR` and the engine's interrupts are not used. `$fn` runs once, without
   arguments, at the next checkpoint the stack allows, the same in the
   interpreter and both JIT modes. A backward `goto` counts as a loop: the
