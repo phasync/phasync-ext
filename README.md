@@ -188,7 +188,8 @@ epoll registration, level-triggered and left armed after a wait, and one slot
 per direction: in request/response I/O nothing arrives while the coroutine is
 busy, so a wait costs no syscall besides the batched `epoll_wait()`. An event
 that finds nobody waiting disarms its direction then and there, so unread data
-with nobody waiting costs one wake-up, never a busy loop. Worker threads never
+with nobody waiting costs one wake-up, never a busy loop. A wait on a regular file (always
+ready, and refused by epoll) returns at the loop's next `poll()`. Worker threads never
 call PHP — the thread-pool work
 of hooked operations (file operations, DNS) started under a `manage()` given this
 `Poller` queues the slot and writes to an eventfd in its epoll set, which `poll()`

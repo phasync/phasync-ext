@@ -930,9 +930,12 @@ static void phasync_wait_settle(phasync_poller *p, int idx, php_stream *stream, 
 
 /* Wait (in a fiber) until fd is readable or writable, or closed or failed.
  * timeout is the native timeout, INFINITY for none. Returns READY, TIMEOUT or
- * ERROR (exception pending); see phasync_park(). */
+ * ERROR (exception pending); see phasync_park(). A regular file is always
+ * ready: with via_loop (Poller::readable()/writable()) the coroutine still
+ * waits for the loop's next poll(), as phasync's own wait on it does without
+ * the extension (#29); hooked operations go on at once. */
 static int phasync_poller_wait(phasync_poller *p, int dir, php_stream *stream, php_socket_t fd,
-                               double timeout, zend_class_entry *timeout_ce)
+                               double timeout, zend_class_entry *timeout_ce, bool via_loop)
 {
 	int idx = dir == PHASYNC_WRITE, rc, dupfd = -1;
 	phasync_reg *r;
@@ -997,7 +1000,10 @@ static int phasync_poller_wait(phasync_poller *p, int dir, php_stream *stream, p
 	if (phasync_reg_arm(p, r) != 0) {
 		r->slot[idx] = -1;
 		p->armed--;
-		if (errno == EPERM) {
+		if (errno == EPERM && via_loop) {
+			phasync_chan_push(p->chan, slot);   /* a regular file: ready at the next poll() */
+			goto park;
+		} else if (errno == EPERM) {
 			rc = PHASYNC_WAIT_READY;   /* a regular file: always ready, as select() says */
 		} else {
 			zend_throw_error(NULL, "Unable to wait on descriptor %d: %s", (int) fd, strerror(errno));
@@ -1006,6 +1012,7 @@ static int phasync_poller_wait(phasync_poller *p, int dir, php_stream *stream, p
 		goto done;
 	}
 
+park:
 	GC_ADDREF(&p->std);                  /* the loop may drop the Poller while we wait */
 	l = phasync_ledger_cur();
 	l->wait_p = p;
@@ -1259,12 +1266,12 @@ static int phasync_wait_fd(int dir, php_stream *stream, php_socket_t fd, double 
 	int rc;
 
 	if (stream == NULL) {
-		return phasync_poller_wait(s->poller, dir, stream, fd, timeout, s->timeout_ce);
+		return phasync_poller_wait(s->poller, dir, stream, fd, timeout, s->timeout_ce, false);
 	}
 	if (!phasync_inflight_enter(stream)) {
 		return PHASYNC_WAIT_CLOSED;
 	}
-	rc = phasync_poller_wait(s->poller, dir, stream, fd, timeout, s->timeout_ce);
+	rc = phasync_poller_wait(s->poller, dir, stream, fd, timeout, s->timeout_ce, false);
 	return phasync_inflight_leave(stream) && rc != PHASYNC_WAIT_ERROR ? PHASYNC_WAIT_CLOSED : rc;
 }
 
@@ -2282,6 +2289,7 @@ static void phasync_pool_run(phasync_task *t)
 		return;
 	}
 	phasync_task_chan(h, p);
+park:
 	GC_ADDREF(&p->std);                  /* the loop may drop the Poller while we wait */
 	l = phasync_ledger_cur();
 	l->task = h;
@@ -7164,7 +7172,7 @@ static void phasync_poller_wait_method(INTERNAL_FUNCTION_PARAMETERS, int dir)
 		RETURN_THROWS();
 	}
 	/* The loop's exceptions (a timeout, a cancellation) reach the caller as they are. */
-	phasync_poller_wait(p, dir, stream, phasync_stream_fd(stream), timeout >= DBL_MAX ? INFINITY : timeout, NULL);
+	phasync_poller_wait(p, dir, stream, phasync_stream_fd(stream), timeout >= DBL_MAX ? INFINITY : timeout, NULL, true);
 }
 
 ZEND_METHOD(phasync_ext_Poller, readable)

@@ -61,7 +61,7 @@ $loop->runAll(
     function () use ($c) { usleep(50000); fclose($c); },
 );
 
-// A regular file is always ready (epoll refuses it): no park.
+// A regular file is always ready (epoll refuses it): one park, until the loop's next poll() (#29).
 $loop = new Loop;
 $loop->runAll(fn() => $loop->poller->readable(fopen(__FILE__, 'r')));
 echo 'regular file parks: ', $loop->parks, "\n";
@@ -145,7 +145,7 @@ reader woke: hello
 B drains
 writer woke
 close woke the waiter: closed
-regular file parks: 0
+regular file parks: 1
 idle poll waited: yes
 pool task: cancelled
 loop still fine: 127.0.0.1
