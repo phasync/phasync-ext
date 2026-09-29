@@ -40,10 +40,11 @@ function destroy_while_waiting(Loop $loop, string $how, Closure $op, array $afte
             ($others[] = new Fiber($c))->start();
         }
         $loop->drop($fiber);
+        $weak = WeakReference::create($fiber);
         unset($fiber, $holder);
         if ($how === 'gc') {
-            $n = gc_collect_cycles();
-            echo "  collected: ", $n > 0 ? 'yes' : 'no', "\n";
+            gc_collect_cycles();
+            echo "  collected: ", $weak->get() === null ? 'yes' : 'no', "\n";
         }
         foreach ($after as $c) {
             $loop->go($c);

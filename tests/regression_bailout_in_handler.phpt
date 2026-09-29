@@ -12,14 +12,20 @@ if (!is_readable('/proc/self/status')) die('skip requires /proc');
 <?php
 // A FIFO open() runs on a dedicated thread holding a pointer to a task in the
 // caller's C frame. A fatal error (bailout) raised inside park() longjmps past
-// that frame; the extension must cancel and join the thread first. Observable:
-// after the fatal, only the main thread is left.
+// that frame; the fiber's ledger orphans the task and cancels the thread (the
+// task is the thread's to free). Observable: after the fatal, only the main
+// thread is left.
 require __DIR__ . '/loop.inc';
 $fifo = sys_get_temp_dir() . '/phasync_bail_' . getmypid();
 function_exists('posix_mkfifo') ? posix_mkfifo($fifo, 0600) : shell_exec('mkfifo ' . escapeshellarg($fifo));
 
 register_shutdown_function(function () use ($fifo) {
-    preg_match('/^Threads:\s+(\d+)/m', file_get_contents('/proc/self/status'), $m);
+    // The orphaned thread is cancelled, not waited for: give it a moment to go.
+    for ($i = 0; $i < 100; $i++) {
+        preg_match('/^Threads:\s+(\d+)/m', file_get_contents('/proc/self/status'), $m);
+        if ($m[1] == 1) break;
+        usleep(10000);
+    }
     echo "threads=", $m[1], "\n";
     @unlink($fifo);
 });

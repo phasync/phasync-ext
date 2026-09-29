@@ -1,5 +1,5 @@
 --TEST--
-A coroutine destroyed (by refcount or by the cycle collector) while a pool thread runs its file read, file write, fsync() or DNS lookup waits for the thread (which writes into its buffers) without suspending; the file and the pool keep working
+A coroutine destroyed (by refcount or by the cycle collector) while a pool thread runs its file read, file write, fsync() or DNS lookup leaves the operation to the thread (it owns its buffer and descriptor, and frees them); nothing waits; the file and the pool keep working
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -27,8 +27,11 @@ foreach (['refcount', 'gc'] as $how) {
     $out = tempnam(sys_get_temp_dir(), 'phasync_destroy_');
     $fp = fopen($out, 'w');
     destroy_while_waiting(new Loop, $how, fn() => fwrite($fp, $big), after: [function () use ($fp, $out, $big) {
-        clearstatcache();
-        echo "  written before: ", filesize($out) === strlen($big) ? 'all' : filesize($out), "\n";
+        // The orphaned write goes on without its coroutine, and ends.
+        for ($i = 0; $i < 500 && (clearstatcache() ?? filesize($out)) < strlen($big); $i++) {
+            usleep(10000);
+        }
+        echo "  orphaned write: ", filesize($out) === strlen($big) ? 'all' : filesize($out), "\n";
         echo "  then write: ", fwrite($fp, 'tail'), "\n";
     }]);
     fclose($fp);
@@ -54,7 +57,7 @@ read (refcount)
   then read: 0123456789abcdef
 write (refcount)
   finally ran
-  written before: all
+  orphaned write: all
   then write: 4
 fsync (refcount)
   finally ran
@@ -69,7 +72,7 @@ read (gc)
 write (gc)
   finally ran
   collected: yes
-  written before: all
+  orphaned write: all
   then write: 4
 fsync (gc)
   finally ran

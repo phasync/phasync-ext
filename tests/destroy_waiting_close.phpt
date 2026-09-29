@@ -1,5 +1,5 @@
 --TEST--
-A coroutine destroyed while another closes the stream it waits on lets the close go on; a closer destroyed while it waits for the others leaves the stream closing, freed with its last reference (#14)
+A coroutine destroyed while another closes the stream it waits on lets the close go on; a closer destroyed while it waits is held until the others have left, then closes; fclose() by a coroutine being destroyed leaves the stream to its last reference (#14, #17, #21)
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -19,39 +19,37 @@ foreach (['refcount', 'gc'] as $how) {
     }]);
     fclose($b);
 
-    // The closer is destroyed while it waits: it cannot, so it leaves the stream
-    // closing (the reader's read fails) and open until its last reference goes.
+    // The closer, dropped while it waits, can't be destroyed there: the extension
+    // holds it until the reader has left (its read fails), and lets PHP have it
+    // where no coroutine is inside an op (here: the next manage()). Its close
+    // then ends as it unwinds. (gc: the cycle collector didn't take it while held.)
     echo "closer destroyed while another reads ($how)\n";
     [$a, $b] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
     destroy_while_waiting(new Loop, $how, fn() => fclose($a), before: [function () use ($a) {
         $r = fread($a, 100);
         echo "  reader: ", json_encode($r), "\n";
     }]);
+    echo "  next manage()\n";
+    (new Loop)->manage(fn() => null);
+    gc_collect_cycles();                      // (in a cycle, it is garbage from here)
     echo "  stream: ", get_resource_type($a), "\n";
-    fwrite($b, 'x');
-    echo "  read without waiting: ", fread($a, 100), "\n";
+    fclose($b);
+
+    // fclose() in the finally block of a coroutine being destroyed, while another
+    // reads: it can't wait, so the reader's read fails and the stream stays open
+    // until its last reference goes.
+    echo "fclose() while unwinding, another reading ($how)\n";
+    [$a, $b] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+    destroy_while_waiting(new Loop, $how, function () use ($a) {
+        try { usleep(5000000); } finally { echo "  fclose: ", json_encode(fclose($a)), "\n"; }
+    }, before: [function () use ($a) {
+        $r = fread($a, 100);
+        echo "  reader: ", json_encode($r), "\n";
+    }]);
+    echo "  stream: ", get_resource_type($a), "\n";
     fclose($a);
     echo "  closed: ", get_resource_type($a), "\n";
     fclose($b);
-
-    // Two readers, a closer and a second fclose() while the first waits.
-    echo "one of two readers destroyed, a second fclose() ($how)\n";
-    [$a, $b] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
-    [$c, $d] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
-    destroy_while_waiting(new Loop, $how, fn() => fread($a, 100), before: [function () use ($c) {
-        $r = fread($c, 100);
-        echo "  other reader: ", json_encode($r), "\n";
-    }], alongside: [function () use ($a) {
-        $r = fclose($a);
-        echo "  closer: ", json_encode($r), ", ", get_resource_type($a), "\n";
-    }, function () use ($a, $d) {
-        $r = fclose($a);
-        echo "  second closer: ", json_encode($r), "\n";
-        fwrite($d, 'y');
-    }]);
-    fclose($b);
-    fclose($c);
-    fclose($d);
 }
 ?>
 --EXPECT--
@@ -59,30 +57,30 @@ reader destroyed while another closes (refcount)
   finally ran
   closer: true, Unknown
 closer destroyed while another reads (refcount)
+  reader: false
+  next manage()
+  finally ran
+  stream: Unknown
+fclose() while unwinding, another reading (refcount)
+  fclose: true
   finally ran
   reader: false
   stream: stream
-  read without waiting: x
   closed: Unknown
-one of two readers destroyed, a second fclose() (refcount)
-  second closer: true
-  finally ran
-  closer: true, Unknown
-  other reader: "y"
 reader destroyed while another closes (gc)
   finally ran
   collected: yes
   closer: true, Unknown
 closer destroyed while another reads (gc)
+  collected: no
+  reader: false
+  next manage()
+  finally ran
+  stream: Unknown
+fclose() while unwinding, another reading (gc)
+  fclose: true
   finally ran
   collected: yes
   reader: false
   stream: stream
-  read without waiting: x
   closed: Unknown
-one of two readers destroyed, a second fclose() (gc)
-  second closer: true
-  finally ran
-  collected: yes
-  closer: true, Unknown
-  other reader: "y"

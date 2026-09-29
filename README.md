@@ -215,12 +215,20 @@ and `writable()` pass the loop's exceptions through as they are. phasync gives t
 `Poller` its loop's `getSlot`/`park`/`unpark`, and `manage()` its sleep and
 `phasync\TimeoutException::class`.
 
-A coroutine **destroyed while it waits** (dropped, or torn down by phasync) ends
-its operation safely: its wait is disarmed, a pool thread still working on its
-buffers is waited for, and a stream it was closing is left to its last reference.
-What the operation returns is moot, since the fiber is unwinding; its `finally`
-blocks run, and there a wait fails with the `FiberError` PHP throws for
-`Fiber::suspend()`, while pool operations run inline.
+**The extension's safety doesn't depend on PHP code**, neither the application's
+nor the loop's. Each coroutine has a ledger, in C, of what the extension holds
+for it while it waits: its Poller registration and slot, its place among a
+stream's operations in flight, a pool operation, a closer's wait. The code after
+the suspension settles it; if the fiber never gets back there, its destroy
+observer does. A pool operation owns its buffer and a duplicate of its
+descriptor, so a coroutine destroyed meanwhile leaves it to its thread, which
+frees it. A slot is taken back before its coroutine is gone, so the extension
+never wakes a dead one, whatever the loop still records. A coroutine closing a
+stream others are inside an operation on waits for them, and is kept alive
+meanwhile. A coroutine destroyed while it waits (dropped, or torn down by phasync)
+thus ends its operation safely; what the operation returns is moot, since the
+fiber is unwinding. In its `finally` blocks a wait fails with the `FiberError`
+PHP throws for `Fiber::suspend()` there; pool operations run inline.
 
 `manage()` scopes are **automatic and stacking**: they apply only while `$task`
 runs, and a nested `manage()` sends hooked I/O to its own `Poller` until it

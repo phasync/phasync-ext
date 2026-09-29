@@ -401,6 +401,8 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	bool hooks_installed;         /* transports + fn overrides physically in place */
 	HashTable hooked;             /* (uintptr_t)stream    -> phasync_hook_entry* */
 	HashTable inflight;           /* (uintptr_t)stream    -> phasync_inflight*   */
+	HashTable ledgers;            /* (uintptr_t)zend_fiber_context -> phasync_ledger* */
+	uint32_t holds;               /* closers held alive while they wait (#21)       */
 	HashTable wrapped_ops_cache;  /* (uintptr_t)orig_ops  -> php_stream_ops*     */
 ZEND_END_MODULE_GLOBALS(phasync)
 
@@ -605,7 +607,6 @@ static double phasync_now(void)
 
 typedef struct {
 	pthread_mutex_t mutex;
-	pthread_cond_t  cond;     /* a finished task (see phasync_task_wait())       */
 	zend_long      *queue;    /* slots of finished tasks, for poll()            */
 	size_t          len, cap;
 	int             evfd;
@@ -670,7 +671,6 @@ static void phasync_chan_release(phasync_chan *ch)
 		close(ch->evfd);
 		free(ch->queue);
 		pthread_mutex_destroy(&ch->mutex);
-		pthread_cond_destroy(&ch->cond);
 		free(ch);
 	}
 }
@@ -693,9 +693,62 @@ static void phasync_chan_push(phasync_chan *ch, zend_long slot)
 	if (ch->len < ch->cap) {
 		ch->queue[ch->len++] = slot;
 	}
-	pthread_cond_broadcast(&ch->cond);
 	pthread_mutex_unlock(&ch->mutex);
 	do { w = write(ch->evfd, &one, sizeof(one)); } while (w < 0 && errno == EINTR);
+}
+
+/* Take back a slot's queued wake-up: its coroutine stopped waiting (cancelled,
+ * timed out, or destroyed), and poll() must not unpark it. */
+static void phasync_chan_purge(phasync_chan *ch, zend_long slot)
+{
+	size_t j = 0;
+
+	pthread_mutex_lock(&ch->mutex);
+	for (size_t i = 0; i < ch->len; i++) {
+		if (ch->queue[i] != slot) {
+			ch->queue[j++] = ch->queue[i];
+		}
+	}
+	ch->len = j;
+	pthread_mutex_unlock(&ch->mutex);
+}
+
+/* ---- the ledger: what the extension holds for a suspended coroutine --------
+ *
+ * While a coroutine is suspended inside a hooked operation, the extension holds
+ * things for it: a registration and slot in a Poller, a count in the stream's
+ * in-flight record (#14), a pool operation, a closer's wait. Each is entered in
+ * the coroutine's ledger before it suspends and struck off by the code after the
+ * suspension. When PHP destroys a suspended fiber it resumes it once to unwind it,
+ * and that code settles everything; whatever it never gets back to (a fatal error
+ * unwinding past it) the fiber's destroy observer settles, and at the end of the
+ * request whatever is left. None of it depends on PHP code (the application's
+ * finally blocks, the loop's bookkeeping): a slot is taken back from the Poller
+ * before its coroutine is gone, so the extension never wakes a dead one. */
+struct phasync_task;
+typedef struct {
+	phasync_poller *wait_p;       /* parked on a registration of it (a reference): */
+	php_stream     *wait_stream;
+	php_socket_t    wait_fd;
+	int             wait_idx, wait_dupfd;
+	zend_long       wait_slot;
+	php_stream     *inflight;     /* inside an op on it: one of its waiters (#14)  */
+	php_stream     *closing;      /* its closer, parked in closing_p (a reference) */
+	phasync_poller *closing_p;
+	struct phasync_task *task;    /* a pool operation reporting to task_p (a reference) */
+	phasync_poller *task_p;
+} phasync_ledger;
+
+static phasync_ledger *phasync_ledger_cur(void)
+{
+	zend_ulong key = (zend_ulong) (uintptr_t) EG(current_fiber_context);
+	phasync_ledger *l = zend_hash_index_find_ptr(&PHASYNC_G(ledgers), key);
+
+	if (l == NULL) {
+		l = pecalloc(1, sizeof(*l), 1);
+		zend_hash_index_add_new_ptr(&PHASYNC_G(ledgers), key, l);
+	}
+	return l;
 }
 
 /* Throw unless this process created the Poller: in a fork()ed child its epoll
@@ -753,6 +806,9 @@ static int phasync_park(phasync_poller *p, zend_long slot, double timeout, zend_
 		}
 	}
 	zval_ptr_dtor(&retval);
+	if (rc != PHASYNC_WAIT_READY) {
+		phasync_chan_purge(p->chan, slot);
+	}
 	return rc;
 }
 
@@ -835,6 +891,31 @@ static void phasync_stream_forget(php_stream *stream)
 
 static bool phasync_has_close_hook(php_stream *stream);
 
+/* A wait on a registration is over (or its coroutine gone): if nobody unparked
+ * it, disarm it, and let go of the Poller. The stream may have been closed
+ * meanwhile (its registration freed): look it up again. */
+static void phasync_wait_settle(phasync_poller *p, int idx, php_stream *stream, php_socket_t fd,
+                                zend_long slot, int dupfd)
+{
+	phasync_reg *r = zend_hash_index_find_ptr(&p->regs, (zend_ulong) fd);
+
+	if (r && r->stream != stream) {
+		r = NULL;
+	}
+	if (r && r->slot[idx] == slot) {
+		r->slot[idx] = -1;
+		p->armed--;
+		phasync_reg_arm(p, r);
+	}
+	if (r && r->transient && r->slot[0] < 0 && r->slot[1] < 0) {
+		phasync_reg_drop(p, r);
+	}
+	if (dupfd >= 0) {
+		close(dupfd);
+	}
+	OBJ_RELEASE(&p->std);
+}
+
 /* Wait (in a fiber) until fd is readable or writable, or closed or failed.
  * timeout is the native timeout, INFINITY for none. Returns READY, TIMEOUT or
  * ERROR (exception pending); see phasync_park(). */
@@ -843,6 +924,7 @@ static int phasync_poller_wait(phasync_poller *p, int dir, php_stream *stream, p
 {
 	int idx = dir == PHASYNC_WRITE, rc, dupfd = -1;
 	phasync_reg *r;
+	phasync_ledger *l;
 	zend_long slot;
 
 	if (!phasync_poller_usable(p)) {
@@ -913,26 +995,16 @@ static int phasync_poller_wait(phasync_poller *p, int dir, php_stream *stream, p
 	}
 
 	GC_ADDREF(&p->std);                  /* the loop may drop the Poller while we wait */
+	l = phasync_ledger_cur();
+	l->wait_p = p;
+	l->wait_stream = stream;
+	l->wait_fd = fd;
+	l->wait_idx = idx;
+	l->wait_dupfd = dupfd;
+	l->wait_slot = slot;
 	rc = phasync_park(p, slot, timeout, timeout_ce);
-
-	/* The stream may have been closed meanwhile (r freed): look it up again. */
-	r = zend_hash_index_find_ptr(&p->regs, (zend_ulong) fd);
-	if (r && r->stream != stream) {
-		r = NULL;
-	}
-	if (r && r->slot[idx] == slot) {
-		/* Not unparked: cancelled or timed out. Disarm before the exception goes on. */
-		r->slot[idx] = -1;
-		p->armed--;
-		phasync_reg_arm(p, r);
-	}
-	if (r && r->transient && r->slot[0] < 0 && r->slot[1] < 0) {
-		phasync_reg_drop(p, r);
-	}
-	if (dupfd >= 0) {
-		close(dupfd);
-	}
-	OBJ_RELEASE(&p->std);
+	l->wait_p = NULL;
+	phasync_wait_settle(p, idx, stream, fd, slot, dupfd);
 	return rc;
 done:
 	if (r && r->transient && r->slot[0] < 0 && r->slot[1] < 0) {
@@ -947,21 +1019,24 @@ done:
 /* ---- a stream closed under a suspended coroutine (#14) --------------------
  *
  * A coroutine suspended inside an operation on a stream still has the stream on
- * its C stack: in our op, in PHP's stream layer, in mysqlnd. Another coroutine
- * closing the stream then must not free it before they have left: its close op
- * wakes them, parks the closer until the last one is out, and only then lets the
- * close go on. A woken operation fails as on a closed descriptor (EBADF), and so
- * does any later one that would wait on the closing stream.
+ * its C stack: in our op, in PHP's stream layer, in mysqlnd (with the connection
+ * mysqli frees as it closes). Another coroutine closing the stream then must not
+ * free it before they have left: its close op wakes them, parks the closer until
+ * the last one is out, and only then lets the close go on. A woken operation fails
+ * as on a closed descriptor (EBADF), and so does any later one that would wait on
+ * the closing stream. PHP frees a stream as its close op returns, whatever the
+ * path (fclose(), mysqli::close(), ...), so the close op is where it waits.
  *
- * A closer being destroyed (dropped while it waits) can no longer park. Once in
- * a close op it cannot stop the stream being freed either, so fclose() waits
- * before closing: a closer destroyed there leaves the stream closing, to be freed
- * with its last reference (the coroutines inside hold one). */
+ * The closer's fiber is held alive while it waits: destroyed there, it could
+ * neither wait nor keep the stream from being freed under the others (#21). Held,
+ * it is resumed by its loop once they are out, or, if its loop has let it go, left
+ * to PHP to destroy once they are (phasync_holds_release()). */
 typedef struct {
 	uint32_t        waiters;      /* coroutines suspended in an op on the stream */
 	bool            closing;      /* a close woke them; ops on it fail (EBADF)   */
 	phasync_poller *closer;       /* where the closer is parked (NULL: none), and its slot */
 	zend_long       closer_slot;
+	zend_object    *hold;         /* the closer's fiber, held while it waits     */
 } phasync_inflight;
 
 /* Before suspending in an op on the stream. False (errno EBADF) if it is closing. */
@@ -977,12 +1052,13 @@ static bool phasync_inflight_enter(php_stream *stream)
 		return false;
 	}
 	f->waiters++;
+	phasync_ledger_cur()->inflight = stream;
 	return true;
 }
 
-/* Back from the suspension. True (errno EBADF) if the stream is closing: the op
- * fails, and the last one out lets the closer go on. */
-static bool phasync_inflight_leave(php_stream *stream)
+/* One coroutine less inside an op on the stream; the last one out of a closing
+ * stream lets the closer go on. True if it is closing. */
+static bool phasync_inflight_out(php_stream *stream)
 {
 	phasync_inflight *f = zend_hash_index_find_ptr(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
 
@@ -995,29 +1071,115 @@ static bool phasync_inflight_leave(php_stream *stream)
 			phasync_chan_push(f->closer->chan, f->closer_slot);
 		}
 	}
-	if (f->closing) {
+	return f->closing;
+}
+
+/* Back from the suspension. True (errno EBADF) if the stream is closing: the op fails. */
+static bool phasync_inflight_leave(php_stream *stream)
+{
+	phasync_ledger_cur()->inflight = NULL;
+	if (phasync_inflight_out(stream)) {
 		errno = EBADF;
 		return true;
 	}
 	return false;
 }
 
+/* Let go of a closer's fiber once it no longer waits. Resumed by its loop, the
+ * loop holds it too; if only we do, it is running and must not be freed under
+ * itself: then the reference is left to the end of the request. */
+static void phasync_hold_drop(phasync_inflight *f)
+{
+	zend_object *o = f->hold;
+
+	f->hold = NULL;
+	PHASYNC_G(holds)--;
+	if (GC_REFCOUNT(o) > 1) {
+		GC_DELREF(o);
+	}
+}
+
+/* Where no coroutine is inside an op (a Poller's poll(), a manage() starting): let
+ * PHP have the closers held for streams nobody is inside any more. One whose loop
+ * let it go is destroyed here, and its close ends as it unwinds. */
+static void phasync_holds_release(void)
+{
+	zend_object *release[16];
+	phasync_inflight *f;
+	int n = 0;
+
+	if (PHASYNC_G(holds) == 0) {
+		return;
+	}
+	ZEND_HASH_FOREACH_PTR(&PHASYNC_G(inflight), f) {
+		if (f->hold && f->waiters == 0 && n < 16) {
+			release[n++] = f->hold;
+			f->hold = NULL;
+			PHASYNC_G(holds)--;
+		}
+	} ZEND_HASH_FOREACH_END();
+	for (int i = 0; i < n; i++) {
+		OBJ_RELEASE(release[i]);
+	}
+}
+
+/* The request is ending and PHP destroys every object: a closer destroyed while
+ * coroutines are still inside an op on its stream cannot wait for them, but they
+ * are about to be destroyed too. Destroy them first, as PHP would. */
+static void phasync_inflight_destroy_waiters(php_stream *stream)
+{
+	zend_object *victims[16];
+	phasync_ledger *l;
+	zend_ulong key;
+	int n = 0;
+
+	ZEND_HASH_FOREACH_NUM_KEY_PTR(&PHASYNC_G(ledgers), key, l) {
+		zend_fiber_context *ctx = (zend_fiber_context *) (uintptr_t) key;
+		if (l->inflight == stream && ctx->kind == zend_ce_fiber && n < 16) {
+			zend_object *obj = &((zend_fiber *) ((char *) ctx - XtOffsetOf(zend_fiber, context)))->std;
+			if (!(OBJ_FLAGS(obj) & IS_OBJ_DESTRUCTOR_CALLED)) {
+				GC_ADDREF(obj);
+				victims[n++] = obj;
+			}
+		}
+	} ZEND_HASH_FOREACH_END();
+	for (int i = 0; i < n; i++) {
+		GC_ADD_FLAGS(victims[i], IS_OBJ_DESTRUCTOR_CALLED);
+		victims[i]->handlers->dtor_obj(victims[i]);
+		OBJ_RELEASE(victims[i]);
+	}
+}
+
 /* Wake whoever waits on the closing stream and park until every coroutine
  * suspended in an op on it has left. A cancellation of the wait is held until
- * they are out. False if the closer is being destroyed while they are still in:
- * it cannot wait, and the unwind is pending. */
+ * they are out. False if the closer is being destroyed while they are still in
+ * (it began closing while unwinding): it cannot wait, and the unwind is pending. */
 static bool phasync_inflight_drain(php_stream *stream, phasync_inflight *f)
 {
 	phasync_poller *p = PHASYNC_G(scope_top)->poller;
+	phasync_ledger *l = phasync_ledger_cur();
 	zend_object *held = NULL;
+	bool destroyed_waiters = false;
 
 	phasync_stream_forget(stream);
 	f->closing = true;
 	f->closer = p;
 	GC_ADDREF(&p->std);
+	l->closing = stream;
+	l->closing_p = p;
+	if (!phasync_unwinding()) {
+		f->hold = &EG(active_fiber)->std;
+		GC_ADDREF(f->hold);
+		PHASYNC_G(holds)++;
+	}
 	while (f->waiters) {
 		if (phasync_unwinding()) {
-			break;
+			if ((EG(flags) & EG_FLAGS_IN_SHUTDOWN) && !destroyed_waiters) {
+				destroyed_waiters = true;
+				phasync_inflight_destroy_waiters(stream);
+				continue;
+			}
+			break;                   /* the unwind stays pending */
 		}
 		if ((f->closer_slot = phasync_get_slot(p)) < 0
 		 || phasync_park(p, f->closer_slot, INFINITY, NULL) != PHASYNC_WAIT_READY) {
@@ -1025,7 +1187,7 @@ static bool phasync_inflight_drain(php_stream *stream, phasync_inflight *f)
 				zend_error_noreturn(E_ERROR, "phasync: unable to wait for the coroutines using a stream being closed");
 			}
 			if (phasync_unwinding()) {
-				break;               /* the unwind stays pending */
+				continue;
 			}
 			if (held == NULL) {
 				held = EG(exception);
@@ -1034,13 +1196,16 @@ static bool phasync_inflight_drain(php_stream *stream, phasync_inflight *f)
 			zend_clear_exception();
 		}
 	}
+	l->closing = NULL;
 	f->closer = NULL;
 	OBJ_RELEASE(&p->std);
+	if (f->hold) {
+		phasync_hold_drop(f);
+	}
 	if (f->waiters) {
 		if (held) {
 			OBJ_RELEASE(held);
 		}
-		phasync_throw_force_closed();
 		return false;
 	}
 	if (held) {
@@ -1190,6 +1355,10 @@ typedef struct phasync_task {
 	zend_long    slot;        /* the waiter's slot, queued for poll() when done  */
 	void        *chan;        /* its Poller's completion channel (a reference)   */
 	int          done;        /* set (under the channel's mutex) once finished   */
+	int          orphaned;    /* its coroutine is gone: the thread frees it (ditto) */
+	int          ownfd;       /* its own duplicate of fd (READ/WRITE/fsync), or -1 */
+	bool         dedicated;   /* on its own thread: */
+	pthread_t    thread;
 	struct phasync_task *next;
 } phasync_task;
 
@@ -1781,30 +1950,150 @@ static void phasync_task_exec(phasync_task *t)
 	}
 }
 
-/* A task is done: queue its slot for poll() and mark it done (the waiter may be
- * waiting for that after a cancellation). The worker never touches the task
- * after this: the waiter's frame may be gone. */
+/* ---- a thread's task: owned by the extension, not by the coroutine ----------
+ *
+ * A task handed to a thread is a heap copy with its own buffer, its own copy of
+ * the host name and its own duplicate of the descriptor: the thread never points
+ * into the coroutine's frame or into PHP's data, and the descriptor can't be
+ * closed (and its number reused) under it. The waiter collects the results once
+ * the thread is done. If the waiter stops waiting first (cancelled, destroyed, or
+ * its fiber gone without coming back), the task is orphaned: the thread frees it
+ * when it finishes, and nobody waits for that. */
+static phasync_task *phasync_task_own(phasync_task *t)
+{
+	phasync_task *h = malloc(sizeof(*h));
+
+	if (h == NULL) {
+		return NULL;
+	}
+	*h = *t;
+	h->orphaned = 0;
+	h->dedicated = false;
+	h->ownfd = -1;
+	h->host = NULL;
+	h->buf = NULL;
+	h->ai = NULL;
+	if (t->type == PHASYNC_OP_OPEN) {
+		h->fd = -1;
+	}
+	bool host = t->type == PHASYNC_OP_GETHOSTBYNAME || t->type == PHASYNC_OP_GETADDRINFO
+	         || t->type == PHASYNC_OP_DNSQUERY;
+	bool buf = t->type == PHASYNC_OP_READ || t->type == PHASYNC_OP_WRITE || t->type == PHASYNC_OP_DNSQUERY;
+	if ((host && (h->host = strdup(t->host)) == NULL)
+	 || (buf && (h->buf = malloc(t->count ? t->count : 1)) == NULL)) {
+		goto fail;
+	}
+	if (t->type == PHASYNC_OP_WRITE) {
+		memcpy(h->buf, t->buf, t->count);
+	}
+	if (t->type == PHASYNC_OP_READ || t->type == PHASYNC_OP_WRITE
+	 || (t->type == PHASYNC_OP_FS && (t->fsop == PHASYNC_FS_FSYNC || t->fsop == PHASYNC_FS_FDATASYNC))) {
+		if ((h->ownfd = h->fd = fcntl(t->fd, F_DUPFD_CLOEXEC, 0)) < 0) {
+			goto fail;
+		}
+	}
+	return h;
+fail:
+	free(h->buf);
+	free((char *) h->host);
+	free(h);
+	return NULL;
+}
+
+/* From any thread: free a task and whatever it still owns. */
+static void phasync_task_free(phasync_task *h)
+{
+	free(h->buf);
+	free((char *) h->host);
+	if (h->ownfd >= 0) {
+		close(h->ownfd);
+	}
+	if (h->type == PHASYNC_OP_OPEN && h->fd >= 0) {
+		close(h->fd);
+	}
+	if (h->ai) {
+		freeaddrinfo(h->ai);
+	}
+	free(h);
+}
+
+/* A task is done: mark it done and queue its slot for poll(); an orphan the thread
+ * frees instead. The thread never touches the task after this: its waiter may
+ * free it at once. */
 static void phasync_task_signal(phasync_task *t)
 {
 	zend_long slot = t->slot;
 	phasync_chan *ch = t->chan;
+	int orphaned;
 
 	pthread_mutex_lock(&ch->mutex);
 	t->done = 1;
+	orphaned = t->orphaned;
 	pthread_mutex_unlock(&ch->mutex);
-	phasync_chan_push(ch, slot);
+	if (orphaned) {
+		phasync_task_free(t);
+	} else {
+		phasync_chan_push(ch, slot);
+	}
 	phasync_chan_release(ch);            /* the task's reference */
 }
 
-/* Wait for a task whose waiter stopped waiting (cancelled): it still points into
- * the waiter's frame. Pool tasks are bounded, so this is short. */
-static void phasync_task_wait(phasync_task *t, phasync_chan *ch)
+/* The waiter is done with its task (and lets go of the Poller): with the thread
+ * done, copy the results into out (NULL: drop them) and free it; otherwise orphan
+ * it (a dedicated thread is cancelled: it may block forever) and fail out with
+ * ECANCELED. Never waits. */
+static bool phasync_task_finish(phasync_task *h, phasync_poller *p, phasync_task *out)
 {
+	phasync_chan *ch = h->chan;
+	zend_long slot = h->slot;
+	pthread_t th = h->thread;
+	bool dedicated = h->dedicated;
+	int done;
+
 	pthread_mutex_lock(&ch->mutex);
-	while (!t->done) {
-		pthread_cond_wait(&ch->cond, &ch->mutex);
+	done = h->done;
+	if (!done) {
+		h->orphaned = 1;                 /* the thread frees it from here on */
 	}
 	pthread_mutex_unlock(&ch->mutex);
+	if (dedicated) {
+		if (!done) {
+			pthread_cancel(th);
+		}
+		pthread_detach(th);
+	}
+	phasync_chan_purge(p->chan, slot);
+	OBJ_RELEASE(&p->std);
+	if (!done) {
+		if (out) {
+			out->result = -1;
+			out->err = ECANCELED;
+			out->hostok = 0;
+			if (out->type == PHASYNC_OP_OPEN) {
+				out->fd = -1;
+			}
+		}
+		return false;
+	}
+	if (out) {
+		if ((h->type == PHASYNC_OP_READ || h->type == PHASYNC_OP_DNSQUERY) && h->result > 0) {
+			memcpy(out->buf, h->buf, MIN((size_t) h->result, out->count));
+		}
+		out->result = h->result;
+		out->err = h->err;
+		out->hostok = h->hostok;
+		out->naddrs = h->naddrs;
+		memcpy(out->addrs, h->addrs, sizeof(h->addrs));
+		memcpy(out->hostresult, h->hostresult, sizeof(h->hostresult));
+		out->ai = h->ai;
+		h->ai = NULL;
+		if (h->type == PHASYNC_OP_OPEN) {
+			out->fd = h->fd;
+			h->fd = -1;
+		}
+	}
+	phasync_task_free(h);
+	return true;
 }
 
 /* Give a task its Poller's channel (a reference, released by the thread). */
@@ -1855,23 +2144,31 @@ static void *phasync_worker(void *arg)
 	}
 }
 
+/* Cancelled inside open(): the task was orphaned (that is when it is cancelled). */
+static void phasync_oneshot_cancelled(void *arg)
+{
+	phasync_task *t = (phasync_task *) arg;
+	phasync_chan *ch = t->chan;
+
+	phasync_task_free(t);                /* closes the descriptor if open() had returned */
+	phasync_chan_release(ch);
+}
+
 /* Dedicated one-shot thread for a single indefinitely-blocking task (FIFO
- * open). It runs the task, signals the self-pipe, and exits; the fiber joins
- * it after being resumed, so nothing leaks. */
+ * open). It runs the task, signals, and exits (detached). Cancellation is
+ * allowed only across the blocking open() (a POSIX cancellation point): its
+ * orphaned task is freed by the cleanup handler. */
 static void *phasync_oneshot(void *arg)
 {
 	phasync_task *t = (phasync_task *) arg;
-	phasync_thread_block_signals();
 
-	/* Allow cancellation ONLY across the blocking syscall (open() is a POSIX
-	 * cancellation point). If cancelled there, the thread unwinds inside open()
-	 * before t->fd is ever assigned, so no fd leaks; the signal step below never
-	 * runs. Everything outside is cancel-disabled so there is no window where a
-	 * cancel could strand an already-opened fd. */
+	pthread_cleanup_push(phasync_oneshot_cancelled, t);
+	phasync_thread_block_signals();
 	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
 	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 	phasync_task_exec(t);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	pthread_cleanup_pop(0);
 
 	phasync_task_signal(t);   /* worker never touches the Zend engine */
 	return NULL;
@@ -1956,56 +2253,31 @@ static void phasync_pool_submit(phasync_task *t)
 	pthread_mutex_unlock(&phasync_pool_mutex);
 }
 
-/* Submit a task and park the coroutine until a worker has done it. The task
- * lives on the caller's (fiber) stack, which is preserved across the suspend, so
- * no heap allocation is needed for it. */
+/* Submit a task and park the coroutine until a worker has done it. Without a
+ * coroutine to park (a fiber being destroyed cannot), a worker, or a slot, run it
+ * inline: a pool task always ends. On a cancellation the task is left to its
+ * thread and fails with ECANCELED (the exception pending). */
 static void phasync_pool_run(phasync_task *t)
 {
 	phasync_poller *p = PHASYNC_G(scope_top) ? PHASYNC_G(scope_top)->poller : NULL;
-	phasync_chan *ch;
-	int rc;
+	phasync_ledger *l;
+	phasync_task *h;
 
 	if (!p || EG(active_fiber) == NULL || PHASYNC_G(no_suspend) || phasync_unwinding()
-	 || p->fork_gen != phasync_fork_gen || !phasync_pool_ensure() || (t->slot = phasync_get_slot(p)) < 0) {
-		/* No coroutine to park (a fiber being destroyed cannot), or no worker, or
-		 * getSlot() threw: run inline. A pool task always ends. */
+	 || p->fork_gen != phasync_fork_gen || !phasync_pool_ensure() || (t->slot = phasync_get_slot(p)) < 0
+	 || (h = phasync_task_own(t)) == NULL) {
 		phasync_task_exec(t);
 		return;
 	}
-	ch = phasync_task_chan(t, p);
-	phasync_pool_submit(t);
-
-	/* The task (and a read's buffer) live in this frame and the worker holds
-	 * pointers into them, so neither a cancellation nor a fatal error (bailout)
-	 * may leave this frame before the worker is done. */
-	GC_ADDREF(&p->std);
-	zend_try {
-		rc = phasync_park(p, t->slot, INFINITY, NULL);
-	} zend_catch {
-		phasync_task_wait(t, ch);
-		zend_bailout();
-	} zend_end_try();
-	if (rc != PHASYNC_WAIT_READY) {
-		phasync_task_wait(t, ch);
-	}
-	OBJ_RELEASE(&p->std);
-}
-
-/* Reap a one-shot thread. Cancelled inside open(), it never signals, so its
- * channel reference is released here instead. */
-static void phasync_oneshot_reap(pthread_t th, phasync_task *t)
-{
-	phasync_chan *ch = t->chan;
-	int done;
-
-	pthread_cancel(th);
-	pthread_join(th, NULL);
-	pthread_mutex_lock(&ch->mutex);
-	done = t->done;
-	pthread_mutex_unlock(&ch->mutex);
-	if (!done) {
-		phasync_chan_release(ch);
-	}
+	phasync_task_chan(h, p);
+	GC_ADDREF(&p->std);                  /* the loop may drop the Poller while we wait */
+	l = phasync_ledger_cur();
+	l->task = h;
+	l->task_p = p;
+	phasync_pool_submit(h);
+	phasync_park(p, h->slot, INFINITY, NULL);
+	l->task = NULL;
+	phasync_task_finish(h, p, t);
 }
 
 /* Like phasync_pool_run, but on a dedicated thread rather than the bounded pool.
@@ -2014,58 +2286,37 @@ static void phasync_oneshot_reap(pthread_t th, phasync_task *t)
 static void phasync_pool_run_dedicated(phasync_task *t)
 {
 	phasync_poller *p = PHASYNC_G(scope_top) ? PHASYNC_G(scope_top)->poller : NULL;
-	pthread_t th;
+	phasync_ledger *l;
+	phasync_task *h;
 	pthread_attr_t attr;
 	int rc;
 
-	if (!p || EG(active_fiber) == NULL || p->fork_gen != phasync_fork_gen || (t->slot = phasync_get_slot(p)) < 0) {
+	if (!p || EG(active_fiber) == NULL || phasync_unwinding() || p->fork_gen != phasync_fork_gen
+	 || (t->slot = phasync_get_slot(p)) < 0 || (h = phasync_task_own(t)) == NULL) {
 		phasync_task_exec(t);   /* no coroutine to park: block inline, as fopen() would */
 		return;
 	}
-	phasync_task_chan(t, p);
+	h->dedicated = true;
+	phasync_task_chan(h, p);
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, PHASYNC_WORKER_STACK);
-	if (pthread_create(&th, &attr, phasync_oneshot, t) != 0) {
-		pthread_attr_destroy(&attr);
-		phasync_chan_release(t->chan);
+	rc = pthread_create(&h->thread, &attr, phasync_oneshot, h);
+	pthread_attr_destroy(&attr);
+	if (rc != 0) {
+		phasync_chan_release(h->chan);
+		phasync_task_free(h);
 		phasync_task_exec(t);
 		return;
 	}
-	pthread_attr_destroy(&attr);
 	GC_ADDREF(&p->std);
-
-	/* A fatal error (bailout) must not unwind past this frame while the thread
-	 * still holds a pointer to the stack-resident task: cancel and reap it first,
-	 * drop any fd it opened, then re-raise. */
-	zend_try {
-		rc = phasync_park(p, t->slot, INFINITY, NULL);
-	} zend_catch {
-		phasync_oneshot_reap(th, t);
-		if (t->fd >= 0) {
-			close(t->fd);
-		}
-		t->fd = -1;
-		zend_bailout();
-	} zend_end_try();
-
-	/* Always reap the thread, however the coroutine came back. If the thread
-	 * already finished, it is past its (only) open() cancellation point with
-	 * cancellation disabled, so the cancel is a no-op and join returns at once.
-	 * If the wait was cancelled, the thread is still in open(): the cancel
-	 * unblocks it there, and it never queues its slot. */
-	phasync_oneshot_reap(th, t);
-	OBJ_RELEASE(&p->std);
-
-	/* On a pending exception, drop any fd the open managed to produce. */
-	if (rc != PHASYNC_WAIT_READY) {
-		if (t->fd >= 0) {
-			close(t->fd);
-		}
-		t->fd = -1;
-		return;
-	}
-	/* Normal return: the worker left t->fd as a valid fd, or -1 with t->err set
-	 * (a real open() failure); the caller distinguishes the two. */
+	l = phasync_ledger_cur();
+	l->task = h;
+	l->task_p = p;
+	phasync_park(p, h->slot, INFINITY, NULL);
+	l->task = NULL;
+	/* The worker left t->fd as a valid fd, or -1 with t->err set (a real open()
+	 * failure, or ECANCELED); the caller distinguishes the two. */
+	phasync_task_finish(h, p, t);
 }
 
 /* Pool-mode ops: offload the blocking read/write to a worker thread (for regular
@@ -5614,6 +5865,47 @@ static void phasync_v_call(phasync_boundary *b, zend_function *fn, zval *rv, uin
 
 /* ---- fiber observers ---- */
 
+/* Settle what a ledger still holds: its coroutine is gone without its code after
+ * the suspension having run (see the ledger). Its slots are taken back first. */
+static void phasync_ledger_settle(phasync_ledger *l)
+{
+	if (l->task) {
+		phasync_task_finish(l->task, l->task_p, NULL);
+		l->task = NULL;
+	}
+	if (l->wait_p) {
+		phasync_chan_purge(l->wait_p->chan, l->wait_slot);
+		phasync_wait_settle(l->wait_p, l->wait_idx, l->wait_stream, l->wait_fd, l->wait_slot, l->wait_dupfd);
+		l->wait_p = NULL;
+	}
+	if (l->inflight) {
+		phasync_inflight_out(l->inflight);
+		l->inflight = NULL;
+	}
+	if (l->closing) {
+		phasync_inflight *f = zend_hash_index_find_ptr(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) l->closing);
+		if (f && f->closer == l->closing_p) {
+			phasync_chan_purge(f->closer->chan, f->closer_slot);
+			f->closer = NULL;
+			if (f->hold) {
+				phasync_hold_drop(f);
+			}
+		}
+		OBJ_RELEASE(&l->closing_p->std);
+		l->closing = NULL;
+	}
+}
+
+static void phasync_ledger_close(zend_fiber_context *ctx)
+{
+	phasync_ledger *l = zend_hash_index_find_ptr(&PHASYNC_G(ledgers), (zend_ulong) (uintptr_t) ctx);
+
+	if (l) {
+		phasync_ledger_settle(l);
+		zend_hash_index_del(&PHASYNC_G(ledgers), (zend_ulong) (uintptr_t) ctx);
+	}
+}
+
 static void phasync_v_fiber_init(zend_fiber_context *ctx)
 {
 	phasync_boundary *b;
@@ -5641,6 +5933,8 @@ static void phasync_v_fiber_switch(zend_fiber_context *from, zend_fiber_context 
 static void phasync_v_fiber_destroy(zend_fiber_context *ctx)
 {
 	phasync_boundary *b;
+
+	phasync_ledger_close(ctx);
 	if (PHASYNC_G(vcount) && (b = phasync_v_of(ctx))) {
 		zend_hash_index_del(&PHASYNC_G(vfibers), PHASYNC_VKEY(ctx));
 		phasync_v_release(b);
@@ -6148,28 +6442,25 @@ ZEND_FUNCTION(phasync_ext_virtualize)
 	RETURN_COPY_VALUE(&retval);
 }
 
-/* fclose() of a stream other coroutines are suspended in an op on: wait for them
- * before closing, where a closer being destroyed meanwhile can still give up
- * (see phasync_inflight_drain()). Past this point the close op waits. */
+/* fclose() in a coroutine being destroyed (its finally blocks), of a stream other
+ * coroutines are inside an op on: it cannot wait for them, and its close op would
+ * free the stream under them. Close it as far as they are concerned (woken, their
+ * ops fail with EBADF) and leave the stream to its last reference, which they hold. */
 static ZEND_NAMED_FUNCTION(phasync_fclose_override)
 {
 	zval *res;
 	php_stream *stream;
 	phasync_inflight *f;
 
-	if (ZEND_NUM_ARGS() == 1 && PHASYNC_G(scope_top) && EG(active_fiber)
+	if (phasync_unwinding() && ZEND_NUM_ARGS() == 1
 	 && Z_TYPE_P(res = ZEND_CALL_ARG(execute_data, 1)) == IS_RESOURCE
 	 && (stream = zend_fetch_resource2(Z_RES_P(res), NULL, php_file_le_stream(), php_file_le_pstream()))
 	 && !(stream->flags & PHP_STREAM_FLAG_NO_FCLOSE)
-	 && (f = zend_hash_index_find_ptr(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream))) {
-		if (f->closer) {
-			RETURN_TRUE;                 /* another coroutine is closing it */
-		}
-		if (f->waiters && !phasync_inflight_drain(stream, f)) {
-			RETURN_THROWS();             /* destroyed: the stream goes with its last reference */
-		}
-		/* Nobody inside: the close may write (a filter's tail) and wait itself. */
-		zend_hash_index_del(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream);
+	 && (f = zend_hash_index_find_ptr(&PHASYNC_G(inflight), (zend_ulong) (uintptr_t) stream))
+	 && f->waiters) {
+		phasync_stream_forget(stream);
+		f->closing = true;
+		RETURN_TRUE;
 	}
 	PHASYNC_G(orig_fclose)(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
@@ -6568,6 +6859,7 @@ ZEND_FUNCTION(phasync_ext_manage)
 	PHASYNC_G(scope_top) = &frame;
 
 	phasync_install_hooks();   /* idempotent; first manage() of the request installs */
+	phasync_holds_release();
 	if (frame.prev == NULL) {
 		/* Entering the outermost scope: wrap fd-backed streams that appeared after
 		 * RINIT's walk — notably the STDIN/STDOUT/STDERR constants, which the CLI
@@ -6693,7 +6985,6 @@ ZEND_METHOD(phasync_ext_Poller, __construct)
 		RETURN_THROWS();
 	}
 	pthread_mutex_init(&ch->mutex, NULL);
-	pthread_cond_init(&ch->cond, NULL);
 	ch->refs = 1;
 	p->chan = ch;
 	e.events = EPOLLIN;
@@ -6734,6 +7025,10 @@ ZEND_METHOD(phasync_ext_Poller, poll)
 	ZEND_PARSE_PARAMETERS_END();
 
 	if ((p = phasync_this_poller(ZEND_THIS)) == NULL) {
+		RETURN_THROWS();
+	}
+	phasync_holds_release();
+	if (EG(exception)) {
 		RETURN_THROWS();
 	}
 	if (max_time <= 0 && p->armed == 0) {
@@ -7236,6 +7531,7 @@ static PHP_GINIT_FUNCTION(phasync)
 	memset(phasync_globals, 0, sizeof(*phasync_globals));
 	zend_hash_init(&phasync_globals->hooked, 8, NULL, phasync_hook_entry_dtor, 1);
 	zend_hash_init(&phasync_globals->inflight, 8, NULL, phasync_hook_entry_dtor, 1);
+	zend_hash_init(&phasync_globals->ledgers, 8, NULL, phasync_hook_entry_dtor, 1);
 	zend_hash_init(&phasync_globals->wrapped_ops_cache, 8, NULL, phasync_ops_dtor, 1);
 	zend_hash_init(&phasync_globals->fs_hooks, 32, NULL, NULL, 1);
 	zend_hash_init(&phasync_globals->sock_hooks, 8, NULL, NULL, 1);
@@ -7247,6 +7543,7 @@ static PHP_GSHUTDOWN_FUNCTION(phasync)
 {
 	zend_hash_destroy(&phasync_globals->hooked);
 	zend_hash_destroy(&phasync_globals->inflight);
+	zend_hash_destroy(&phasync_globals->ledgers);
 	zend_hash_destroy(&phasync_globals->wrapped_ops_cache);
 	zend_hash_destroy(&phasync_globals->fs_hooks);
 	zend_hash_destroy(&phasync_globals->sock_hooks);
@@ -7340,6 +7637,7 @@ static PHP_RINIT_FUNCTION(phasync)
 	PHASYNC_G(hooks_installed) = 0;
 	zend_hash_clean(&PHASYNC_G(hooked));
 	zend_hash_clean(&PHASYNC_G(inflight));
+	PHASYNC_G(holds) = 0;
 	/* Always-on: the transport factories and function overrides go in at the
 	 * start of every request (they are inert while no manage() scope is active),
 	 * and streams that predate them get wrapped now. */
@@ -7355,6 +7653,15 @@ static PHP_RSHUTDOWN_FUNCTION(phasync)
 	 * stack); nothing to free here. Leave the hooked table intact: streams may
 	 * close later in shutdown. */
 	PHASYNC_G(scope_top) = NULL;
+	/* Fibers PHP freed without resuming them (after a fatal error): settle what
+	 * the extension still holds for them. */
+	{
+		phasync_ledger *l;
+		ZEND_HASH_FOREACH_PTR(&PHASYNC_G(ledgers), l) {
+			phasync_ledger_settle(l);
+		} ZEND_HASH_FOREACH_END();
+		zend_hash_clean(&PHASYNC_G(ledgers));
+	}
 	return SUCCESS;
 }
 
