@@ -258,17 +258,23 @@ typedef struct phasync_scope {
 	X(exception_handlers, EG(user_exception_handlers))
 
 /* The superglobals a boundary has its own of, in the order PHP creates them
- * (php_startup_auto_globals(), without $_ENV, which stays the process's). */
+ * (php_startup_auto_globals(), without $_ENV, which stays the process's), then
+ * $_SESSION: ext/session puts it in the symbol table at session_start(), as a
+ * reference it keeps in PS(http_session_vars), which is per boundary as well.
+ * The first PHASYNC_NSG are built per request; $_SESSION is only swapped, and
+ * only while ext/session is loaded (otherwise it is an ordinary global). */
 #define PHASYNC_NSG 6
-static const char *const phasync_sg_cnames[PHASYNC_NSG] = { "_GET", "_POST", "_COOKIE", "_SERVER", "_REQUEST", "_FILES" };
-static zend_string *phasync_sg_names[PHASYNC_NSG];
+#define PHASYNC_SG_SESSION PHASYNC_NSG
+#define PHASYNC_NSG_ALL (PHASYNC_NSG + 1)
+static const char *const phasync_sg_cnames[PHASYNC_NSG_ALL] = { "_GET", "_POST", "_COOKIE", "_SERVER", "_REQUEST", "_FILES", "_SESSION" };
+static zend_string *phasync_sg_names[PHASYNC_NSG_ALL];
 #define PHASYNC_SG_SERVER 3
 
 typedef struct phasync_vstate {
 #define PHASYNC_VSTATE_DECL(name, live) __typeof__(live) name;
 	PHASYNC_VSTATE_FIELDS(PHASYNC_VSTATE_DECL)
 #undef PHASYNC_VSTATE_DECL
-	zval sg[PHASYNC_NSG];         /* EG(symbol_table)'s "_GET", ...; UNDEF = not there */
+	zval sg[PHASYNC_NSG_ALL];     /* EG(symbol_table)'s "_GET", ...; UNDEF = not there */
 } phasync_vstate;
 
 #ifdef PHASYNC_HAVE_FILTER
@@ -329,7 +335,8 @@ ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	phasync_vstate vroot;         /* the SAPI's own state while a boundary's is live */
 	HashTable vfibers;            /* (uintptr_t)zend_fiber_context -> its boundary (members only) */
 	uint32_t vcount;              /* live boundaries; 0 = the fiber observers return at once */
-	uint32_t sg_idx[PHASYNC_NSG]; /* the superglobals' last bucket in EG(symbol_table) */
+	uint32_t sg_idx[PHASYNC_NSG_ALL]; /* the superglobals' last bucket in EG(symbol_table) */
+	int nsg;                      /* how many of them are swapped: + $_SESSION with ext/session */
 #ifdef PHASYNC_HAVE_SESSION
 	php_ps_globals *ps;           /* ext/session's globals, NULL if it isn't loaded */
 	phasync_vsession vroot_session;
@@ -4978,7 +4985,7 @@ static void phasync_v_install(phasync_boundary *b)
 		zval *save = cur ? cur->st.sg : PHASYNC_G(vroot).sg;
 		zval *load = b ? b->st.sg : PHASYNC_G(vroot).sg;
 		HashTable *symtab = &EG(symbol_table);
-		for (int i = 0; i < PHASYNC_NSG; i++) {
+		for (int i = 0, n = PHASYNC_G(nsg); i < n; i++) {
 			/* Where the entry was last time, if it still is: a lookup saved. */
 			uint32_t idx = PHASYNC_G(sg_idx)[i];
 			zval *slot;
@@ -5059,6 +5066,7 @@ static void phasync_vstate_init(phasync_vstate *st)
 	for (int i = 0; i < PHASYNC_NSG; i++) {
 		ZVAL_EMPTY_ARRAY(&st->sg[i]);   /* replaced as they are built */
 	}
+	ZVAL_UNDEF(&st->sg[PHASYNC_SG_SESSION]);   /* no session started yet */
 }
 
 /* php://input handles point at a body stream without a reference (its
@@ -5149,7 +5157,7 @@ static void phasync_vstate_free(phasync_vstate *st)
 	zval_ptr_dtor(&st->http_cookie);
 	zval_ptr_dtor(&st->http_server);
 	zval_ptr_dtor(&st->http_files);
-	for (int i = 0; i < PHASYNC_NSG; i++) {
+	for (int i = 0; i < PHASYNC_NSG_ALL; i++) {
 		zval_ptr_dtor(&st->sg[i]);
 	}
 }
@@ -5879,6 +5887,12 @@ ZEND_FUNCTION(phasync_ext_virtualize)
 	}
 #endif
 	if (!PHASYNC_G(vcount)) {
+		PHASYNC_G(nsg) = PHASYNC_NSG;
+#ifdef PHASYNC_HAVE_SESSION
+		if (PHASYNC_G(ps)) {
+			PHASYNC_G(nsg) = PHASYNC_NSG_ALL;
+		}
+#endif
 #ifdef PHASYNC_HAVE_FILTER
 		PHASYNC_G(fg) = phasync_filter_globals();
 #endif
@@ -6950,7 +6964,7 @@ static PHP_MINIT_FUNCTION(phasync)
 	sapi_module.read_post = phasync_v_read_post;
 	phasync_v_register_server_variables_prev = sapi_module.register_server_variables;
 	sapi_module.register_server_variables = phasync_v_register_server_variables;
-	for (int i = 0; i < PHASYNC_NSG; i++) {
+	for (int i = 0; i < PHASYNC_NSG_ALL; i++) {
 		phasync_sg_names[i] = zend_string_init_interned(phasync_sg_cnames[i], strlen(phasync_sg_cnames[i]), 1);
 	}
 	if ((phasync_v_header_handler_prev = sapi_module.header_handler)) {

@@ -306,7 +306,7 @@ state PHP otherwise keeps once per process:
 | `connection_aborted()`, `connection_status()`, `ignore_user_abort()` | user-abort state |
 | `register_shutdown_function()` | the shutdown functions |
 | `set_error_handler()`, `set_exception_handler()`, `restore_*()` | the error and exception handlers |
-| `session_start()`, `session_id()`, `session_status()`, `session_set_save_handler()`, ... | the session: its id, status, save handler and data |
+| `$_SESSION`, `session_start()`, `session_id()`, `session_status()`, `session_set_save_handler()`, ... | the session: its id, status, save handler and data |
 
 The fiber observers swap that state when execution moves between boundaries, so
 these functions run PHP's own code, with no override and no cost outside a
@@ -354,14 +354,13 @@ and `$_REQUEST` by `request_order`. Without the optional methods they are empty
 arrays. Other bodies are read only when the code reads `php://input`. A
 `session_start()` finds the session id in the request's own `$_COOKIE`.
 
-Each request starts with the session state of a fresh request (no session, the
-worker's save handler) and ends by writing and closing its session, as PHP ends a
+Each request starts with the session state of a fresh request (no session, no
+`$_SESSION`, the worker's save handler) and ends by writing and closing its session, as PHP ends a
 request. Two concurrent requests on the same session take turns on its lock, as
 under php-fpm: with the files handler, inside `manage()`, the second waits
 cooperatively instead of blocking the worker. Settings behind INI entries, such
 as `session_name()` and the cookie parameters, stay shared by the worker's
-requests, like any `ini_set()`. `$_SESSION` is a global variable: a server
-isolating globals per request must keep it the reference ext/session holds.
+requests, like any `ini_set()`.
 
 Other global variables are not isolated, and a fatal error still ends the worker
 (after being displayed in the request's output, as natively). Nesting

@@ -55,15 +55,12 @@ var_dump($seen);
 virtualize(function () use (&$seen) { session_start(); $seen = [session_id(), $_SESSION]; }, Sink::withSession($alice));
 var_dump($seen[0] === $alice, $seen[1]);
 
-// Two requests interleaved, each with its own session. $_SESSION is a global
-// variable, which virtualize() leaves alone: phasync swaps globals per request,
-// keeping $_SESSION the reference ext/session holds; here each request keeps its own.
+// Two requests interleaved, each with its own session and $_SESSION.
 $a = Sink::withSession($alice); $b = new Sink;
 $fa = new Fiber(fn() => virtualize(function () {
     session_start();
-    $session = &$_SESSION;
     Fiber::suspend();
-    $session['visits'] = ($session['visits'] ?? 0) + 1;
+    $_SESSION['visits'] = ($_SESSION['visits'] ?? 0) + 1;
     echo session_id() === $GLOBALS['alice'] ? "a: alice's session" : "a: WRONG session";
 }, $a));
 $fa->start();
