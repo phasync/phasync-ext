@@ -5,7 +5,6 @@ phasync
 --SKIPIF--
 <?php
 if (!extension_loaded('Zend OPcache')) die('skip needs opcache');
-if (PHP_VERSION_ID >= 80400) die('skip preemption is disabled under the function JIT on 8.4+ (preempt_function_jit_disabled.phpt)');
 ?>
 --INI--
 opcache.enable=1

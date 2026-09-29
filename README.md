@@ -434,11 +434,6 @@ output, as natively). Nesting `virtualize()` throws.
 `$minInterval` seconds (wall clock), between iterations of whatever PHP loop is
 running, so a scheduler can preempt a coroutine that never yields: `$fn` may
 call `Fiber::suspend()`, and resuming the fiber continues the loop.
-On PHP 8.4 and later, under opcache's function JIT (`opcache.jit=function`, or a
-numeric setting whose trigger isn't tracing), it warns and starts no timer: that
-JIT can compute wrong results when interrupts are handled in loops
-([php/php-src#23983](https://github.com/php/php-src/issues/23983)); the tracing
-JIT (the default) and the interpreter are not affected.
 
 Preemption happens only between loop iterations, in PHP code called from PHP
 code: never in callbacks called by C functions (`usort()`, `array_map()`, output
@@ -449,13 +444,14 @@ exception handlers and shutdown functions, or in `#[\phasync\Uninterruptible]`
 functions and what they call. The stack is checked down to the fiber's first
 frame (outside fibers, to the script's own code).
 
-- A timer thread, not a signal, asks the engine to interrupt, so no syscall
-  fails with `EINTR`. `$fn` runs once, without arguments, where execution next
-  continues at a loop head (the start of a `while`, `for`, `do`-`while` or
-  `foreach` iteration, or a loop's condition: a `while`/`for`/`do`-`while`
-  condition, or an `if (...) break;` a loop starts or ends with, from where
-  it holds only calls and temporaries) and the stack allows it.
-  A backward `goto` compiles to the same jump as a loop and counts as one: the
+- Every backward jump (a loop's back-edge, a `foreach` `continue`, a backward
+  `goto`) is compiled with a checkpoint before it: a call the JIT makes
+  directly on PHP 8.4+ (frameless), an internal call before. It costs a load
+  and a compare while nothing is due, and shows in no backtrace. A timer
+  thread, not a signal, raises the checkpoints' flag, so no syscall fails with
+  `EINTR` and the engine's interrupts are not used. `$fn` runs once, without
+  arguments, at the next checkpoint the stack allows, the same in the
+  interpreter and both JIT modes. A backward `goto` counts as a loop: the
   attribute is the way to make such code uninterruptible. Code without a loop
   (straight-line code, recursion) is never interrupted. A long C call delays it
   until it returns. The interval counts from the start of the previous call.
@@ -470,25 +466,13 @@ frame (outside fibers, to the script's own code).
   (or outside any fiber). A call suspended in one fiber doesn't hold back calls
   in others.
 - It returns the previous closure; `null` removes it and stops the thread. With
-  none set, there is no thread and no interrupt. Other interrupt users
+  none set, there is no thread, and checkpoints only load the flag. Other interrupt users
   (`pcntl_async_signals()`, `max_execution_time`) keep working.
 - It is per process (per thread on ZTS builds). A `fork()`ed child keeps the
   closure and gets a timer thread of its own.
 
-The engine checks for interrupts at jumps and calls; the extension waits for a
-check at a loop head. Until one takes the due call, the next few checks are
-asked for, then one every 0.25 ms. Code without loops pays for that within
-measuring noise (a recursive `fib()`, interpreter and JIT). Where the engine
-does not check at a loop head, a loop is interrupted later or not at all:
-
-- Under opcache's tracing JIT, a loop whose trace links into the trace of a
-  function it calls has no check at its head: it is interrupted after a C call
-  in its condition (`hrtime()`, say), and possibly not at all if its condition calls
-  none (the function JIT and the interpreter check every loop).
-- On PHP < 8.4 without JIT, the check after a C call can't be followed by one
-  at the loop head, so a `do`-`while`, or a loop left by `break`, whose time
-  goes mostly into C calls outside its condition is interrupted later than
-  the interval.
+A checkpoint the stack rules reject lowers the flag; the thread raises it again
+0.25 ms later.
 
 ## Status
 

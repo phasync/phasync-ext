@@ -32,6 +32,7 @@ $shapes = [
     'while(true), break last, calls' => function () { global $phase; $y = 1; $e = hrtime(true) + RUN; while (true) { $phase = 1; $y = hot($y); $phase = 0; if (hrtime(true) >= $e) break; } },
     'while(true), break first' => function () { global $phase; $y = 1; $e = hrtime(true) + RUN; while (true) { if (hrtime(true) >= $e) break; $phase = 1; $y = ($y * 31 + 7) & 0xffffff; $phase = 0; } },
     'while(true), break first, calls' => function () { global $phase; $y = 1; $e = hrtime(true) + RUN; while (true) { if (hrtime(true) >= $e) break; $phase = 1; $y = hot($y); $phase = 0; } },
+    'while(true), break last, calls, no C call per iteration (#24)' => function () { global $phase; $y = 1; $e = hrtime(true) + RUN; $i = 0; while (true) { $phase = 1; $y = hot($y); $phase = 0; if (++$i >= 100000) { if (hrtime(true) >= $e) break; $i = 0; } } },
     'for(;;), break, calls' => function () { global $phase; $y = 1; $e = hrtime(true) + RUN; for (;;) { $phase = 1; $y = hot($y); $phase = 0; if (hrtime(true) >= $e) break; } },
     'goto' => function () { global $phase; $y = 1; $e = hrtime(true) + RUN; top: $phase = 1; $y = ($y * 31 + 7) & 0xffffff; $phase = 0; if (hrtime(true) < $e) goto top; },
     'goto, calls' => function () { global $phase; $y = 1; $e = hrtime(true) + RUN; top: $phase = 1; $y = hot($y); $phase = 0; if (hrtime(true) < $e) goto top; },

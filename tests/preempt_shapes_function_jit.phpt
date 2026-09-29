@@ -5,7 +5,6 @@ phasync
 --SKIPIF--
 <?php
 if (!extension_loaded('Zend OPcache')) die('skip needs opcache');
-if (PHP_VERSION_ID >= 80400) die('skip preemption is disabled under the function JIT on 8.4+ (php/php-src#23983)');
 ?>
 --INI--
 opcache.enable=1
@@ -32,6 +31,7 @@ while(true), break last: interrupted, mid-iteration: 0
 while(true), break last, calls: interrupted, mid-iteration: 0
 while(true), break first: interrupted, mid-iteration: 0
 while(true), break first, calls: interrupted, mid-iteration: 0
+while(true), break last, calls, no C call per iteration (#24): interrupted, mid-iteration: 0
 for(;;), break, calls: interrupted, mid-iteration: 0
 goto: interrupted, mid-iteration: 0
 goto, calls: interrupted, mid-iteration: 0

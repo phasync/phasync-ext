@@ -36,6 +36,7 @@ while(true), break last: interrupted, mid-iteration: 0
 while(true), break last, calls: interrupted, mid-iteration: 0
 while(true), break first: interrupted, mid-iteration: 0
 while(true), break first, calls: interrupted, mid-iteration: 0
+while(true), break last, calls, no C call per iteration (#24): interrupted, mid-iteration: 0
 for(;;), break, calls: interrupted, mid-iteration: 0
 goto: interrupted, mid-iteration: 0
 goto, calls: interrupted, mid-iteration: 0
