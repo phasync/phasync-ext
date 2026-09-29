@@ -434,6 +434,11 @@ output, as natively). Nesting `virtualize()` throws.
 `$minInterval` seconds (wall clock), between iterations of whatever PHP loop is
 running, so a scheduler can preempt a coroutine that never yields: `$fn` may
 call `Fiber::suspend()`, and resuming the fiber continues the loop.
+On PHP 8.4 and later, under opcache's function JIT (`opcache.jit=function`, or a
+numeric setting whose trigger isn't tracing), it warns and starts no timer: that
+JIT can compute wrong results when interrupts are handled in loops
+([php/php-src#23983](https://github.com/php/php-src/issues/23983)); the tracing
+JIT (the default) and the interpreter are not affected.
 
 Preemption happens only between loop iterations, in PHP code called from PHP
 code: never in callbacks called by C functions (`usort()`, `array_map()`, output

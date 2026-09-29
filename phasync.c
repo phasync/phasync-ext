@@ -84,6 +84,7 @@
 #include <sys/syscall.h>
 #include <dirent.h>
 #include <sys/wait.h>
+#include <dlfcn.h>
 #include <sys/file.h>
 #include <sys/sysmacros.h>
 #include <sys/uio.h>
@@ -7783,6 +7784,48 @@ static void phasync_preempt_interrupt(zend_execute_data *execute_data)
 	zval_ptr_dtor(&fn);
 }
 
+/* php/php-src#23983: under the function JIT, code that handles interrupts in
+ * loops can compute wrong results. Narrow this when PHP fixes it. */
+#define PHASYNC_FUNCTION_JIT_BROKEN (PHP_VERSION_ID >= 80400)
+
+/* Whether opcache JIT-compiles whole functions in this request: opcache is on
+ * for this SAPI and its JIT is on (so opcache.jit_buffer_size > 0) with a
+ * trigger other than tracing (opcache.jit=function, or CRTO with T 0-3). */
+static bool phasync_function_jit_active(void)
+{
+#if PHASYNC_FUNCTION_JIT_BROKEN
+	void (*jit_status)(zval *);
+	zend_string *enable;
+	zval status, *on, *kind;
+	bool active;
+
+	enable = zend_ini_str_ex(ZEND_STRL("opcache.enable"), false, NULL);
+	if (!enable || !zend_ini_parse_bool(enable)) {
+		return false;
+	}
+	if (!strcmp(sapi_module.name, "cli") || !strcmp(sapi_module.name, "phpdbg")) {
+		enable = zend_ini_str_ex(ZEND_STRL("opcache.enable_cli"), false, NULL);
+		if (!enable || !zend_ini_parse_bool(enable)) {
+			return false;
+		}
+	}
+	/* opcache_get_status()['jit'], without its opcache.restrict_api check */
+	if (!(jit_status = (void (*)(zval *))dlsym(RTLD_DEFAULT, "zend_jit_status"))) {
+		return false;
+	}
+	array_init(&status);
+	jit_status(&status);
+	on = zend_hash_str_find(Z_ARRVAL(status), ZEND_STRL("jit"));
+	kind = on ? zend_hash_str_find(Z_ARRVAL_P(on), ZEND_STRL("kind")) : NULL;
+	on = on ? zend_hash_str_find(Z_ARRVAL_P(on), ZEND_STRL("on")) : NULL;
+	active = on && Z_TYPE_P(on) == IS_TRUE && kind && Z_LVAL_P(kind) != 5; /* 5: ZEND_JIT_ON_HOT_TRACE */
+	zval_ptr_dtor(&status);
+	return active;
+#else
+	return false;
+#endif
+}
+
 ZEND_FUNCTION(phasync_ext_set_preempt_function)
 {
 	zend_object *fn;
@@ -7800,7 +7843,14 @@ ZEND_FUNCTION(phasync_ext_set_preempt_function)
 		RETURN_THROWS();
 	}
 	p = PHASYNC_G(preempt);
-	if (fn && !p) {
+	if (fn && phasync_function_jit_active()) {
+		php_error_docref(NULL, E_WARNING, "Preemption is disabled: under opcache's function JIT, "
+			"PHP 8.4+ can compute wrong results when interrupts are handled in loops (php/php-src#23983)");
+		if (p) {
+			PHASYNC_G(preempt) = NULL;
+			phasync_preempt_stop(p);
+		}
+	} else if (fn && !p) {
 		if (!(p = phasync_preempt_start(interval))) {
 			zend_throw_error(NULL, "Could not start the preempt timer thread");
 			RETURN_THROWS();
