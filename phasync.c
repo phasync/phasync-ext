@@ -7485,14 +7485,6 @@ typedef struct phasync_preempt {
 	struct timespec   since;          /* start of the current interval (CLOCK_MONOTONIC) */
 } phasync_preempt;
 
-/* What the checkpoint needs to know of an op_array, built on first need and kept
- * for the request in its run-time cache (writable also for opcache's immutable
- * op_arrays), in the arena that lives as long. */
-typedef struct phasync_loop_info {
-	bool     no_preempt;              /* #[phasync\Uninterruptible], or a destructor */
-} phasync_loop_info;
-
-static int phasync_preempt_handle;    /* op_array extension slot: its phasync_loop_info */
 static zend_string *phasync_uninterruptible_lcname;   /* the attribute, as attributes are keyed */
 
 static zend_always_inline void phasync_ts_add_ns(struct timespec *ts, long ns)
@@ -7615,20 +7607,18 @@ static void phasync_preempt_fork_child(void)
 	}
 }
 
-static phasync_loop_info *phasync_loop_info_of(const zend_op_array *op_array)
+/* #[phasync\Uninterruptible], or a destructor. A due checkpoint is rare (about
+ * once per 1 ms), so this attribute/name lookup runs fresh each time instead
+ * of being cached: op_array run-time caches are per closure object (a rebound
+ * closure gets its own, zeroed one), so caching this in the run-time cache
+ * via the arena, as before, allocated on CG(arena) -- never freed for the
+ * life of a long-running worker -- once per closure that hit a checkpoint. */
+static zend_always_inline bool phasync_op_array_no_preempt(const zend_op_array *op_array)
 {
-	phasync_loop_info *info = ZEND_OP_ARRAY_EXTENSION(op_array, phasync_preempt_handle);
-
-	if (info) {
-		return info;
-	}
-	info = zend_arena_alloc(&CG(arena), sizeof(*info));
-	info->no_preempt = (op_array->attributes
+	return (op_array->attributes
 		&& zend_get_attribute(op_array->attributes, phasync_uninterruptible_lcname))
 		|| (op_array->scope && op_array->function_name
 		 && zend_string_equals_literal_ci(op_array->function_name, "__destruct"));
-	ZEND_OP_ARRAY_EXTENSION(op_array, phasync_preempt_handle) = info;
-	return info;
 }
 
 /* Preemption happens only at checkpoints (between loop iterations), in PHP code
@@ -7653,7 +7643,7 @@ static bool phasync_preemptible(const zend_execute_data *execute_data)
 		if (ex->func->op_array.fn_flags & ZEND_ACC_CALL_VIA_TRAMPOLINE) {
 			continue;
 		}
-		if (phasync_loop_info_of(&ex->func->op_array)->no_preempt) {
+		if (phasync_op_array_no_preempt(&ex->func->op_array)) {
 			return false;
 		}
 		if (!prev) {
@@ -8171,7 +8161,6 @@ static PHP_MINIT_FUNCTION(phasync)
 	phasync_poller_handlers.get_gc = phasync_poller_get_gc;
 	phasync_poller_handlers.clone_obj = NULL;
 	pthread_atfork(phasync_preempt_fork_prepare, phasync_preempt_fork_parent, phasync_fork_child);
-	phasync_preempt_handle = zend_get_op_array_extension_handle("phasync");
 	phasync_checkpoint_startup();
 	{
 		zend_class_entry *ce = register_class_phasync_Uninterruptible();
