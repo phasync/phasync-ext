@@ -5291,9 +5291,21 @@ static void phasync_vsession_init(phasync_vsession *vs)
 	vs->status = ps->mod ? php_session_none : php_session_disabled;
 	vs->define_sid = 1;
 	ZVAL_UNDEF(&vs->http_vars);
-	for (size_t i = 0; i < sizeof(vs->user_names) / sizeof(zval); i++) {
-		ZVAL_UNDEF(&names[i]);
+	/* The worker's user save handler (session_set_save_handler() outside any
+	 * boundary), as ps->mod already is: the request holds its own references. */
+	{
+		zval *worker = (zval *) &ps->mod_user_names;
+		for (size_t i = 0; i < sizeof(vs->user_names) / sizeof(zval); i++) {
+			ZVAL_COPY(&names[i], &worker[i]);
+		}
 	}
+	vs->user_implemented = ps->mod_user_implemented;
+	if (ps->mod_user_class_name) {
+		vs->user_class_name = zend_string_copy(ps->mod_user_class_name);
+	}
+# if PHP_VERSION_ID >= 80600
+	vs->user_obj_methods = ps->mod_user_uses_object_methods_as_handlers;
+# endif
 }
 
 /* Free what a boundary's session state owns (it is not live). */
