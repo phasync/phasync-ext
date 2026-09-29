@@ -50,10 +50,10 @@ var_dump(function_exists('phasync\ext\checkpoint'));
 bool(true)
 bool(true)
 int(13961473)
-#0 %s(%d): {closure%s}()
+#0 %s(%d): {closure%S}()
 #1 %s(%d): loop()
 from the closure at line %d
-#0 %s(%d): {closure%s}()
+#0 %s(%d): {closure%S}()
 #1 %s(%d): loop()
 #2 {main}
 bool(%s)
