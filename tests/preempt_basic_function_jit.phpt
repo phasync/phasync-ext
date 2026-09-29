@@ -1,5 +1,5 @@
 --TEST--
-set_preempt_function(): interval, removal, previous, exceptions, suspension (tracing JIT)
+set_preempt_function(): interval, removal, previous, exceptions, suspension (function JIT)
 --EXTENSIONS--
 phasync
 --SKIPIF--
@@ -10,7 +10,7 @@ if (!extension_loaded('Zend OPcache')) die('skip needs opcache');
 --INI--
 opcache.enable=1
 opcache.enable_cli=1
-opcache.jit=tracing
+opcache.jit=function
 opcache.jit_buffer_size=64M
 --FILE--
 <?php

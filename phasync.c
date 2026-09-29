@@ -331,7 +331,7 @@ struct phasync_preempt;
 ZEND_BEGIN_MODULE_GLOBALS(phasync)
 	struct phasync_preempt *preempt; /* set_preempt_function()'s timer, NULL = none */
 	zval preempt_fn;              /* its closure, UNDEF = none                     */
-	zval *preempt_due;            /* phasync\ext\PREEMPT_DUE's value: true = a checkpoint calls */
+	zval *preempt_due;            /* phasync\ext\__PREEMPT_DUE's value: true = a checkpoint calls */
 	phasync_scope *scope_top;     /* innermost active manage() scope, or NULL */
 	struct phasync_boundary *vb_cur; /* virtualize(): boundary whose state is live; NULL = the SAPI's */
 	phasync_vstate vroot;         /* the SAPI's own state while a boundary's is live */
@@ -7439,7 +7439,7 @@ static void phasync_ops_dtor(zval *zv)
 
 /* set_preempt_function(): every backward jump (a loop's back-edge, a backward
  * goto, foreach's continue) is compiled with
- *     if (\phasync\ext\PREEMPT_DUE) \phasync\ext\checkpoint();
+ *     if (\phasync\ext\__PREEMPT_DUE) \phasync\ext\checkpoint();
  * right before it (phasync_inject_checkpoints()). The constant is registered
  * per request, without CONST_PERSISTENT, so neither the compiler nor opcache
  * substitutes it; FETCH_CONSTANT reads it through its run-time cache slot, and
@@ -7470,7 +7470,7 @@ typedef struct phasync_preempt {
 	pthread_mutex_t   mutex;
 	pthread_cond_t    cond;
 	pthread_t         thread;
-	uint32_t         *flag;           /* type_info of the owning PHP thread's PREEMPT_DUE */
+	uint32_t         *flag;           /* type_info of the owning PHP thread's __PREEMPT_DUE */
 	zend_atomic_bool  pending;        /* raised, not yet taken at a checkpoint    */
 	bool              stop;
 	double            interval;
@@ -7719,8 +7719,9 @@ static zend_never_inline void phasync_checkpoint_hit(zend_execute_data *ex, bool
 	}
 }
 
-/* The checkpoint, called when PREEMPT_DUE was seen raised (or by user code,
- * hence the check). PHP 8.4+ calls it frameless; older PHP with a frame. */
+/* The checkpoint, called when __PREEMPT_DUE was seen raised. PHP 8.4+ calls it
+ * frameless and has it in no function table; older PHP calls it with a frame and
+ * by name, so PHP code can call it too (hence the check). */
 ZEND_FUNCTION(phasync_checkpoint)
 {
 	if (EXPECTED(!phasync_flag_raised())) {
@@ -7743,9 +7744,8 @@ static const zend_frameless_function_info phasync_checkpoint_flf[] = {
 	{ 0 },
 };
 static uint32_t phasync_checkpoint_flf_offset;
-#else
-static zend_function *phasync_checkpoint_func;
 #endif
+static zend_function *phasync_checkpoint_func;
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_phasync_checkpoint, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
@@ -7914,7 +7914,7 @@ static uint32_t phasync_shift_target(uint32_t t, void *arg)
 	return t + lo * s->k;
 }
 
-/* FETCH_CONSTANT PREEMPT_DUE, JMPZ past the call, then the call:
+/* FETCH_CONSTANT __PREEMPT_DUE, JMPZ past the call, then the call:
  * FRAMELESS_ICALL_0 + FREE on PHP 8.4+, INIT_FCALL + DO_ICALL before. */
 #define PHASYNC_CHECKPOINT_OPS 4
 
@@ -8049,26 +8049,27 @@ static void phasync_checkpoint_startup(void)
 {
 	zend_register_functions(NULL, phasync_checkpoint_functions, NULL, MODULE_PERSISTENT);
 	phasync_checkpoint_name = zend_string_init_interned(ZEND_STRL("phasync\\ext\\checkpoint"), 1);
-	phasync_preempt_due_name = zend_string_init_interned(ZEND_STRL("phasync\\ext\\PREEMPT_DUE"), 1);
+	phasync_preempt_due_name = zend_string_init_interned(ZEND_STRL("phasync\\ext\\__PREEMPT_DUE"), 1);
+	phasync_checkpoint_func = zend_hash_find_ptr(CG(function_table), phasync_checkpoint_name);
 #if PHP_VERSION_ID >= 80400
 	for (uint32_t i = 0; zend_flf_handlers[i]; i++) {
 		if (zend_flf_handlers[i] == (void *) ZEND_FRAMELESS_FUNCTION_NAME(phasync_checkpoint, 0)) {
 			phasync_checkpoint_flf_offset = i;
 		}
 	}
-#else
-	phasync_checkpoint_func = zend_hash_find_ptr(CG(function_table), phasync_checkpoint_name);
+	/* Frameless calls reach it through zend_flf_handlers/zend_flf_functions, not
+	 * by name: take it out of the function table (without freeing it, MSHUTDOWN
+	 * does), so PHP code can neither see nor call it. */
+	{
+		dtor_func_t dtor = CG(function_table)->pDestructor;
+
+		CG(function_table)->pDestructor = NULL;
+		zend_hash_del(CG(function_table), phasync_checkpoint_name);
+		CG(function_table)->pDestructor = dtor;
+	}
 #endif
 	zend_register_extension(&phasync_zend_extension, NULL);
 }
-
-/* php/php-src#23983 was about the function JIT taking interrupts; checkpoints
- * are plain calls, so nothing is disabled here (measured on the prototype). */
-static bool phasync_function_jit_active(void)
-{
-	return false;
-}
-
 
 ZEND_FUNCTION(phasync_ext_set_preempt_function)
 {
@@ -8087,14 +8088,7 @@ ZEND_FUNCTION(phasync_ext_set_preempt_function)
 		RETURN_THROWS();
 	}
 	p = PHASYNC_G(preempt);
-	if (fn && phasync_function_jit_active()) {
-		php_error_docref(NULL, E_WARNING, "Preemption is disabled: under opcache's function JIT, "
-			"PHP 8.4+ can compute wrong results when interrupts are handled in loops (php/php-src#23983)");
-		if (p) {
-			PHASYNC_G(preempt) = NULL;
-			phasync_preempt_stop(p);
-		}
-	} else if (fn && !p) {
+	if (fn && !p) {
 		if (!(p = phasync_preempt_start(interval))) {
 			zend_throw_error(NULL, "Could not start the preempt timer thread");
 			RETURN_THROWS();
@@ -8282,6 +8276,14 @@ static PHP_MSHUTDOWN_FUNCTION(phasync)
 	zend_set_user_opcode_handler(ZEND_EXIT, phasync_exit_opcode_prev);
 #endif
 	zend_string_release_ex(phasync_uninterruptible_lcname, 1);
+#if PHP_VERSION_ID >= 80400
+	{
+		zval zv;   /* the checkpoint, kept out of the function table */
+
+		ZVAL_PTR(&zv, phasync_checkpoint_func);
+		zend_function_dtor(&zv);
+	}
+#endif
 	if (phasync_ub_write_orig) {
 		sapi_module.ub_write = phasync_ub_write_orig;
 	}
@@ -8351,7 +8353,7 @@ static PHP_RINIT_FUNCTION(phasync)
 	phasync_install_hooks();
 	phasync_wrap_existing_streams(false);
 	/* Per request, so opcache never substitutes it (see set_preempt_function()). */
-	zend_register_bool_constant(ZEND_STRL("phasync\\ext\\PREEMPT_DUE"), false, 0, module_number);
+	zend_register_bool_constant(ZEND_STRL("phasync\\ext\\__PREEMPT_DUE"), false, 0, module_number);
 	PHASYNC_G(preempt_due) = &((zend_constant *) zend_hash_find_ptr(EG(zend_constants), phasync_preempt_due_name))->value;
 	return SUCCESS;
 }

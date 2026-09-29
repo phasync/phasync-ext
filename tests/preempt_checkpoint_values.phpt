@@ -44,7 +44,9 @@ try {
     echo $e->getMessage(), ' at line ', $e->getLine(), "\n", $e->getTraceAsString(), "\n";
 }
 set_preempt_function(null);
-var_dump(function_exists('phasync\ext\checkpoint'));
+// Internal: the flag is a constant; the function is in no function table on 8.4+.
+var_dump(defined('phasync\ext\__PREEMPT_DUE'), phasync\ext\__PREEMPT_DUE);
+var_dump(function_exists('phasync\ext\checkpoint') === PHP_VERSION_ID < 80400);
 ?>
 --EXPECTF--
 bool(true)
@@ -56,4 +58,6 @@ from the closure at line %d
 #0 %s(%d): {closure%S}()
 #1 %s(%d): loop()
 #2 {main}
-bool(%s)
+bool(true)
+bool(false)
+bool(true)

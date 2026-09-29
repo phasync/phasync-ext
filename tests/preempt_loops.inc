@@ -2,8 +2,6 @@
 use function phasync\ext\set_preempt_function;
 
 // $phase is 0 exactly between iterations: the closure must never see it set.
-// On PHP < 8.4 without JIT, a do-while or a loop left by break is interrupted
-// less often when its time goes into calls (see README): those call nothing.
 $phase = 0;
 $calls = 0;
 $mid = 0;

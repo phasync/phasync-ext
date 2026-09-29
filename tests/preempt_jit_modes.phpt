@@ -1,5 +1,5 @@
 --TEST--
-set_preempt_function(): no warning under the tracing JIT, or opcache.jit=off (php/php-src#23983)
+set_preempt_function(): interrupts under the tracing JIT, and after opcache.jit=off at run time
 --EXTENSIONS--
 phasync
 --SKIPIF--

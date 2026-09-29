@@ -446,16 +446,19 @@ frame (outside fibers, to the script's own code).
 
 - Every backward jump (a loop's back-edge, a `foreach` `continue`, a backward
   `goto`) is compiled with a checkpoint before it:
-  `if (\phasync\ext\PREEMPT_DUE) \phasync\ext\checkpoint();`. The constant is
+  `if (\phasync\ext\__PREEMPT_DUE) \phasync\ext\checkpoint();`. Both are
+  internal: the constant is a flag the extension flips (read-only to PHP code,
+  not for use), and the function is in no function table on PHP 8.4+ (a
+  frameless call; on 8.2/8.3 `function_exists()` sees it). The constant is
   registered per request, so opcache never folds it, and both JITs compile its
   read into loads and a compare, without a call; the call runs only when due
-  and shows in no backtrace. A timer
-  thread, not a signal, raises the flag, so no syscall fails with
-  `EINTR` and the engine's interrupts are not used. `$fn` runs once, without
-  arguments, at the next checkpoint the stack allows, the same in the
+  and shows in no backtrace. A timer thread, not a signal, raises the flag, so
+  no syscall fails with `EINTR` and the engine's interrupts are not used. `$fn`
+  runs once, without arguments, at the next checkpoint the stack allows, the same in the
   interpreter and both JIT modes. A backward `goto` counts as a loop: the
   attribute is the way to make such code uninterruptible. Code without a loop
-  (straight-line code, recursion) is never interrupted. A long C call delays it
+  (straight-line code, recursion) is never interrupted, nor is code the engine
+  compiles without running extensions' compile hooks (`php -r`). A long C call delays it
   until it returns. The interval counts from the start of the previous call.
 - `#[\phasync\Uninterruptible]` is not mutual exclusion: such a function can
   still suspend (on I/O, say), and other coroutines run, and are preempted,
