@@ -39,6 +39,7 @@
 #include "zend_closures.h"
 #include "ext/spl/spl_exceptions.h"
 #include <float.h>
+#include "zend_attributes.h"
 #include "phasync_arginfo.h"
 
 #include <poll.h>
@@ -61,6 +62,7 @@
 #include "php_open_temporary_file.h"
 #include "zend_observer.h"
 #include "zend_fibers.h"
+#include "zend_extensions.h"
 #if __has_include("ext/session/php_session.h")
 # include "ext/session/php_session.h"
 # define PHASYNC_HAVE_SESSION 1
@@ -323,8 +325,11 @@ typedef struct phasync_vsession {
 #endif
 
 struct phasync_boundary;
+struct phasync_preempt;
 
 ZEND_BEGIN_MODULE_GLOBALS(phasync)
+	struct phasync_preempt *preempt; /* set_preempt_function()'s timer, NULL = none */
+	zval preempt_fn;              /* its closure, UNDEF = none                     */
 	phasync_scope *scope_top;     /* innermost active manage() scope, or NULL */
 	struct phasync_boundary *vb_cur; /* virtualize(): boundary whose state is live; NULL = the SAPI's */
 	phasync_vstate vroot;         /* the SAPI's own state while a boundary's is live */
@@ -645,9 +650,14 @@ static phasync_poller *phasync_pollers;   /* live Pollers of this process */
  * used from a process other than its creator without a getpid() syscall. */
 static unsigned phasync_fork_gen;
 
+static void phasync_preempt_fork_prepare(void);
+static void phasync_preempt_fork_parent(void);
+static void phasync_preempt_fork_child(void);
+
 static void phasync_fork_child(void)
 {
 	phasync_fork_gen++;
+	phasync_preempt_fork_child();
 }
 
 static zend_always_inline phasync_poller *phasync_poller_from(zend_object *obj)
@@ -7425,6 +7435,399 @@ static void phasync_ops_dtor(zval *zv)
 }
 
 
+/* set_preempt_function(): a timer thread asks the engine to interrupt at most
+ * every interval; the engine calls zend_interrupt_function at its next check
+ * (on this thread), which calls the closure if execution continues at a loop
+ * head. The interval counts from the moment the closure is due there: the thread
+ * raises one request at a time.
+ *
+ * Until a loop head takes it, the hook raises the engine's flag again, so the
+ * engine's next check asks again, up to PHASYNC_PREEMPT_CHAIN checks in a row.
+ * Not when the check is at the same frame and opline as the last one: the VM
+ * checks again right after the hook returns, without moving (the JIT doesn't).
+ * After that, the thread raises it every PHASYNC_PREEMPT_RETRY: code without
+ * loops costs a few engine checks per retry. */
+#define PHASYNC_PREEMPT_RETRY_NS 250000L    /* 0.25 ms */
+#define PHASYNC_PREEMPT_CHAIN    4
+
+typedef struct phasync_preempt {
+	pthread_mutex_t   mutex;
+	pthread_cond_t    cond;
+	pthread_t         thread;
+	zend_atomic_bool *vm_interrupt;   /* EG(vm_interrupt) of the owning PHP thread */
+	zend_atomic_bool  pending;        /* raised, not yet taken at a loop head      */
+	bool              stop;
+	double            interval;
+	struct timespec   since;          /* start of the current interval (CLOCK_MONOTONIC) */
+	uint32_t          raised;         /* times the thread raised the flag (__atomic) */
+	/* The PHP thread's own: */
+	uint32_t          seen;           /* `raised` when the hook last looked      */
+	uint32_t          chain;          /* checks re-raised since                  */
+	const zend_execute_data *miss_ex; /* where the last check was               */
+	const zend_op    *miss_op;
+} phasync_preempt;
+
+/* What the hook needs to know of an op_array, built on first need and kept for
+ * the request in its run-time cache (writable also for opcache's immutable
+ * op_arrays), in the arena that lives as long. */
+typedef struct phasync_loop_info {
+	bool     no_preempt;              /* #[phasync\Uninterruptible], or a destructor */
+	uint32_t heads[1];                /* bitmap: which oplines are loop heads    */
+} phasync_loop_info;
+
+static void (*phasync_preempt_prev)(zend_execute_data *execute_data);
+static int phasync_preempt_handle;    /* op_array extension slot: its phasync_loop_info */
+static zend_string *phasync_uninterruptible_lcname;   /* the attribute, as attributes are keyed */
+
+static zend_always_inline void phasync_ts_add_ns(struct timespec *ts, long ns)
+{
+	ts->tv_nsec += ns;
+	while (ts->tv_nsec >= 1000000000L) {
+		ts->tv_sec++;
+		ts->tv_nsec -= 1000000000L;
+	}
+}
+
+static void *phasync_preempt_main(void *arg)
+{
+	phasync_preempt *p = arg;
+	struct timespec now, deadline;
+
+	pthread_mutex_lock(&p->mutex);
+	while (!p->stop) {
+		if (zend_atomic_bool_load_ex(&p->pending)) {
+			/* Not taken yet: the engine's check found no loop head (or
+			 * uninterruptible code); raise its flag again shortly. */
+			clock_gettime(CLOCK_MONOTONIC, &deadline);
+			phasync_ts_add_ns(&deadline, PHASYNC_PREEMPT_RETRY_NS);
+			if (pthread_cond_timedwait(&p->cond, &p->mutex, &deadline) == ETIMEDOUT
+			 && zend_atomic_bool_load_ex(&p->pending)) {
+				__atomic_add_fetch(&p->raised, 1, __ATOMIC_RELAXED);
+				zend_atomic_bool_store(p->vm_interrupt, true);
+			}
+			continue;
+		}
+		deadline = p->since;
+		deadline.tv_sec += (time_t) p->interval;
+		phasync_ts_add_ns(&deadline, (long) ((p->interval - floor(p->interval)) * 1e9));
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+			zend_atomic_bool_store_ex(&p->pending, true);
+			__atomic_add_fetch(&p->raised, 1, __ATOMIC_RELAXED);
+			zend_atomic_bool_store(p->vm_interrupt, true);
+			continue;
+		}
+		pthread_cond_timedwait(&p->cond, &p->mutex, &deadline);
+	}
+	pthread_mutex_unlock(&p->mutex);
+	return NULL;
+}
+
+/* Start a timer for this PHP thread; NULL if no thread could be created. The
+ * thread blocks every signal, so process signals (pcntl, SIGPROF of
+ * max_execution_time) keep going to PHP's thread. */
+static phasync_preempt *phasync_preempt_start(double interval)
+{
+	phasync_preempt *p = calloc(1, sizeof(*p));
+	pthread_condattr_t ca;
+	sigset_t all, old;
+	int rc;
+
+	if (!p) {
+		return NULL;
+	}
+	pthread_mutex_init(&p->mutex, NULL);
+	pthread_condattr_init(&ca);
+	pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+	pthread_cond_init(&p->cond, &ca);
+	pthread_condattr_destroy(&ca);
+	p->vm_interrupt = &EG(vm_interrupt);
+	zend_atomic_bool_init(&p->pending, false);
+	p->interval = interval;
+	clock_gettime(CLOCK_MONOTONIC, &p->since);
+	sigfillset(&all);
+	pthread_sigmask(SIG_SETMASK, &all, &old);
+	rc = pthread_create(&p->thread, NULL, phasync_preempt_main, p);
+	pthread_sigmask(SIG_SETMASK, &old, NULL);
+	if (rc != 0) {
+		pthread_cond_destroy(&p->cond);
+		pthread_mutex_destroy(&p->mutex);
+		free(p);
+		return NULL;
+	}
+	return p;
+}
+
+static void phasync_preempt_stop(phasync_preempt *p)
+{
+	pthread_mutex_lock(&p->mutex);
+	p->stop = true;
+	pthread_cond_signal(&p->cond);
+	pthread_mutex_unlock(&p->mutex);
+	pthread_join(p->thread, NULL);
+	pthread_cond_destroy(&p->cond);
+	pthread_mutex_destroy(&p->mutex);
+	free(p);
+}
+
+/* fork(): the child has no timer thread. It gets one of its own, with the same
+ * interval; the parent's mutex is held across fork() so the child's copy is in
+ * a known state (owned by the forking thread, which the child has). */
+static void phasync_preempt_fork_prepare(void)
+{
+	if (PHASYNC_G(preempt)) {
+		pthread_mutex_lock(&PHASYNC_G(preempt)->mutex);
+	}
+}
+
+static void phasync_preempt_fork_parent(void)
+{
+	if (PHASYNC_G(preempt)) {
+		pthread_mutex_unlock(&PHASYNC_G(preempt)->mutex);
+	}
+}
+
+static void phasync_preempt_fork_child(void)
+{
+	phasync_preempt *old = PHASYNC_G(preempt);
+
+	if (old) {
+		/* old's cond may record the parent's timer thread as a waiter: it is
+		 * dropped as plain memory, not destroyed. If no thread can be created,
+		 * the child runs without preemption. */
+		PHASYNC_G(preempt) = phasync_preempt_start(old->interval);
+		free(old);
+	}
+}
+
+/* A loop head is the target of a backward jump (the VM checks interrupts there:
+ * while/for/do-while back-edges, foreach's jump back to FE_FETCH, continue; also
+ * a backward goto, which compiles to the same jump) and, for while and for
+ * loops, their condition, from where their entry JMP jumps to up to the backward
+ * jump: the function JIT checks at its start (the CFG's loop header), and the
+ * engine after an internal call in it (PHP < 8.4, the tracing JIT). */
+static phasync_loop_info *phasync_loop_info_of(const zend_op_array *op_array)
+{
+	phasync_loop_info *info = ZEND_OP_ARRAY_EXTENSION(op_array, phasync_preempt_handle);
+	size_t size;
+
+	if (info) {
+		return info;
+	}
+	size = XtOffsetOf(phasync_loop_info, heads) + ((op_array->last + 31) / 32 + 1) * sizeof(uint32_t);
+	info = zend_arena_alloc(&CG(arena), size);
+	memset(info, 0, size);
+	info->no_preempt = (op_array->attributes
+		&& zend_get_attribute(op_array->attributes, phasync_uninterruptible_lcname))
+		|| (op_array->scope && op_array->function_name
+		 && zend_string_equals_literal_ci(op_array->function_name, "__destruct"));
+	for (uint32_t i = 0; i < op_array->last; i++) {
+		const zend_op *op = &op_array->opcodes[i];
+		const zend_op *target;
+		uint32_t t;
+
+		switch (op->opcode) {
+			case ZEND_JMP:
+				target = OP_JMP_ADDR(op, op->op1);
+				break;
+			case ZEND_JMPZ:
+			case ZEND_JMPNZ:
+				target = OP_JMP_ADDR(op, op->op2);
+				break;
+			default:
+				continue;
+		}
+		t = (uint32_t) (target - op_array->opcodes);
+		if (t > i) {
+			continue;
+		}
+		info->heads[t / 32] |= 1u << (t % 32);
+		if (t > 0 && op_array->opcodes[t - 1].opcode == ZEND_JMP) {
+			const zend_op *entry = &op_array->opcodes[t - 1];
+			uint32_t c = (uint32_t) (OP_JMP_ADDR(entry, entry->op1) - op_array->opcodes);
+
+			for (; c > t && c <= i; c++) {
+				info->heads[c / 32] |= 1u << (c % 32);
+			}
+		}
+	}
+	ZEND_OP_ARRAY_EXTENSION(op_array, phasync_preempt_handle) = info;
+	return info;
+}
+
+static zend_always_inline bool phasync_user_frame(const zend_execute_data *ex)
+{
+	return ex->func && ZEND_USER_CODE(ex->func->type)
+		&& !(ex->func->op_array.fn_flags & ZEND_ACC_CALL_VIA_TRAMPOLINE);
+}
+
+/* Preemption happens only between loop iterations, in PHP code called from PHP
+ * code: execution continues at a loop head of user code, and on the stack, down
+ * to the fiber's first frame (or the script's own code outside fibers), is no C
+ * function (a callback of usort(), an output handler, a session handler ...), no
+ * function the engine called in the middle of an operation rather than at a
+ * call (an error handler, a magic method, __toString(), an Iterator's methods
+ * driven by foreach, an autoloader ...), no destructor, and no function with
+ * #[phasync\Uninterruptible]. Outside fibers, a function at the bottom of the
+ * stack was called from C (an exception handler, a shutdown function). */
+static bool phasync_preemptible(const zend_execute_data *execute_data)
+{
+	const zend_execute_data *bottom = EG(active_fiber) ? EG(active_fiber)->stack_bottom : NULL;
+	const zend_op_array *op_array;
+	const zend_op *next;
+	uint32_t n;
+
+	if (!execute_data || !execute_data->func) {
+		return false;
+	}
+	next = execute_data->opline;
+	if (!ZEND_USER_CODE(execute_data->func->type)) {
+		/* Checked after an internal call returned, with its frame still on top:
+		 * execution continues after the call in its caller. */
+		execute_data = execute_data->prev_execute_data;
+		if (!execute_data || !phasync_user_frame(execute_data)) {
+			return false;
+		}
+		next = execute_data->opline + 1;
+	} else if (!phasync_user_frame(execute_data)) {
+		return false;
+	}
+	op_array = &execute_data->func->op_array;
+	n = (uint32_t) (next - op_array->opcodes);
+	if (n >= op_array->last || !((phasync_loop_info_of(op_array)->heads[n / 32] >> (n % 32)) & 1)) {
+		return false;
+	}
+	for (const zend_execute_data *ex = execute_data, *prev; ex != bottom; ex = prev) {
+		prev = ex->prev_execute_data;
+		if (!ex->func || !ZEND_USER_CODE(ex->func->type)) {
+			return false;   /* a C function */
+		}
+		if (ex->func->op_array.fn_flags & ZEND_ACC_CALL_VIA_TRAMPOLINE) {
+			continue;
+		}
+		if (phasync_loop_info_of(&ex->func->op_array)->no_preempt) {
+			return false;
+		}
+		if (!prev) {
+			return !ex->func->op_array.function_name;   /* the script's own code */
+		}
+		if (prev != bottom && !(ZEND_CALL_INFO(ex) & ZEND_CALL_GENERATOR)
+		 && prev->func && ZEND_USER_CODE(prev->func->type)) {
+			switch (prev->opline->opcode) {
+				case ZEND_DO_FCALL:
+				case ZEND_DO_UCALL:
+				case ZEND_DO_FCALL_BY_NAME:
+				case ZEND_INCLUDE_OR_EVAL:
+					break;
+				default:
+					return false;   /* called by the engine, not at a call */
+			}
+		}
+	}
+	return true;
+}
+
+static void phasync_preempt_interrupt(zend_execute_data *execute_data)
+{
+	phasync_preempt *p;
+	zval fn, retval;
+
+	if (phasync_preempt_prev) {
+		phasync_preempt_prev(execute_data);
+	}
+	p = PHASYNC_G(preempt);
+	if (!p || !zend_atomic_bool_load_ex(&p->pending)) {
+		return;
+	}
+	/* Not between loop iterations, uninterruptible, or after an internal call
+	 * that threw (or a pcntl handler that did): ask again. The engine's own flags
+	 * (EG(timed_out), pcntl's queue) are unaffected. */
+	if (EG(exception) || !phasync_preemptible(execute_data)) {
+		uint32_t raised = __atomic_load_n(&p->raised, __ATOMIC_RELAXED);
+
+		if (raised != p->seen) {
+			p->seen = raised;
+			p->chain = 0;
+		}
+		if (p->chain < PHASYNC_PREEMPT_CHAIN) {
+			/* An internal function's frame is checked after its call returns
+			 * (no second check follows); its opline means nothing. */
+			bool user = execute_data && phasync_user_frame(execute_data);
+
+			if (!user || execute_data != p->miss_ex || execute_data->opline != p->miss_op) {
+				p->chain++;
+				p->miss_ex = user ? execute_data : NULL;
+				p->miss_op = user ? execute_data->opline : NULL;
+				zend_atomic_bool_store_ex(&EG(vm_interrupt), true);
+			}
+		}
+		return;
+	}
+	p->miss_ex = NULL;
+	pthread_mutex_lock(&p->mutex);
+	zend_atomic_bool_store_ex(&p->pending, false);
+	clock_gettime(CLOCK_MONOTONIC, &p->since);
+	pthread_cond_signal(&p->cond);
+	pthread_mutex_unlock(&p->mutex);
+
+	/* Where Fiber::suspend() would throw (pcntl handlers, a fiber being
+	 * destroyed), skip: the next interval gets it. */
+	if (zend_fiber_switch_blocked() || phasync_unwinding()) {
+		return;
+	}
+	/* Not re-entrant: the engine calls $fn here, at no call of the interrupted
+	 * code, so nothing on its stack is preemptible while it runs. */
+	ZVAL_COPY(&fn, &PHASYNC_G(preempt_fn));   /* it may replace itself */
+	call_user_function(NULL, NULL, &fn, &retval, 0, NULL);
+	zval_ptr_dtor(&retval);
+	zval_ptr_dtor(&fn);
+}
+
+ZEND_FUNCTION(phasync_ext_set_preempt_function)
+{
+	zend_object *fn;
+	double interval = 0.1;
+	phasync_preempt *p;
+
+	ZEND_PARSE_PARAMETERS_START(1, 2)
+		Z_PARAM_OBJ_OF_CLASS_OR_NULL(fn, zend_ce_closure)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_DOUBLE(interval)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (!(interval > 0) || !zend_finite(interval)) {
+		zend_argument_value_error(2, "must be a positive number of seconds");
+		RETURN_THROWS();
+	}
+	p = PHASYNC_G(preempt);
+	if (fn && !p) {
+		if (!(p = phasync_preempt_start(interval))) {
+			zend_throw_error(NULL, "Could not start the preempt timer thread");
+			RETURN_THROWS();
+		}
+		PHASYNC_G(preempt) = p;
+	} else if (fn) {
+		pthread_mutex_lock(&p->mutex);
+		p->interval = interval;
+		pthread_cond_signal(&p->cond);
+		pthread_mutex_unlock(&p->mutex);
+	} else if (p) {
+		PHASYNC_G(preempt) = NULL;
+		phasync_preempt_stop(p);
+	}
+	if (Z_TYPE(PHASYNC_G(preempt_fn)) == IS_UNDEF) {
+		RETVAL_NULL();
+	} else {
+		ZVAL_COPY_VALUE(return_value, &PHASYNC_G(preempt_fn));
+	}
+	if (fn) {
+		ZVAL_OBJ_COPY(&PHASYNC_G(preempt_fn), fn);
+	} else {
+		ZVAL_UNDEF(&PHASYNC_G(preempt_fn));
+	}
+}
+
+
 static ZEND_INI_MH(phasync_update_fs_offload)
 {
 	if (zend_string_equals_literal_ci(new_value, "network")) {
@@ -7471,7 +7874,17 @@ static PHP_MINIT_FUNCTION(phasync)
 	phasync_poller_handlers.free_obj = phasync_poller_free;
 	phasync_poller_handlers.get_gc = phasync_poller_get_gc;
 	phasync_poller_handlers.clone_obj = NULL;
-	pthread_atfork(NULL, NULL, phasync_fork_child);
+	pthread_atfork(phasync_preempt_fork_prepare, phasync_preempt_fork_parent, phasync_fork_child);
+	phasync_preempt_handle = zend_get_op_array_extension_handle("phasync");
+	phasync_preempt_handle = zend_get_op_array_extension_handle("phasync");
+	{
+		zend_class_entry *ce = register_class_phasync_Uninterruptible();
+
+		zend_mark_internal_attribute(ce);   /* its targets are checked at compile time */
+		phasync_uninterruptible_lcname = zend_string_tolower_ex(ce->name, 1);
+	}
+	phasync_preempt_prev = zend_interrupt_function;
+	zend_interrupt_function = phasync_preempt_interrupt;
 	phasync_stdio_read_orig = php_stream_stdio_ops.read;
 	phasync_stdio_write_orig = php_stream_stdio_ops.write;
 	phasync_stdio_set_option_orig = php_stream_stdio_ops.set_option;
@@ -7536,6 +7949,7 @@ static PHP_GINIT_FUNCTION(phasync)
 	zend_hash_init(&phasync_globals->fs_hooks, 32, NULL, NULL, 1);
 	zend_hash_init(&phasync_globals->sock_hooks, 8, NULL, NULL, 1);
 	zend_hash_init(&phasync_globals->vfibers, 8, NULL, NULL, 1);
+	ZVAL_UNDEF(&phasync_globals->preempt_fn);
 	phasync_globals->mountinfo_fd = -1;
 }
 
@@ -7575,6 +7989,10 @@ static PHP_MSHUTDOWN_FUNCTION(phasync)
 #if PHP_VERSION_ID < 80400
 	zend_set_user_opcode_handler(ZEND_EXIT, phasync_exit_opcode_prev);
 #endif
+	zend_string_release_ex(phasync_uninterruptible_lcname, 1);
+	if (zend_interrupt_function == phasync_preempt_interrupt) {
+		zend_interrupt_function = phasync_preempt_prev;
+	}
 	if (phasync_ub_write_orig) {
 		sapi_module.ub_write = phasync_ub_write_orig;
 	}
@@ -7648,6 +8066,12 @@ static PHP_RINIT_FUNCTION(phasync)
 
 static PHP_RSHUTDOWN_FUNCTION(phasync)
 {
+	if (PHASYNC_G(preempt)) {
+		phasync_preempt_stop(PHASYNC_G(preempt));
+		PHASYNC_G(preempt) = NULL;
+	}
+	zval_ptr_dtor(&PHASYNC_G(preempt_fn));
+	ZVAL_UNDEF(&PHASYNC_G(preempt_fn));
 	phasync_restore_hooks();
 	/* Any manage() scopes have unwound already (their frames live on the C
 	 * stack); nothing to free here. Leave the hooked table intact: streams may

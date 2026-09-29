@@ -5,7 +5,7 @@
  * @undocumentable
  */
 
-namespace phasync\ext;
+namespace phasync\ext {
 
 /**
  * Like the built-in stream_select(), but the descriptor set grows on demand,
@@ -65,6 +65,30 @@ final class Poller
      */
     public function writable(mixed $stream, float $timeout = \PHP_FLOAT_MAX): void {}
 }
+
+/**
+ * Call $fn at most every $minInterval seconds (wall clock), between iterations
+ * of whatever PHP loop is running then, so a scheduler can preempt a coroutine
+ * that never yields: $fn may call Fiber::suspend(), and resuming the fiber
+ * continues the loop.
+ *
+ * Preemption happens only between loop iterations, in PHP code called from PHP
+ * code: never in callbacks called by C functions, in code the engine calls in
+ * the middle of an operation (error handlers, magic methods, __toString(),
+ * Iterator methods driven by foreach, autoloaders), in destructors, exception
+ * handlers, shutdown functions, or #[\phasync\Uninterruptible] functions and
+ * what they call, down to the fiber's first frame. Code without a loop is never
+ * interrupted. A timer thread (not a signal: no syscall fails with EINTR) asks
+ * the engine to interrupt; $fn runs once, without arguments. It is skipped
+ * where suspending would throw FiberError (pcntl signal handlers, a fiber being
+ * destroyed). It is never called while a call of it is still running in the
+ * same fiber. An exception $fn throws surfaces at the interrupted point.
+ *
+ * Returns the previous closure. null removes it and stops the timer; with none
+ * set there is no thread and no interrupt. It is per process (per thread on ZTS
+ * builds), and a fork()ed child keeps it and has its own timer.
+ */
+function set_preempt_function(?\Closure $fn, float $minInterval = 0.1): ?\Closure {}
 
 /**
  * Run $task with transparent fiber-async I/O active for its dynamic extent.
@@ -156,3 +180,22 @@ function manage(\Closure $task, Poller $poller, \Closure $sleep, string $timeout
  * Other global variables are not isolated. Nesting throws an Error.
  */
 function virtualize(\Closure $code, object $sapi): mixed {}
+
+}
+
+namespace phasync {
+
+/**
+ * While a function with this attribute, or anything it calls in its fiber, runs,
+ * the closure set with phasync\ext\set_preempt_function() is not called: it is
+ * not preempted. It is not mutual exclusion: it can still suspend (on I/O, say),
+ * and other coroutines run meanwhile.
+ *
+ * @strict-properties
+ */
+#[\Attribute(6)] // Attribute::TARGET_FUNCTION | Attribute::TARGET_METHOD
+final class Uninterruptible
+{
+}
+
+}

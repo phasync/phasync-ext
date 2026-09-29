@@ -169,6 +169,15 @@ function virtualize(
     \Closure $code,             // one request; its return value is returned
     object   $sapi,             // where its response goes: ub_write(), send_headers(), ...
 ): mixed;
+
+function set_preempt_function(?\Closure $fn, float $minInterval = 0.1): ?\Closure;
+```
+
+```php
+namespace phasync;
+
+#[\Attribute(\Attribute::TARGET_FUNCTION | \Attribute::TARGET_METHOD)]
+final class Uninterruptible {}
 ```
 
 **Waiting.** A coroutine waits by parking in a slot of the event loop: the
@@ -418,6 +427,59 @@ swaps the same way.
 
 A fatal error still ends the worker (after being displayed in the request's
 output, as natively). Nesting `virtualize()` throws.
+
+### Preemption: `set_preempt_function()`
+
+`set_preempt_function($fn, $minInterval)` calls `$fn` at most every
+`$minInterval` seconds (wall clock), between iterations of whatever PHP loop is
+running, so a scheduler can preempt a coroutine that never yields: `$fn` may
+call `Fiber::suspend()`, and resuming the fiber continues the loop.
+
+Preemption happens only between loop iterations, in PHP code called from PHP
+code: never in callbacks called by C functions (`usort()`, `array_map()`, output
+handlers, session handlers, stream wrappers ...), in code the engine calls in
+the middle of an operation (error handlers, magic methods, `__toString()`,
+`Iterator` methods driven by `foreach`, autoloaders), in destructors, in
+exception handlers and shutdown functions, or in `#[\phasync\Uninterruptible]`
+functions and what they call. The stack is checked down to the fiber's first
+frame (outside fibers, to the script's own code).
+
+- A timer thread, not a signal, asks the engine to interrupt, so no syscall
+  fails with `EINTR`. `$fn` runs once, without arguments, where execution next
+  continues at a loop head (the start of a `while`, `for`, `do`-`while` or
+  `foreach` iteration, or a `while`/`for` condition) and the stack allows it.
+  A backward `goto` compiles to the same jump as a loop and counts as one: the
+  attribute is the way to make such code uninterruptible. Code without a loop
+  (straight-line code, recursion) is never interrupted. A long C call delays it
+  until it returns. The interval counts from the start of the previous call.
+- `#[\phasync\Uninterruptible]` is not mutual exclusion: such a function can
+  still suspend (on I/O, say), and other coroutines run, and are preempted,
+  meanwhile.
+- It is skipped where suspending would throw `FiberError` (pcntl signal
+  handlers, a fiber being destroyed); the next interval gets it.
+- An exception `$fn` throws surfaces at the interrupted point, in the
+  interrupted code, as a `pcntl_async_signals()` handler's does.
+- It is not re-entrant: never called while a call of it runs in the same fiber
+  (or outside any fiber). A call suspended in one fiber doesn't hold back calls
+  in others.
+- It returns the previous closure; `null` removes it and stops the thread. With
+  none set, there is no thread and no interrupt. Other interrupt users
+  (`pcntl_async_signals()`, `max_execution_time`) keep working.
+- It is per process (per thread on ZTS builds). A `fork()`ed child keeps the
+  closure and gets a timer thread of its own.
+
+The engine checks for interrupts at jumps and calls; the extension waits for a
+check at a loop head. Until one takes the due call, the next few checks are
+asked for, then one every 0.25 ms. Code without loops pays for that within
+measuring noise (a recursive `fib()`, interpreter and JIT). Where the engine
+does not check at a loop head, a loop is interrupted later or not at all:
+
+- Under opcache's tracing JIT, a loop whose trace links into the trace of a
+  function it calls may have no check at its head, and is then not interrupted
+  (the function JIT and the interpreter check every loop).
+- On PHP < 8.4 without JIT, the check after a C call can't be followed by one
+  at the loop head, so a `do`-`while`, or a loop left by `break`, whose time
+  goes mostly into calls is interrupted later than the interval.
 
 ## Status
 
