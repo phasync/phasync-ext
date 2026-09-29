@@ -97,7 +97,7 @@
 # define SYS_pidfd_open 434   /* Linux 5.3; same number on every architecture */
 #endif
 
-#define PHP_PHASYNC_VERSION "0.5.0-alpha14"
+#define PHP_PHASYNC_VERSION "0.5.0-alpha15"
 
 typedef struct {
 	bool want_block;    /* caller's intended blocking mode (default: blocking) */
