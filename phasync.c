@@ -2340,7 +2340,6 @@ static void phasync_pool_run(phasync_task *t)
 		return;
 	}
 	phasync_task_chan(h, p);
-park:
 	GC_ADDREF(&p->std);                  /* the loop may drop the Poller while we wait */
 	l = phasync_ledger_cur();
 	l->task = h;
