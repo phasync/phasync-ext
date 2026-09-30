@@ -205,6 +205,17 @@ descriptor (EBADF); the close waits in its coroutine until the operation has let
 of the stream. Closing it outside a coroutine meanwhile is a fatal error.
 `socket_close()` likewise wakes a coroutine waiting on the `Socket`.
 
+A close *begun* in a coroutine that is already being destroyed (its `finally`
+blocks, PHP resuming it once to unwind it) cannot wait this way — it cannot
+suspend. `fclose()`, the resource destructor, and `proc_close()`/`pclose()` of a
+pipe handle this by waking the others and leaving the stream open under its last
+remaining reference instead, which closes it for real once that reference goes;
+no fatal error. `mysqli::close()` has no such adapter — mysqlnd frees its own
+connection structures outside the streams API once its socket stream closes, so
+a coroutine still inside a query on that connection has those structures freed
+under it; this one case stays a fatal error, deliberately, rather than risk the
+memory corruption a use-after-free there would be.
+
 The loop keeps its `Poller` alive: waiters parked through a `Poller` that is freed
 are never unparked, so their waits run to their timeouts. A `Poller` belongs to the
 process that created it: after `fork()`, create a new one (using the old one
