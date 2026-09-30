@@ -1,4 +1,7 @@
 <?php
+// none() doubles its input until a run takes 50 ms; under JIT array_map reaches
+// ~4M elements, and input + result exceed the default 128M.
+ini_set('memory_limit', '1G');
 use function phasync\ext\set_preempt_function;
 
 // $phase is 0 exactly between iterations: the closure must never see it set.
